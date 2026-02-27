@@ -55,7 +55,7 @@ Ingests from EDGAR → parses HTML → chunks → embeds (Voyage Finance-2) → 
 ### Files to Modify
 - `ingestion/sec_proxy_parser.py` — primary implementation target
 - `ingestion/html_parser.py` — extend `_extract_table` if needed (keep backward-compat)
-- `core/models.py` — add fields only if strictly required by tests
+- `ingestion/metadata_model.py` — add fields only if strictly required by tests
 
 ### Do NOT Touch
 - `tests/` — tests are the spec; never modify test files
