@@ -80,6 +80,21 @@ class XBRLTaggedBlock(BaseBlock):
     token_count: int
 
 
+class FilingMetadata(BaseModel):
+    """Metadata passed from downloader to parser for each SEC filing."""
+
+    slot: int | None = None
+    cik: str
+    company_name: str
+    ticker: str | None = None
+    industry: str | None = None
+    form_type: str
+    filing_date: date
+    accession_number: str
+    edgar_url: str
+    raw_html_path: str | None = None
+
+
 class DocumentMetadata(BaseModel):
     document_id: str
     cik: str
