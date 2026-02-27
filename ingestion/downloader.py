@@ -146,6 +146,7 @@ class FilingDownloader:
         downloaded: list[FilingMetadata] = []
         for filing in filings:
             resolved = filing.model_copy(deep=True)
+            # Keep manifest fixtures stable while resolving the J&J placeholder at runtime.
             if resolved.accession_number == self.TBD_ACCESSION:
                 resolved.accession_number = self.edgar_client.resolve_latest_def14a_accession_before(
                     resolved.cik,
@@ -157,6 +158,7 @@ class FilingDownloader:
                 resolved.accession_number,
             )
             if output_path.exists():
+                # Cache hit: do not call the network path, only backfill raw_html_path.
                 resolved.raw_html_path = str(output_path)
                 self._log_event("cache_hit", resolved, output_path)
                 downloaded.append(resolved)
