@@ -1,0 +1,6 @@
+slot,cik,company_name,ticker,industry,form_type,filing_date,accession_number,edgar_url
+1,712771,ConnectOne Bancorp Inc,CNOB,Regional Banking,DEF 14A,2025-04-11,0001437749-25-011656,https://www.sec.gov/Archives/edgar/data/712771/000143774925011656/cnob20240411_def14a.htm
+2,320193,Apple Inc,AAPL,Large-Cap Technology,DEF 14A,2024-01-11,0001308179-24-000010,https://www.sec.gov/Archives/edgar/data/320193/000130817924000010/0001308179-24-000010-index.htm
+3,789019,Microsoft Corporation,MSFT,Large-Cap Technology,DEF 14A,2024-10-11,0001193125-24-242883,https://www.sec.gov/Archives/edgar/data/789019/000119312524242883/d858775ddef14a.htm
+4,200406,Johnson & Johnson,JNJ,Healthcare,DEF 14A,2024-04-11,TBD_RETRIEVE_VIA_EDGARTOOLS,https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=200406&type=DEF+14A&dateb=&owner=include&count=5
+5,18230,Caterpillar Inc,CAT,Industrial,DEF 14A,2025-04-13,0001308179-25-000529,https://www.sec.gov/Archives/edgar/data/18230/000130817925000529/cat012723-def14a.htm

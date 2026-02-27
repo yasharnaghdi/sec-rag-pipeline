@@ -1,0 +1,65 @@
+[
+  {
+    "query_id": "Q01",
+    "query_text": "What was the CEO's total compensation in 2023?",
+    "target_section_keywords": ["Summary Compensation Table", "Executive Compensation"],
+    "required_keywords": ["total", "compensation", "CEO", "Chief Executive"],
+    "cross_filing": false,
+    "notes": "Answer lives in the Summary Compensation Table. All five filings should return a relevant chunk. Relevance grades must be annotated by human verifier against actual table rows.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q02",
+    "query_text": "Does the company have a clawback policy for executive compensation?",
+    "target_section_keywords": ["Clawback", "Recoupment", "Compensation Discussion and Analysis"],
+    "required_keywords": ["clawback", "recoupment", "recovery"],
+    "cross_filing": false,
+    "notes": "Post-Dodd-Frank clawback disclosures required since 2023. All five filings should contain this. Relevance grades annotated by human verifier.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q03",
+    "query_text": "What are the stock option vesting schedules for executives?",
+    "target_section_keywords": ["Grants of Plan-Based Awards", "Outstanding Equity Awards", "Long-Term Incentive"],
+    "required_keywords": ["vest", "vesting", "option", "award", "schedule"],
+    "cross_filing": false,
+    "notes": "Answer may span two tables: grants table and outstanding equity table. Tests multi-chunk retrieval.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q04",
+    "query_text": "How many independent directors are on the board?",
+    "target_section_keywords": ["Board of Directors", "Director Independence", "Corporate Governance"],
+    "required_keywords": ["independent", "director", "board"],
+    "cross_filing": false,
+    "notes": "Tests governance section retrieval. Answer is typically a number plus a list of names.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q05",
+    "query_text": "What is the company's policy on director term limits?",
+    "target_section_keywords": ["Corporate Governance", "Director Tenure", "Board Refreshment"],
+    "required_keywords": ["term", "tenure", "limit", "retirement", "age"],
+    "cross_filing": false,
+    "notes": "Not all five companies will have an explicit term limit policy. Absence of a chunk is itself a valid retrieval result (no relevant chunks). Tests recall vs precision tradeoff.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q06",
+    "query_text": "Compare CEO compensation between Apple and Microsoft in their latest proxy statements.",
+    "target_section_keywords": ["Summary Compensation Table", "Executive Compensation"],
+    "required_keywords": ["total", "compensation", "CEO", "Chief Executive"],
+    "cross_filing": true,
+    "notes": "This is the only cross-filing query in M0. Requires retrieval from two documents (CIK 320193 and CIK 789019) in a single query response. Tests document-level filtering. Relevance grades annotated per document.",
+    "relevance_grades": {}
+  },
+  {
+    "query_id": "Q07",
+    "query_text": "What percentage of the CEO's compensation is performance-based?",
+    "target_section_keywords": ["Compensation Discussion and Analysis", "Pay Mix", "Performance-Based Compensation"],
+    "required_keywords": ["performance", "variable", "at-risk", "incentive", "percentage", "mix"],
+    "cross_filing": false,
+    "notes": "Answer may be a prose statement, a chart caption, or a table row. Tests multi-content-type retrieval (ProseBlock vs TableBlock vs ImageBlock caption).",
+    "relevance_grades": {}
+  }
+]
