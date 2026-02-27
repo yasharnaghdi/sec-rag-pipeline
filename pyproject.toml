@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "SEC filing RAG pipeline: EDGAR → parse → chunk → embed → retrieve → generate"
 authors = ["YaNa <yashar@example.com>"]
 readme = "README.md"
-python = "^3.11"
 
 [tool.poetry.dependencies]
 python = "^3.11"
