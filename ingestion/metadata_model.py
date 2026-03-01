@@ -103,5 +103,5 @@ class DocumentMetadata(BaseModel):
     filing_date: date
     accession_number: str
     source_url: str
-    fiscal_year_end: date | None
-    raw_html_path: str
+    fiscal_year_end: date | None = None
+    raw_html_path: str | None = None
