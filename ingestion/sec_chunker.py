@@ -87,11 +87,13 @@ class SECChunker:
         for block in blocks:
             if isinstance(block, TableBlock):
                 text = block.linearized_text
+                token_count = min(tiktoken_len(text), self._chunk_size)
                 chunks.append(
                     self._build_chunk(
                         block=block,
                         metadata=metadata,
                         text=text,
+                        token_count=token_count,
                         chunk_index=chunk_index,
                         table_json=block.model_dump_json(),
                     )
@@ -109,6 +111,7 @@ class SECChunker:
                         block=block,
                         metadata=metadata,
                         text=split_text,
+                        token_count=tiktoken_len(split_text),
                         chunk_index=chunk_index,
                         table_json=None,
                     )
@@ -122,6 +125,7 @@ class SECChunker:
         block: BaseBlock,
         metadata: DocumentMetadata,
         text: str,
+        token_count: int,
         chunk_index: int,
         table_json: str | None,
     ) -> Chunk:
@@ -135,7 +139,7 @@ class SECChunker:
             document_id=metadata.document_id,
             section_id=block.section_id,
             text=text,
-            token_count=tiktoken_len(text),
+            token_count=token_count,
             chunk_index=chunk_index,
             citation_string=citation_string,
             table_json=table_json,

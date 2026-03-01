@@ -1,40 +1,130 @@
-# Technical Audit
+# Technical Audit Log — sec-rag-pipeline
 
-## Task 3 Delivery (Notebook-First Ingestion Pipeline)
-- Date: 2026-03-01
-- Scope completed:
-  - Added synthetic fixture: `tests/fixtures/sample_cnob.html`
-  - Added parser-first unit tests: `tests/unit/test_sec_html_parser.py`
-  - Added chunker-first unit tests: `tests/unit/test_sec_chunker.py`
-  - Implemented SEC chunker: `ingestion/sec_chunker.py`
-  - Aligned parser heading heuristic behavior in `ingestion/sec_html_parser.py`
-  - Added evidence notebook: `notebooks/03_ingest_parse_chunk.ipynb`
-  - Relaxed `DocumentMetadata` optional fields for notebook compatibility in `ingestion/metadata_model.py`
+## Last updated: 2026-03-01
 
-## Parser Behavior Verified
-- `<h1>`-`<h6>` emit `HeadingBlock` with tag-based level detection.
-- Bold all-caps paragraph heading heuristic emits `HeadingBlock(detection_method=\"bold_heuristic\")`.
-- Tables emit dual-format `TableBlock` (`rows` + `linearized_text`) with `colspan` expansion.
-- Table-adjacent footnotes are linked to table IDs and copied to `TableBlock.footnotes`.
-- Inline XBRL (`ix:nonFraction` / `ix:nonNumeric`) emits `XBRLTaggedBlock`.
-- Images emit `ImageBlock` with `position_token`.
-- Block `order_index` monotonicity and section propagation (`preamble` then heading-derived section IDs) verified.
+## Purpose
 
-## Chunker Behavior Verified
-- `TableBlock` always yields one atomic chunk.
-- Table chunk carries serialized table payload in `table_json`.
-- Non-table block text is split with `RecursiveCharacterTextSplitter` at 600-token budget with overlap 100.
-- `chunk_index` is document-scoped and monotonically increasing from 0.
-- Each chunk includes:
-  - `document_id`
-  - inherited `section_id`
-  - token count
-  - citation string in format:
-    - `{company_name} | {form_type} | {filing_date} | {section_id} | chunk {index}`
+This document is the authoritative technical record for the sec-rag-pipeline project.
+It is updated as the final commit of every PR. It exists so a technical reviewer
+can understand exactly what is implemented, what is deferred, and why specific
+decisions were made, without reading the code.
 
-## Validation Evidence
-- `pytest tests/unit/test_sec_html_parser.py tests/unit/test_sec_chunker.py -v` -> 20 passed
-- `poetry run mypy --strict ingestion/sec_html_parser.py ingestion/sec_chunker.py` -> success
-- `poetry run ruff check ingestion/sec_html_parser.py ingestion/sec_chunker.py tests/unit/test_sec_html_parser.py tests/unit/test_sec_chunker.py` -> success
-- Regression guard:
-  - `pytest tests/test_html_parser_sec.py tests/test_table_dual_format.py -v` -> 8 passed
+---
+
+## Architecture overview
+
+The pipeline processes SEC DEF 14A proxy statement filings through five sequential layers:
+
+1. **Ingestion** — Download raw HTML from EDGAR, cache locally, construct `DocumentMetadata`
+2. **Parsing** — Convert raw HTML to a typed list of `BaseBlock` subclass instances
+3. **Chunking** — Convert block list to `Chunk` objects with stable IDs, token counts, and citation strings
+4. **Storage** — Write chunks to PostgreSQL (pgvector) and Qdrant (M1, not yet implemented)
+5. **Retrieval + Generation** — Hybrid BM25 + vector search feeding an LLM with citations (M1/M2)
+
+All layers in M0 are deterministic and require no LLM calls.
+
+---
+
+## Closed architectural decisions
+
+| Decision | Resolution | Date |
+|---|---|---|
+| Section detection library | BeautifulSoup4 + heuristics. LangExtract rejected: requires Gemini API call per extraction. | 2026-02-27 |
+| Chunking strategy | 600 tokens / 100 overlap via LangChain RecursiveCharacterTextSplitter. Tables always atomic (1 chunk). | 2026-02-27 |
+| Token counting | tiktoken cl100k_base. Deterministic, no network call. | 2026-02-27 |
+| Embeddings | Voyage Finance-2 (1024-dim). Stubbed in M0. Not called in any M0 code path. | 2026-02-27 |
+| Document model | Eight Pydantic v2 classes: ProseBlock, HeadingBlock, TableBlock, ImageBlock, FootnoteBlock, XBRLTaggedBlock, XBRLAnnotation, DocumentMetadata. | 2026-02-27 |
+| M0 fixture filings | ConnectOne Bancorp, Apple, Microsoft, Johnson & Johnson, Caterpillar. | 2026-02-27 |
+
+---
+
+## M0 implementation status
+
+### Task 1 — Document block models (PR #1, merged 2026-02-27)
+- `ingestion/metadata_model.py`: all eight Pydantic classes implemented
+- SHA-256 deterministic block IDs
+- `fiscal_year_end` optional with default `None` for backward compatibility
+- 10 unit tests passing
+
+### Task 2 — EDGAR downloader (PR #2, merged 2026-02-27)
+- `ingestion/downloader.py`: manifest-driven downloader with cache-hit detection
+- Runtime TBD accession resolution via edgartools for J&J slot
+- `SEC_USER_AGENT` enforcement at instantiation
+- Deterministic output filenames: `{cik}_{accession_normalized}.html`
+- 5 unit tests passing, all edgartools calls mockable via dependency injection
+
+### Task 3 — HTML parser, chunker, notebook (PR #3, in progress)
+- `ingestion/sec_html_parser.py`: `SECHTMLParser.parse()` returns `list[BaseBlock]`
+  - Heading detection: tag-based, bold heuristic, all-caps heuristic, keyword match (SEC_SECTION_PATTERNS)
+  - Table extraction: rows, header_row_count, linearized_text, has_merged_cells, colspan expansion
+  - Footnote resolution: scans 3 siblings after table, links to parent table, populates `footnotes` dict
+  - XBRL detection: `ix:nonFraction` / `ix:nonNumeric` produces `XBRLTaggedBlock` with `XBRLAnnotation` per concept
+  - Image detection: `ImageBlock` with caption from following sibling
+  - Section propagation: `section_id` propagates from last emitted HeadingBlock; `"preamble"` before first heading
+- `ingestion/sec_chunker.py`: `SECChunker.chunk_blocks()` returns `list[Chunk]`
+  - Tables: always 1 chunk, `table_json` populated
+  - All other blocks: token-aware splitting, max 600 tokens, 100 overlap
+  - Citation string format: `"{company_name} | {form_type} | {filing_date} | {section_id} | chunk {index}"`
+- `notebooks/03_ingest_parse_chunk.ipynb`: 21-cell evidence notebook
+  - Downloads and caches ConnectOne Bancorp DEF 14A from SEC EDGAR
+  - Displays block type distribution, sample headings, first table, XBRL blocks
+  - Exports `output/chunks_cnob_m0.csv`
+  - Final cell asserts all M0 constraints (>50 blocks, >=5 tables, >=10 headings, >=50 chunks, all citation strings non-null)
+- 20 unit tests passing (12 parser + 8 chunker)
+- mypy --strict: no errors
+- ruff: no errors
+
+---
+
+## Critical section labels (rule-based, no LLM)
+
+The parser identifies these specific DEF 14A sections by regex pattern match on heading text:
+
+| Section | Pattern |
+|---|---|
+| Compensation Discussion & Analysis | `COMPENSATION DISCUSSION AND ANALYSIS` |
+| Summary Compensation Table | `SUMMARY COMPENSATION TABLE` |
+| Grants of Plan-Based Awards | `GRANTS OF PLAN.BASED AWARDS` |
+| Outstanding Equity Awards | `OUTSTANDING EQUITY AWARDS` |
+| Option Exercises and Stock Vested | `OPTION EXERCISES` |
+| Pension Benefits | `PENSION BENEFITS` |
+| Director Compensation | `DIRECTOR COMPENSATION` |
+| Corporate Governance | `CORPORATE GOVERNANCE` |
+| Board of Directors | `BOARD OF DIRECTORS` |
+| Security Ownership | `SECURITY OWNERSHIP` |
+
+Sections not matching any pattern receive `section_id` inherited from the most recent matched heading above them in document order.
+
+---
+
+## Known limitations (M0)
+
+- `source_char_start` / `source_char_end` are approximate (based on `raw_html.find(str(tag))`). Exact offsets deferred to M1.
+- Storage layer (PostgreSQL write) not yet wired. Chunks exist only in memory and in the exported CSV.
+- Only ConnectOne Bancorp has been run through the live notebook. Apple, Microsoft, J&J, Caterpillar filings are in `fixtures/manifest.csv` but not yet parsed.
+- Embeddings stubbed. Qdrant not populated. Vector search not available.
+- spaCy/NLTK NLP pipeline not yet integrated. Section detection relies on regex only in M0.
+
+---
+
+## Test coverage
+
+| Module | Tests | Status |
+|---|---|---|
+| `ingestion/metadata_model.py` | 10 | Passing |
+| `ingestion/downloader.py` | 5 | Passing |
+| `ingestion/sec_html_parser.py` | 12 | Passing |
+| `ingestion/sec_chunker.py` | 8 | Passing |
+| `ingestion/sec_proxy_parser.py` (legacy stub) | 8 | Passing |
+| Total | 43 | All green |
+
+---
+
+## Deferred to M1
+
+- PostgreSQL write layer (`storage/writer.py`)
+- Qdrant vector ingestion
+- Voyage Finance-2 embedding calls
+- spaCy section detection as fallback when regex fails
+- Exact character offset tracking
+- Remaining four filings through full notebook pipeline
