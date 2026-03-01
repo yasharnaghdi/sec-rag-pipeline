@@ -106,3 +106,22 @@ def test_chunk_citation_string_format() -> None:
         f"{chunk.section_id} | chunk {chunk.chunk_index}"
     )
     assert chunk.citation_string == expected
+
+
+def test_table_chunk_token_count_capped_to_chunk_budget() -> None:
+    long_linearized = "token " * 1200
+    table_block = TableBlock(
+        document_id="712771_000143774925011656",
+        section_id="sec_table",
+        order_index=0,
+        source_char_start=0,
+        source_char_end=100,
+        rows=[["token", "token"], ["token", "token"]],
+        header_row_count=1,
+        linearized_text=long_linearized.strip(),
+        footnotes={},
+        has_merged_cells=False,
+        token_count_linearized=1200,
+    )
+    chunk = SECChunker().chunk_blocks([table_block], _metadata())[0]
+    assert chunk.token_count == 600
