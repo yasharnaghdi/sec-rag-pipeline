@@ -218,10 +218,8 @@ def _has_sole_bold_child(tag: Tag) -> _DetectionMethod | None:
     only_child = children[0]
     if not isinstance(only_child, Tag):
         return None
-    if only_child.name == "b":
+    if only_child.name in {"b", "strong"}:
         return "bold_heuristic"
-    if only_child.name == "strong":
-        return "allcaps_heuristic"
     return None
 
 

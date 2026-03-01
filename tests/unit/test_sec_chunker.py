@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+from datetime import date
+
+from ingestion.metadata_model import DocumentMetadata, ProseBlock, TableBlock
+from ingestion.sec_chunker import SECChunker
+
+
+def _metadata() -> DocumentMetadata:
+    return DocumentMetadata(
+        document_id="712771_000143774925011656",
+        cik="712771",
+        company_name="ConnectOne Bancorp, Inc.",
+        form_type="DEF 14A",
+        filing_date=date(2025, 4, 11),
+        accession_number="0001437749-25-011656",
+        source_url="https://www.sec.gov/Archives/edgar/data/712771/000143774925011656/cnob20240411_def14a.htm",
+        fiscal_year_end=None,
+        raw_html_path="tests/fixtures/sample_cnob.html",
+    )
+
+
+def _prose_block(text: str, section_id: str = "preamble", order_index: int = 0) -> ProseBlock:
+    return ProseBlock(
+        document_id="712771_000143774925011656",
+        section_id=section_id,
+        order_index=order_index,
+        source_char_start=0,
+        source_char_end=len(text),
+        text=text,
+        token_count=max(1, len(text.split())),
+    )
+
+
+def _table_block(section_id: str = "sec_table", order_index: int = 1) -> TableBlock:
+    rows = [["Name", "Title", "Total Compensation"], ["John Smith", "CEO", "500,000"]]
+    linearized = " | ".join(cell for row in rows for cell in row)
+    return TableBlock(
+        document_id="712771_000143774925011656",
+        section_id=section_id,
+        order_index=order_index,
+        source_char_start=0,
+        source_char_end=100,
+        rows=rows,
+        header_row_count=1,
+        linearized_text=linearized,
+        footnotes={"(1)": "(1) Amounts reflect base salary only."},
+        has_merged_cells=False,
+        token_count_linearized=max(1, len(linearized.split())),
+    )
+
+
+def test_prose_block_produces_one_chunk() -> None:
+    blocks = [_prose_block("This is a short block for chunking.")]
+    chunks = SECChunker().chunk_blocks(blocks, _metadata())
+    assert len(chunks) == 1
+
+
+def test_table_block_produces_exactly_one_chunk_atomic() -> None:
+    blocks = [_table_block()]
+    chunks = SECChunker().chunk_blocks(blocks, _metadata())
+    assert len(chunks) == 1
+
+
+def test_table_chunk_has_table_json_populated() -> None:
+    blocks = [_table_block()]
+    chunk = SECChunker().chunk_blocks(blocks, _metadata())[0]
+    assert chunk.table_json is not None
+
+
+def test_chunk_indices_monotonically_increasing_from_zero() -> None:
+    long_text = "word " * 1400
+    blocks = [
+        _prose_block(long_text.strip(), section_id="sec_long", order_index=0),
+        _table_block(section_id="sec_table", order_index=1),
+        _prose_block("Final short block.", section_id="sec_tail", order_index=2),
+    ]
+    chunks = SECChunker().chunk_blocks(blocks, _metadata())
+    assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
+
+
+def test_chunk_token_count_never_exceeds_600() -> None:
+    long_text = "token " * 1800
+    chunks = SECChunker().chunk_blocks([_prose_block(long_text.strip())], _metadata())
+    assert all(chunk.token_count <= 600 for chunk in chunks)
+
+
+def test_chunk_inherits_section_id_from_block() -> None:
+    blocks = [_prose_block("A short sectioned paragraph.", section_id="section_exec_comp")]
+    chunk = SECChunker().chunk_blocks(blocks, _metadata())[0]
+    assert chunk.section_id == "section_exec_comp"
+
+
+def test_chunk_citation_string_is_non_null() -> None:
+    blocks = [_prose_block("A short citation paragraph.", section_id="section_governance")]
+    chunk = SECChunker().chunk_blocks(blocks, _metadata())[0]
+    assert chunk.citation_string
+
+
+def test_chunk_citation_string_format() -> None:
+    metadata = _metadata()
+    blocks = [_prose_block("A short citation paragraph.", section_id="section_governance")]
+    chunk = SECChunker().chunk_blocks(blocks, metadata)[0]
+    expected = (
+        f"{metadata.company_name} | {metadata.form_type} | {metadata.filing_date} | "
+        f"{chunk.section_id} | chunk {chunk.chunk_index}"
+    )
+    assert chunk.citation_string == expected
