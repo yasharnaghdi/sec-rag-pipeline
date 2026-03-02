@@ -21,9 +21,7 @@ class EdgarDownloader:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         # TODO: set_identity(settings.edgar_user_agent)
 
-    def download_proxy_filing(
-        self, cik: str, year: int
-    ) -> tuple[Path, FilingMetadata]:
+    def download_proxy_filing(self, cik: str, year: int) -> tuple[Path, FilingMetadata]:
         """Download DEF 14A for a given CIK and fiscal year.
 
         Returns:

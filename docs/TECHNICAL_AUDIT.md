@@ -18,16 +18,10 @@ The pipeline processes SEC DEF 14A proxy statement filings through five sequenti
 1. **Ingestion** — Download raw HTML from EDGAR, cache locally, construct `DocumentMetadata`
 2. **Parsing** — Convert raw HTML to a typed list of `BaseBlock` subclass instances
 3. **Chunking** — Convert block list to `Chunk` objects with stable IDs, token counts, and citation strings
-4. **Storage** — Write chunks to PostgreSQL (pgvector) and Qdrant (M1, not yet implemented)
+4. **Storage** — Write chunks to PostgreSQL (pgvector) and prepare for vector storage integration
 5. **Retrieval + Generation** — Hybrid BM25 + vector search feeding an LLM with citations (M1/M2)
 
 All layers in M0 are deterministic and require no LLM calls.
-
----
-
-## What has been built
-
-The storage layer is now implemented in `storage/writer.py` with idempotent Postgres upserts for chunks, including citation and table JSON persistence. The batch evidence workflow is captured in `notebooks/04_batch_ingest.ipynb`, which processes all five fixture filings from `fixtures/manifest.csv` end-to-end (download, parse, chunk, store) and exports `output/m0_batch_summary.csv` for M0 audit verification.
 
 ---
 
@@ -44,43 +38,17 @@ The storage layer is now implemented in `storage/writer.py` with idempotent Post
 
 ---
 
-## M0 implementation status
+## What has been built
 
-### Document block models (PR #1, merged 2026-02-27)
-- `ingestion/metadata_model.py`: all eight Pydantic classes implemented
-- SHA-256 deterministic block IDs
-- `fiscal_year_end` optional with default `None` for backward compatibility
-- 10 unit tests passing
+The system can download SEC DEF 14A filings from EDGAR and cache each source HTML document locally with deterministic filenames. It enforces a valid SEC user agent and supports reproducible ingestion from manifest inputs so the same filing can be reprocessed consistently.
 
-### EDGAR downloader (PR #2, merged 2026-02-27)
-- `ingestion/downloader.py`: manifest-driven downloader with cache-hit detection
-- Runtime TBD accession resolution via edgartools for J&J slot
-- `SEC_USER_AGENT` enforcement at instantiation
-- Deterministic output filenames: `{cik}_{accession_normalized}.html`
-- 6 unit tests passing, all edgartools calls mockable via dependency injection
+The parser can convert filing HTML into typed document blocks, including headings, prose, tables, images, footnotes, and inline XBRL-tagged content. Section labels are assigned through deterministic heading detection rules, and section context is propagated through downstream blocks in document order.
 
-### HTML parser, chunker, notebook (PR #3, complete)
-- `ingestion/sec_html_parser.py`: `SECHTMLParser.parse()` returns `list[BaseBlock]`
-  - Heading detection: tag-based, bold heuristic, all-caps heuristic, keyword match (SEC_SECTION_PATTERNS)
-  - Table extraction: rows, header_row_count, linearized_text, has_merged_cells, colspan expansion
-  - Footnote resolution: scans 3 siblings after table, links to parent table, populates `footnotes` dict
-  - XBRL detection: `ix:nonFraction` / `ix:nonNumeric` produces `XBRLTaggedBlock` with `XBRLAnnotation` per concept
-  - Image detection: `ImageBlock` with caption from following sibling
-  - Section propagation: `section_id` propagates from last emitted HeadingBlock; `"preamble"` before first heading
-- `ingestion/sec_chunker.py`: `SECChunker.chunk_blocks()` returns `list[Chunk]`
-  - Tables: always 1 chunk, `table_json` populated
-  - All other blocks: token-aware splitting, max 600 tokens, 100 overlap
-  - Citation string format: `"{company_name} | {form_type} | {filing_date} | {section_id} | chunk {index}"`
-- `notebooks/03_ingest_parse_chunk.ipynb`: 21-cell evidence notebook
-  - Downloads and caches ConnectOne Bancorp DEF 14A from SEC EDGAR
-  - Displays block type distribution, sample headings, first table, XBRL blocks
-  - Exports `output/chunks_cnob_m0.csv`
-  - Final cell asserts all M0 constraints (>50 blocks, >=5 tables, >=10 headings, >=50 chunks, all citation strings non-null)
-- 20 unit tests passing (12 parser + 8 chunker)
-- mypy --strict: no errors
-- ruff: no errors
-- `storage/writer.py`: PostgreSQL write layer implemented with idempotent chunk upserts and citation/table JSON persistence
-- `notebooks/04_batch_ingest.ipynb`: batch M0 evidence notebook for all 5 fixture filings with gate assertions and CSV export
+The chunking layer can turn parsed blocks into stable, citable chunks with deterministic IDs, token counts, chunk indices, and citation strings. Tables are preserved as atomic chunks so structured compensation data remains intact for audit and downstream analysis.
+
+The storage layer is implemented in `storage/writer.py` with idempotent Postgres upserts for chunks, including citation and table JSON persistence. The migration `storage/migrations/001_add_citation_and_table_json.sql` adds required chunk columns for environments created before these fields existed.
+
+The notebook workflow includes single-filing and batch evidence artifacts. `notebooks/03_ingest_parse_chunk.ipynb` provides filing-level audit output, and `notebooks/04_batch_ingest.ipynb` processes all five fixture filings end-to-end and exports `output/m0_batch_summary.csv`.
 
 ---
 
@@ -108,8 +76,8 @@ Sections not matching any pattern receive `section_id` inherited from the most r
 ## Known limitations (M0)
 
 - `source_char_start` / `source_char_end` are approximate (based on `raw_html.find(str(tag))`). Exact offsets deferred to M1.
-- Embeddings stubbed. Qdrant not populated. Vector search not available.
-- spaCy/NLTK NLP pipeline not yet integrated. Section detection relies on regex only in M0.
+- Embeddings are not executed in M0 ingest paths. Qdrant vector retrieval remains deferred.
+- spaCy/NLTK NLP pipeline is not yet integrated. Section detection relies on regex in M0.
 
 ---
 

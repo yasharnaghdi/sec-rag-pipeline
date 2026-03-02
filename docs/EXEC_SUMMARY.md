@@ -14,19 +14,15 @@ and executive pay analysis. Outputs are suitable for citation in peer-reviewed w
 
 ---
 
-## Current status (M0 — 2026-03-01)
+## What researchers can do today
 
-**What researchers can do right now:**
+Researchers can run `notebooks/03_ingest_parse_chunk.ipynb` to download a DEF 14A filing from SEC EDGAR, parse it into typed blocks, and export a citation-ready chunk manifest CSV. The workflow provides a transparent path from source HTML to structured outputs that can be inspected and validated manually.
 
-Run `notebooks/03_ingest_parse_chunk.ipynb` to:
-- Download the ConnectOne Bancorp DEF 14A proxy statement directly from SEC EDGAR
-- See every section of the filing broken into typed, labelled blocks
-- Export a fully-cited chunk manifest to `output/chunks_cnob_m0.csv`
-- Verify that all data is traceable back to the source HTML character-for-character
+Researchers can also run `notebooks/04_batch_ingest.ipynb` to download, parse, chunk, and store all five fixture proxy statements in a single session, then review row-level storage counts in `output/m0_batch_summary.csv`.
 
-Run `notebooks/04_batch_ingest.ipynb` to download, parse, chunk, and store all five proxy statements in a single session.
+---
 
-**What is not yet available:**
+## What is not yet available
 
 - Natural language query interface (M1)
 - Search across multiple filings simultaneously (M1)
@@ -35,13 +31,13 @@ Run `notebooks/04_batch_ingest.ipynb` to download, parse, chunk, and store all f
 
 ---
 
-## Milestone plan
+## What is coming next
 
-| Milestone | Scope | Status |
-|---|---|---|
-| M0 | Parse, chunk, and audit 5 filings locally. No LLM, no embeddings. | In progress |
-| M1 | Embed chunks, store in pgvector + Qdrant, BM25 + vector hybrid retrieval | Not started |
-| M2 | LLM generation with citations, evaluation against 7 benchmark queries | Not started |
+- Ask questions in plain English across multiple filings simultaneously
+- Receive answers with verifiable citations to the source document
+- Search filings using semantic similarity, not only exact keyword matches
+- Retrieve evidence from both lexical and vector search in a single ranked result set
+- Expand from deterministic ingest/chunk/storage to embedding and hybrid retrieval workflows
 
 M0 sign-off evidence: `notebooks/03_ingest_parse_chunk.ipynb` and `notebooks/04_batch_ingest.ipynb` run to completion with assertions passing, and outputs are exported to `output/chunks_cnob_m0.csv` and `output/m0_batch_summary.csv`.
 

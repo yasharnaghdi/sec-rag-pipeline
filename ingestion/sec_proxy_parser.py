@@ -35,7 +35,7 @@ SEC_SECTION_PATTERNS: list[re.Pattern[str]] = [
 class SECProxyParser(HTMLParser):
     """Enriches base HTML blocks with SEC filing metadata and section attribution."""
 
-    def parse_with_metadata(  # type: ignore[override]
+    def parse_with_metadata(
         self,
         file_path: Path,
         metadata: FilingMetadata,
