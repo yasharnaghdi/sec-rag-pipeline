@@ -13,8 +13,6 @@ TODO (Phase 2 implementation):
 """
 from __future__ import annotations
 
-from uuid import uuid4
-
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

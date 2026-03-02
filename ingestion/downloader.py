@@ -57,7 +57,7 @@ class EdgartoolsClient:
 
     def __init__(self) -> None:
         try:
-            from edgar import Company, set_identity  # type: ignore[import-untyped]
+            from edgar import Company, set_identity
         except Exception as exc:  # pragma: no cover - import/runtime dependency
             raise ImportError(
                 "edgartools is required for downloader runtime operations."
