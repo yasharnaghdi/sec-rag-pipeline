@@ -47,9 +47,18 @@ class HTMLParser:
             if any(ancestor in _SKIP_TAGS for ancestor in _tag_ancestors(tag)):
                 continue
 
+            raw_classes = tag.get("class")
+            classes: list[str]
+            if isinstance(raw_classes, list):
+                classes = [str(item) for item in raw_classes]
+            elif raw_classes is None:
+                classes = []
+            else:
+                classes = [str(raw_classes)]
+
             meta: dict[str, Any] = {
                 "tag": tag.name,
-                "classes": tag.get("class", []),
+                "classes": classes,
                 "parent_tags": _tag_ancestors(tag)[:3],
             }
 

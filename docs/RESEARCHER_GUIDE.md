@@ -119,6 +119,14 @@ reference the same chunk across multiple analysis runs.
 
 ---
 
+## How results are verified
+
+To manually verify a chunk, open the cached filing HTML in `data/raw/` that matches the filing you processed. Copy the full chunk text from the CSV (or a distinctive sentence from it), then search for that text verbatim in the HTML file. A direct text match confirms the chunk was extracted from the source filing rather than generated or paraphrased.
+
+After locating the text in the HTML, confirm it appears under the same section context shown in the chunk’s `section_id` value. This cross-check links the chunk content and its section label back to the original document structure, which gives you an auditable path from published SEC filing to analysis-ready record.
+
+---
+
 ## Known limitations (M0)
 
 - Only ConnectOne Bancorp has been processed through the full pipeline. The remaining four filings (Apple, Microsoft, J&J, Caterpillar) are scheduled for M1.
