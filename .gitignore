@@ -17,3 +17,4 @@ coverage.xml
 data/raw/
 data/processed/
 *.log
+poetry.lock

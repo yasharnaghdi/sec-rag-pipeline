@@ -38,41 +38,17 @@ All layers in M0 are deterministic and require no LLM calls.
 
 ---
 
-## M0 implementation status
+## What has been built
 
-### Task 1 — Document block models (PR #1, merged 2026-02-27)
-- `ingestion/metadata_model.py`: all eight Pydantic classes implemented
-- SHA-256 deterministic block IDs
-- `fiscal_year_end` optional with default `None` for backward compatibility
-- 10 unit tests passing
+The system can download SEC DEF 14A filings from EDGAR and cache each source HTML document locally with deterministic filenames. It enforces a valid SEC user agent and supports reproducible ingestion from manifest inputs so the same filing can be reprocessed consistently.
 
-### Task 2 — EDGAR downloader (PR #2, merged 2026-02-27)
-- `ingestion/downloader.py`: manifest-driven downloader with cache-hit detection
-- Runtime TBD accession resolution via edgartools for J&J slot
-- `SEC_USER_AGENT` enforcement at instantiation
-- Deterministic output filenames: `{cik}_{accession_normalized}.html`
-- 5 unit tests passing, all edgartools calls mockable via dependency injection
+The parser can convert filing HTML into typed document blocks, including headings, prose, tables, images, footnotes, and inline XBRL-tagged content. Section labels are assigned through deterministic heading detection rules, and section context is propagated through downstream blocks in document order.
 
-### Task 3 — HTML parser, chunker, notebook (PR #3, in progress)
-- `ingestion/sec_html_parser.py`: `SECHTMLParser.parse()` returns `list[BaseBlock]`
-  - Heading detection: tag-based, bold heuristic, all-caps heuristic, keyword match (SEC_SECTION_PATTERNS)
-  - Table extraction: rows, header_row_count, linearized_text, has_merged_cells, colspan expansion
-  - Footnote resolution: scans 3 siblings after table, links to parent table, populates `footnotes` dict
-  - XBRL detection: `ix:nonFraction` / `ix:nonNumeric` produces `XBRLTaggedBlock` with `XBRLAnnotation` per concept
-  - Image detection: `ImageBlock` with caption from following sibling
-  - Section propagation: `section_id` propagates from last emitted HeadingBlock; `"preamble"` before first heading
-- `ingestion/sec_chunker.py`: `SECChunker.chunk_blocks()` returns `list[Chunk]`
-  - Tables: always 1 chunk, `table_json` populated
-  - All other blocks: token-aware splitting, max 600 tokens, 100 overlap
-  - Citation string format: `"{company_name} | {form_type} | {filing_date} | {section_id} | chunk {index}"`
-- `notebooks/03_ingest_parse_chunk.ipynb`: 21-cell evidence notebook
-  - Downloads and caches ConnectOne Bancorp DEF 14A from SEC EDGAR
-  - Displays block type distribution, sample headings, first table, XBRL blocks
-  - Exports `output/chunks_cnob_m0.csv`
-  - Final cell asserts all M0 constraints (>50 blocks, >=5 tables, >=10 headings, >=50 chunks, all citation strings non-null)
-- 20 unit tests passing (12 parser + 8 chunker)
-- mypy --strict: no errors
-- ruff: no errors
+The chunking layer can turn parsed blocks into stable, citable chunks with deterministic IDs, token counts, chunk indices, and citation strings. Tables are preserved as atomic chunks so structured compensation data remains intact for audit and downstream analysis.
+
+The notebook workflow can run an end-to-end ingestion, parsing, and chunking pass for a live filing and export a manifest CSV in `output/`. This provides a transparent evidence path from raw SEC source HTML to analyzable, citation-ready chunks.
+
+The codebase includes automated validation across core modules with passing unit tests, static type checks, and linting checks for implemented components. This establishes a reproducible baseline for extending storage, retrieval, and generation layers.
 
 ---
 
