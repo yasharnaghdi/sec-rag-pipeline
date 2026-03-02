@@ -9,9 +9,12 @@ import sys
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
-from ingestion.metadata_model import FilingMetadata
+from ingestion.metadata_model import DocumentMetadata, FilingMetadata
+
+if TYPE_CHECKING:
+    import pandas as pd  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +121,8 @@ class FilingDownloader:
     def __init__(
         self,
         *,
-        raw_dir: Path | str = Path("data/raw"),
+        raw_dir: Path | str | None = None,
+        data_dir: Path | str | None = None,
         manifest_path: Path | str = Path("fixtures/manifest.csv"),
         edgar_client: EdgarClientProtocol | None = None,
         sec_user_agent: str | None = None,
@@ -129,7 +133,8 @@ class FilingDownloader:
         if not user_agent:
             raise EnvironmentError("SEC_USER_AGENT environment variable is required.")
 
-        self.raw_dir = Path(raw_dir)
+        resolved_raw_dir = data_dir if data_dir is not None else raw_dir
+        self.raw_dir = Path(resolved_raw_dir or Path("data/raw"))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = Path(manifest_path)
         self.edgar_client = edgar_client or EdgartoolsClient()
@@ -180,6 +185,37 @@ class FilingDownloader:
         """Download filings listed in the default `fixtures/manifest.csv`."""
         return self.download(self.manifest_path)
 
+    def resolve_and_download(self, manifest_row: "pd.Series") -> DocumentMetadata:
+        """Resolve accession and cache/download one manifest row into `DocumentMetadata`."""
+        row = self._manifest_row_to_mapping(manifest_row)
+        filing_date = date.fromisoformat(self._required_manifest_value(row, "filing_date")[:10])
+        slot_raw = row.get("slot")
+        slot = int(str(slot_raw)) if slot_raw not in (None, "") else None
+
+        filing = FilingMetadata(
+            slot=slot,
+            cik=self._required_manifest_value(row, "cik"),
+            company_name=self._required_manifest_value(row, "company_name"),
+            ticker=self._optional_manifest_value(row, "ticker"),
+            industry=self._optional_manifest_value(row, "industry"),
+            form_type=self._required_manifest_value(row, "form_type"),
+            filing_date=filing_date,
+            accession_number=self._required_manifest_value(row, "accession_number"),
+            edgar_url=self._required_manifest_value(row, "edgar_url"),
+        )
+        resolved = self.download([filing])[0]
+        return DocumentMetadata(
+            document_id=self.build_document_id(resolved.cik, resolved.accession_number),
+            cik=resolved.cik,
+            company_name=resolved.company_name,
+            form_type=resolved.form_type,
+            filing_date=resolved.filing_date,
+            accession_number=resolved.accession_number,
+            source_url=resolved.edgar_url,
+            fiscal_year_end=None,
+            raw_html_path=resolved.raw_html_path,
+        )
+
     def load_manifest(self, manifest_path: Path | str) -> list[FilingMetadata]:
         """Load FilingMetadata entries from a manifest CSV file."""
         manifest = Path(manifest_path)
@@ -212,10 +248,47 @@ class FilingDownloader:
         return f"{cik}_{accession_normalized}.html"
 
     @staticmethod
+    def build_document_id(cik: str, accession_number: str) -> str:
+        """Return deterministic document id keyed by cik + accession."""
+        accession_compact = accession_number.replace("-", "")
+        return f"{cik}_{accession_compact}"
+
+    @staticmethod
     def _required_field(row: Mapping[str, str | None], key: str, row_number: int) -> str:
         value = row.get(key)
         if value is None or value == "":
             raise ValueError(f"Manifest row {row_number} missing required field '{key}'.")
+        return value
+
+    @staticmethod
+    def _manifest_row_to_mapping(manifest_row: object) -> Mapping[str, object]:
+        if isinstance(manifest_row, Mapping):
+            return cast(Mapping[str, object], manifest_row)
+        to_dict = getattr(manifest_row, "to_dict", None)
+        if callable(to_dict):
+            row_dict = to_dict()
+            if isinstance(row_dict, Mapping):
+                return cast(Mapping[str, object], row_dict)
+        raise TypeError("manifest_row must be a pandas.Series or mapping-like object.")
+
+    @staticmethod
+    def _required_manifest_value(row: Mapping[str, object], key: str) -> str:
+        raw_value = row.get(key)
+        if raw_value is None:
+            raise ValueError(f"Manifest row missing required field '{key}'.")
+        value = str(raw_value).strip()
+        if value == "" or value.lower() == "nan":
+            raise ValueError(f"Manifest row missing required field '{key}'.")
+        return value
+
+    @staticmethod
+    def _optional_manifest_value(row: Mapping[str, object], key: str) -> str | None:
+        raw_value = row.get(key)
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        if value == "" or value.lower() == "nan":
+            return None
         return value
 
     def _log_event(

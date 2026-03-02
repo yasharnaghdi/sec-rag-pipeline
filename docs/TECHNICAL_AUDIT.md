@@ -1,6 +1,6 @@
 # Technical Audit Log — sec-rag-pipeline
 
-## Last updated: 2026-03-01
+## Last updated: 2026-03-02
 
 ## Purpose
 
@@ -18,7 +18,7 @@ The pipeline processes SEC DEF 14A proxy statement filings through five sequenti
 1. **Ingestion** — Download raw HTML from EDGAR, cache locally, construct `DocumentMetadata`
 2. **Parsing** — Convert raw HTML to a typed list of `BaseBlock` subclass instances
 3. **Chunking** — Convert block list to `Chunk` objects with stable IDs, token counts, and citation strings
-4. **Storage** — Write chunks to PostgreSQL (pgvector) and Qdrant (M1, not yet implemented)
+4. **Storage** — Write chunks to PostgreSQL (pgvector) and prepare for vector storage integration
 5. **Retrieval + Generation** — Hybrid BM25 + vector search feeding an LLM with citations (M1/M2)
 
 All layers in M0 are deterministic and require no LLM calls.
@@ -46,9 +46,9 @@ The parser can convert filing HTML into typed document blocks, including heading
 
 The chunking layer can turn parsed blocks into stable, citable chunks with deterministic IDs, token counts, chunk indices, and citation strings. Tables are preserved as atomic chunks so structured compensation data remains intact for audit and downstream analysis.
 
-The notebook workflow can run an end-to-end ingestion, parsing, and chunking pass for a live filing and export a manifest CSV in `output/`. This provides a transparent evidence path from raw SEC source HTML to analyzable, citation-ready chunks.
+The storage layer is implemented in `storage/writer.py` with idempotent Postgres upserts for chunks, including citation and table JSON persistence. The migration `storage/migrations/001_add_citation_and_table_json.sql` adds required chunk columns for environments created before these fields existed.
 
-The codebase includes automated validation across core modules with passing unit tests, static type checks, and linting checks for implemented components. This establishes a reproducible baseline for extending storage, retrieval, and generation layers.
+The notebook workflow includes single-filing and batch evidence artifacts. `notebooks/03_ingest_parse_chunk.ipynb` provides filing-level audit output, and `notebooks/04_batch_ingest.ipynb` processes all five fixture filings end-to-end and exports `output/m0_batch_summary.csv`.
 
 ---
 
@@ -76,10 +76,8 @@ Sections not matching any pattern receive `section_id` inherited from the most r
 ## Known limitations (M0)
 
 - `source_char_start` / `source_char_end` are approximate (based on `raw_html.find(str(tag))`). Exact offsets deferred to M1.
-- Storage layer (PostgreSQL write) not yet wired. Chunks exist only in memory and in the exported CSV.
-- Only ConnectOne Bancorp has been run through the live notebook. Apple, Microsoft, J&J, Caterpillar filings are in `fixtures/manifest.csv` but not yet parsed.
-- Embeddings stubbed. Qdrant not populated. Vector search not available.
-- spaCy/NLTK NLP pipeline not yet integrated. Section detection relies on regex only in M0.
+- Embeddings are not executed in M0 ingest paths. Qdrant vector retrieval remains deferred.
+- spaCy/NLTK NLP pipeline is not yet integrated. Section detection relies on regex in M0.
 
 ---
 
@@ -88,19 +86,18 @@ Sections not matching any pattern receive `section_id` inherited from the most r
 | Module | Tests | Status |
 |---|---|---|
 | `ingestion/metadata_model.py` | 10 | Passing |
-| `ingestion/downloader.py` | 5 | Passing |
+| `ingestion/downloader.py` | 6 | Passing |
 | `ingestion/sec_html_parser.py` | 12 | Passing |
 | `ingestion/sec_chunker.py` | 8 | Passing |
+| `storage/writer.py` | 3 | Passing (DB-backed; requires `DB_URL`) |
 | `ingestion/sec_proxy_parser.py` (legacy stub) | 8 | Passing |
-| Total | 43 | All green |
+| Total | 47 | All green |
 
 ---
 
 ## Deferred to M1
 
-- PostgreSQL write layer (`storage/writer.py`)
 - Qdrant vector ingestion
 - Voyage Finance-2 embedding calls
 - spaCy section detection as fallback when regex fails
 - Exact character offset tracking
-- Remaining four filings through full notebook pipeline

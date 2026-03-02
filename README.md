@@ -1,42 +1,53 @@
 # sec-rag-pipeline
 
-A production-grade Retrieval-Augmented Generation pipeline for SEC proxy filings (DEF 14A) and 10-K documents.
+SEC filing RAG pipeline for DEF 14A and 10-K documents.
 
-## Architecture
+This repository implements a deterministic ingestion path from SEC EDGAR HTML to auditable chunk records in PostgreSQL, with citation-ready metadata for downstream retrieval and generation.
 
-```
-EDGAR (edgartools)
-    └─► ingestion/       — SECProxyParser (BeautifulSoup + SEC section detection)
-            └─► chunking/    — LangChain splitter, table-safe, 600t/100t overlap
-                    └─► storage/     — PostgreSQL + pgvector (documents→sections→chunks→embeddings)
-                            └─► indexing/    — Voyage Finance-2 embeddings → Qdrant
-                                    └─► retrieval/   — Hybrid BM25 + vector, RRF merge, cross-encoder re-rank
-                                            └─► generation/ — LLM prompt assembly + citation extraction
-```
+## Current milestone status
 
-## Quickstart
+M0 is complete for fixture processing:
+- Download + cache filings from `fixtures/manifest.csv`
+- Parse SEC HTML into typed blocks (`SECHTMLParser`)
+- Chunk blocks with citation strings (`SECChunker`)
+- Persist chunks idempotently into Postgres (`ChunkWriter`)
+- Produce batch evidence output in `output/m0_batch_summary.csv`
+
+## Pipeline
+
+1. `ingestion/downloader.py` resolves accession numbers (including TBD via edgartools) and caches raw HTML.
+2. `ingestion/sec_html_parser.py` extracts headings, prose, tables, footnotes, images, and XBRL-tagged content.
+3. `ingestion/sec_chunker.py` emits token-bounded chunks (tables are atomic).
+4. `storage/writer.py` writes documents/sections/chunks into PostgreSQL with upsert-on-chunk-id behavior.
+
+## Key notebooks
+
+- `notebooks/03_ingest_parse_chunk.ipynb`: single-filing audit run and chunk export.
+- `notebooks/04_batch_ingest.ipynb`: all 5 fixture filings in one session with M0 gate assertions.
+
+## Local setup
 
 ```bash
 cp .env.example .env
-# Fill in API keys
-docker compose up -d
+# Fill required env vars (SEC_USER_AGENT, DB_URL, API keys for later milestones)
+
+docker compose up -d postgres qdrant
 poetry install
-poetry run pytest tests/ -v
 ```
 
-## Phase Plan
+## Validation commands
 
-| Phase | Scope | Days |
-|-------|-------|------|
-| 0 | Repo init, TDD baseline, infra | 1 |
-| 1 | Ingestion: SECProxyParser + edgartools | 1–2 |
-| 2 | Chunking + Voyage embeddings | 2–3 |
-| 3 | PostgreSQL schema + pgvector | 3 |
-| 4 | Hybrid retrieval + LLM generation | 4–5 |
-| 5 | FastAPI endpoints + query UI | 6+ |
+```bash
+pytest tests/unit/ -v
+mypy --strict ingestion/sec_html_parser.py ingestion/sec_chunker.py ingestion/downloader.py storage/writer.py
+ruff check ingestion/ storage/ tests/unit/
+```
 
-## Reuse from stark-translate-agent
+## Repository structure
 
-- `ingestion/html_parser.py` — ported from `file_parser.py`, BeautifulSoup base retained
-- `core/config.py` — stripped of stark-* branding, re-parameterized for SEC/RAG env vars
-- All stark-specific orchestration, Jinja2 templates, and task state machine are **not** ported
+- `ingestion/` SEC download, parsing, and chunking
+- `storage/` database schema, migrations, and write layer
+- `retrieval/` hybrid ranking logic
+- `generation/` prompt/citation assembly
+- `notebooks/` reproducible audit artifacts
+- `docs/` technical and researcher-facing project status

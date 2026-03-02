@@ -1,6 +1,6 @@
 # Executive Summary — sec-rag-pipeline
 
-## Last updated: 2026-03-01
+## Last updated: 2026-03-02
 
 ## What this system does
 
@@ -16,9 +16,18 @@ and executive pay analysis. Outputs are suitable for citation in peer-reviewed w
 
 ## What researchers can do today
 
-Researchers can run `notebooks/03_ingest_parse_chunk.ipynb` to download a DEF 14A filing from SEC EDGAR, parse it into typed blocks, and export a citation-ready chunk manifest CSV. The current workflow provides a transparent path from source HTML to structured outputs that can be inspected and validated manually.
+Researchers can run `notebooks/03_ingest_parse_chunk.ipynb` to download a DEF 14A filing from SEC EDGAR, parse it into typed blocks, and export a citation-ready chunk manifest CSV. The workflow provides a transparent path from source HTML to structured outputs that can be inspected and validated manually.
 
-Researchers can review section-labelled chunks and citation strings directly in `output/chunks_cnob_m0.csv`. Each chunk is traceable to the underlying filing text, which supports reproducible evidence collection for compensation and governance studies.
+Researchers can also run `notebooks/04_batch_ingest.ipynb` to download, parse, chunk, and store all five fixture proxy statements in a single session, then review row-level storage counts in `output/m0_batch_summary.csv`.
+
+---
+
+## What is not yet available
+
+- Natural language query interface (M1)
+- Search across multiple filings simultaneously (M1)
+- Embedding-based semantic search (M1)
+- LLM-generated answers with citations (M2)
 
 ---
 
@@ -28,7 +37,9 @@ Researchers can review section-labelled chunks and citation strings directly in 
 - Receive answers with verifiable citations to the source document
 - Search filings using semantic similarity, not only exact keyword matches
 - Retrieve evidence from both lexical and vector search in a single ranked result set
-- Process the remaining fixture filings (Apple, Microsoft, Johnson & Johnson, and Caterpillar) through the same pipeline
+- Expand from deterministic ingest/chunk/storage to embedding and hybrid retrieval workflows
+
+M0 sign-off evidence: `notebooks/03_ingest_parse_chunk.ipynb` and `notebooks/04_batch_ingest.ipynb` run to completion with assertions passing, and outputs are exported to `output/chunks_cnob_m0.csv` and `output/m0_batch_summary.csv`.
 
 ---
 

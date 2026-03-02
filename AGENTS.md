@@ -94,3 +94,11 @@ docker compose up -d postgres qdrant
 poetry install
 poetry run pytest tests/ -v
 ```
+
+## M0 Complete State
+
+All five fixture filings are parseable by `SECHTMLParser` and `SECChunker`.
+`notebooks/04_batch_ingest.ipynb` is the M0 evidence artifact.
+`output/m0_batch_summary.csv` contains the final row counts per filing.
+PostgreSQL write layer is in `storage/writer.py`.
+Next milestone (M1) begins with embedding and vector storage.

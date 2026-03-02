@@ -1,6 +1,6 @@
 # Researcher Guide — sec-rag-pipeline
 
-## Last updated: 2026-03-01
+## Last updated: 2026-03-02
 
 ## Who this is for
 
@@ -57,6 +57,25 @@ Run all cells top to bottom. The notebook will:
 6. Assert all data integrity constraints
 
 If the final cell prints `✓ All M0 assertions passed`, the pipeline is verified.
+
+---
+
+## Running the full M0 batch (all 5 fixture filings)
+
+Open:
+```bash
+poetry run jupyter lab notebooks/04_batch_ingest.ipynb
+```
+
+Run all cells top to bottom. The notebook will:
+1. Read `fixtures/manifest.csv`
+2. Resolve/download all fixture filings with cache support
+3. Parse and chunk each filing
+4. Write all chunks to PostgreSQL via `ChunkWriter`
+5. Export `output/m0_batch_summary.csv`
+6. Assert M0 gates across all filings
+
+If the final cell prints `✓ All M0 gate assertions passed`, batch ingest is verified.
 
 ---
 
@@ -129,7 +148,6 @@ After locating the text in the HTML, confirm it appears under the same section c
 
 ## Known limitations (M0)
 
-- Only ConnectOne Bancorp has been processed through the full pipeline. The remaining four filings (Apple, Microsoft, J&J, Caterpillar) are scheduled for M1.
 - Character offset tracking is approximate in M0. Do not use `source_char_start`/`source_char_end` for production citation purposes until M1.
 - The query interface (natural language questions) is not yet available. In M0 you work directly with the CSV.
 - Image blocks are captured with alt text and caption only. Image content is not analysed.
