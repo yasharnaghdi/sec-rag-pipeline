@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from ingestion.downloader import FilingDownloader
@@ -105,3 +106,30 @@ def test_returned_metadata_has_raw_html_path(tmp_path: Path) -> None:
     assert expected_path.exists()
     assert downloaded[0].raw_html_path == str(expected_path)
 
+
+def test_resolve_and_download_tbd_accession_calls_edgartools(tmp_path: Path) -> None:
+    resolved_accession = "000200406-24-000333"
+    edgar_client = FakeEdgarClient(resolved_accession=resolved_accession)
+    downloader = FilingDownloader(raw_dir=tmp_path, edgar_client=edgar_client)
+    row = pd.Series(
+        {
+            "slot": 4,
+            "cik": "200406",
+            "company_name": "Johnson & Johnson",
+            "ticker": "JNJ",
+            "industry": "Healthcare",
+            "form_type": "DEF 14A",
+            "filing_date": "2024-04-11",
+            "accession_number": FilingDownloader.TBD_ACCESSION,
+            "edgar_url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=200406&type=DEF+14A",
+        }
+    )
+
+    resolved = downloader.resolve_and_download(row)
+
+    assert len(edgar_client.resolve_calls) == 1
+    assert edgar_client.resolve_calls[0] == ("200406", FilingDownloader.JNJ_CUTOFF_DATE)
+    assert resolved.accession_number == resolved_accession
+    assert resolved.document_id == FilingDownloader.build_document_id("200406", resolved_accession)
+    assert resolved.raw_html_path is not None
+    assert Path(resolved.raw_html_path).exists()

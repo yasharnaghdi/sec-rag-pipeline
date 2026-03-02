@@ -6,6 +6,8 @@ TODO (Phase 1 implementation):
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from core.models import FilingMetadata
 from core.config import get_settings
 
@@ -21,7 +23,7 @@ class EdgarDownloader:
 
     def download_proxy_filing(
         self, cik: str, year: int
-    ) -> tuple["Path", FilingMetadata]:  # type: ignore[name-defined]
+    ) -> tuple[Path, FilingMetadata]:
         """Download DEF 14A for a given CIK and fiscal year.
 
         Returns:

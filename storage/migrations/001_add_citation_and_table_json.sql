@@ -1,0 +1,5 @@
+ALTER TABLE chunks
+ADD COLUMN IF NOT EXISTS citation_string TEXT;
+
+ALTER TABLE chunks
+ADD COLUMN IF NOT EXISTS table_json JSONB;

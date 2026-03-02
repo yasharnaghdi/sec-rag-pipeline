@@ -1,6 +1,6 @@
 # Technical Audit Log — sec-rag-pipeline
 
-## Last updated: 2026-03-01
+## Last updated: 2026-03-02
 
 ## Purpose
 
@@ -25,6 +25,12 @@ All layers in M0 are deterministic and require no LLM calls.
 
 ---
 
+## What has been built
+
+The storage layer is now implemented in `storage/writer.py` with idempotent Postgres upserts for chunks, including citation and table JSON persistence. The batch evidence workflow is captured in `notebooks/04_batch_ingest.ipynb`, which processes all five fixture filings from `fixtures/manifest.csv` end-to-end (download, parse, chunk, store) and exports `output/m0_batch_summary.csv` for M0 audit verification.
+
+---
+
 ## Closed architectural decisions
 
 | Decision | Resolution | Date |
@@ -40,20 +46,20 @@ All layers in M0 are deterministic and require no LLM calls.
 
 ## M0 implementation status
 
-### Task 1 — Document block models (PR #1, merged 2026-02-27)
+### Document block models (PR #1, merged 2026-02-27)
 - `ingestion/metadata_model.py`: all eight Pydantic classes implemented
 - SHA-256 deterministic block IDs
 - `fiscal_year_end` optional with default `None` for backward compatibility
 - 10 unit tests passing
 
-### Task 2 — EDGAR downloader (PR #2, merged 2026-02-27)
+### EDGAR downloader (PR #2, merged 2026-02-27)
 - `ingestion/downloader.py`: manifest-driven downloader with cache-hit detection
 - Runtime TBD accession resolution via edgartools for J&J slot
 - `SEC_USER_AGENT` enforcement at instantiation
 - Deterministic output filenames: `{cik}_{accession_normalized}.html`
-- 5 unit tests passing, all edgartools calls mockable via dependency injection
+- 6 unit tests passing, all edgartools calls mockable via dependency injection
 
-### Task 3 — HTML parser, chunker, notebook (PR #3, in progress)
+### HTML parser, chunker, notebook (PR #3, complete)
 - `ingestion/sec_html_parser.py`: `SECHTMLParser.parse()` returns `list[BaseBlock]`
   - Heading detection: tag-based, bold heuristic, all-caps heuristic, keyword match (SEC_SECTION_PATTERNS)
   - Table extraction: rows, header_row_count, linearized_text, has_merged_cells, colspan expansion
@@ -73,6 +79,8 @@ All layers in M0 are deterministic and require no LLM calls.
 - 20 unit tests passing (12 parser + 8 chunker)
 - mypy --strict: no errors
 - ruff: no errors
+- `storage/writer.py`: PostgreSQL write layer implemented with idempotent chunk upserts and citation/table JSON persistence
+- `notebooks/04_batch_ingest.ipynb`: batch M0 evidence notebook for all 5 fixture filings with gate assertions and CSV export
 
 ---
 
@@ -100,8 +108,6 @@ Sections not matching any pattern receive `section_id` inherited from the most r
 ## Known limitations (M0)
 
 - `source_char_start` / `source_char_end` are approximate (based on `raw_html.find(str(tag))`). Exact offsets deferred to M1.
-- Storage layer (PostgreSQL write) not yet wired. Chunks exist only in memory and in the exported CSV.
-- Only ConnectOne Bancorp has been run through the live notebook. Apple, Microsoft, J&J, Caterpillar filings are in `fixtures/manifest.csv` but not yet parsed.
 - Embeddings stubbed. Qdrant not populated. Vector search not available.
 - spaCy/NLTK NLP pipeline not yet integrated. Section detection relies on regex only in M0.
 
@@ -112,19 +118,18 @@ Sections not matching any pattern receive `section_id` inherited from the most r
 | Module | Tests | Status |
 |---|---|---|
 | `ingestion/metadata_model.py` | 10 | Passing |
-| `ingestion/downloader.py` | 5 | Passing |
+| `ingestion/downloader.py` | 6 | Passing |
 | `ingestion/sec_html_parser.py` | 12 | Passing |
 | `ingestion/sec_chunker.py` | 8 | Passing |
+| `storage/writer.py` | 3 | Passing (DB-backed; requires `DB_URL`) |
 | `ingestion/sec_proxy_parser.py` (legacy stub) | 8 | Passing |
-| Total | 43 | All green |
+| Total | 47 | All green |
 
 ---
 
 ## Deferred to M1
 
-- PostgreSQL write layer (`storage/writer.py`)
 - Qdrant vector ingestion
 - Voyage Finance-2 embedding calls
 - spaCy section detection as fallback when regex fails
 - Exact character offset tracking
-- Remaining four filings through full notebook pipeline

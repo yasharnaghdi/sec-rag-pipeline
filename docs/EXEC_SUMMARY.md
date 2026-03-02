@@ -1,6 +1,6 @@
 # Executive Summary — sec-rag-pipeline
 
-## Last updated: 2026-03-01
+## Last updated: 2026-03-02
 
 ## What this system does
 
@@ -24,13 +24,14 @@ Run `notebooks/03_ingest_parse_chunk.ipynb` to:
 - Export a fully-cited chunk manifest to `output/chunks_cnob_m0.csv`
 - Verify that all data is traceable back to the source HTML character-for-character
 
+Run `notebooks/04_batch_ingest.ipynb` to download, parse, chunk, and store all five proxy statements in a single session.
+
 **What is not yet available:**
 
 - Natural language query interface (M1)
 - Search across multiple filings simultaneously (M1)
 - Embedding-based semantic search (M1)
 - LLM-generated answers with citations (M2)
-- Apple, Microsoft, J&J, and Caterpillar filings processed (M1)
 
 ---
 
@@ -42,7 +43,7 @@ Run `notebooks/03_ingest_parse_chunk.ipynb` to:
 | M1 | Embed chunks, store in pgvector + Qdrant, BM25 + vector hybrid retrieval | Not started |
 | M2 | LLM generation with citations, evaluation against 7 benchmark queries | Not started |
 
-M0 sign-off criteria: `notebooks/03_ingest_parse_chunk.ipynb` runs to completion with all assertions passing for all 5 fixture filings, and `output/chunks_cnob_m0.csv` is committed to the repository.
+M0 sign-off evidence: `notebooks/03_ingest_parse_chunk.ipynb` and `notebooks/04_batch_ingest.ipynb` run to completion with assertions passing, and outputs are exported to `output/chunks_cnob_m0.csv` and `output/m0_batch_summary.csv`.
 
 ---
 
