@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import AsyncGenerator
 from datetime import date
 from pathlib import Path
@@ -14,6 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from ingestion.metadata_model import DocumentMetadata
 from ingestion.sec_chunker import Chunk
 from storage.writer import ChunkWriter, _to_async_db_url
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove -- line comments before splitting on semicolons."""
+    return re.sub(r"--[^\n]*", "", sql)
 
 
 def _async_db_url(raw_db_url: str) -> str:
@@ -105,11 +111,11 @@ async def db_engine() -> AsyncGenerator[AsyncEngine, None]:
     )
 
     async with engine.begin() as conn:
-        for statement in schema_sql.split(";"):
+        for statement in _strip_sql_comments(schema_sql).split(";"):
             cleaned = statement.strip()
             if cleaned:
                 await conn.execute(text(cleaned))
-        for statement in migration_sql.split(";"):
+        for statement in _strip_sql_comments(migration_sql).split(";"):
             cleaned = statement.strip()
             if cleaned:
                 await conn.execute(text(cleaned))
