@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+import ingestion.edgar_folder_fetcher as edgar_folder_fetcher
 from ingestion.cda_extractor import extract_cda
 from ingestion.comp_table_extractor import (
     extract_equity_awards,
@@ -20,7 +21,6 @@ from ingestion.comp_table_extractor import (
     extract_pension_benefits,
     extract_summary_compensation,
 )
-from ingestion.edgar_folder_fetcher import fetch_all_def14a
 from ingestion.metadata_model import DocumentMetadata
 from ingestion.sec_chunker import SECChunker
 from ingestion.sec_html_parser import SECHTMLParser
@@ -199,13 +199,28 @@ def _read_ciks(input_csv: Path) -> list[str]:
     return [row[0].strip() for row in data_rows if row and row[0].strip()]
 
 
-def _safe_iso_date(value: str) -> date:
-    if not value:
-        return date.today()
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        return date.today()
+def _safe_iso_date(value: object) -> date:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return date.today()
+    return date.today()
+
+
+def _fetch_filing_records(cik: str, years_back: int) -> list[Any]:
+    fetch_all = getattr(edgar_folder_fetcher, "fetch_all_def14a", None)
+    if callable(fetch_all):
+        return list(fetch_all(cik, max_filings=years_back))
+
+    fetch_single = getattr(edgar_folder_fetcher, "fetch_filing", None)
+    if callable(fetch_single):
+        return [fetch_single(cik=cik, folder_id=cik, form_type="DEF 14A")]
+
+    msg = "No supported DEF 14A fetch function found in ingestion.edgar_folder_fetcher"
+    raise AttributeError(msg)
 
 
 def _configure_csv_field_limit() -> None:
@@ -406,43 +421,61 @@ def main() -> None:
             log.info("-- CIK %s/%s: %s --", cik_index, len(cik_list), cik)
 
             try:
-                filing_records = fetch_all_def14a(cik, max_filings=args.years_back)
+                filing_records = _fetch_filing_records(cik, args.years_back)
             except Exception as exc:
                 log.error("  submissions fetch failed for CIK %s: %s", cik, exc)
                 continue
 
             for filing in filing_records:
                 total_filings += 1
-                accession = filing.accession_number
+                accession = str(getattr(filing, "accession_number", "") or "")
+                filing_date_obj = _safe_iso_date(getattr(filing, "filing_date", None))
+                filing_date_text = filing_date_obj.isoformat()
+                fiscal_year_text = str(getattr(filing, "fiscal_year", "") or "")
+                if not fiscal_year_text:
+                    fiscal_year_text = str(filing_date_obj.year - 1)
+                company_name = str(getattr(filing, "company_name", "") or "")
+                source_url = str(
+                    getattr(filing, "primary_doc_url", "") or getattr(filing, "filing_url", "") or ""
+                )
+                cache_path = getattr(filing, "cache_path", None)
+                cache_path_text = str(cache_path) if cache_path is not None else ""
 
                 if accession in already_done:
-                    log.info("  SKIP (already processed): %s %s", accession, filing.filing_date)
+                    log.info("  SKIP (already processed): %s %s", accession, filing_date_text)
                     continue
 
                 t0 = time.perf_counter()
                 meta: dict[str, Any] = {
                     "cik": cik,
-                    "company_name": filing.company_name,
+                    "company_name": company_name,
                     "ticker": "",
-                    "fiscal_year": filing.fiscal_year,
-                    "filing_date": filing.filing_date,
+                    "fiscal_year": fiscal_year_text,
+                    "filing_date": filing_date_text,
                     "accession_number": accession,
                 }
 
                 try:
-                    raw_html = filing.cache_path.read_text(encoding="utf-8", errors="replace")
-                    filing_date = _safe_iso_date(filing.filing_date)
+                    raw_html_value = getattr(filing, "raw_html", None)
+                    if isinstance(raw_html_value, str) and raw_html_value:
+                        raw_html = raw_html_value
+                    elif isinstance(cache_path, Path):
+                        raw_html = cache_path.read_text(encoding="utf-8", errors="replace")
+                    else:
+                        msg = f"Unable to resolve raw HTML for accession {accession}"
+                        raise ValueError(msg)
+                    filing_date = filing_date_obj
 
                     doc_meta = DocumentMetadata(
                         document_id=f"{cik}_{accession.replace('-', '_')}",
                         cik=cik,
-                        company_name=filing.company_name,
+                        company_name=company_name,
                         form_type="DEF 14A",
                         filing_date=filing_date,
                         accession_number=accession,
-                        source_url=filing.primary_doc_url,
+                        source_url=source_url,
                         fiscal_year_end=None,
-                        raw_html_path=str(filing.cache_path),
+                        raw_html_path=cache_path_text,
                     )
 
                     blocks = html_parser.parse(raw_html, doc_meta)
@@ -494,8 +527,8 @@ def main() -> None:
 
                     log.info(
                         "  ok %s FY%s | summary=%s equity=%s grants=%s opt=%s pension=%s cda=%s",
-                        filing.company_name[:30],
-                        filing.fiscal_year,
+                        company_name[:30] if company_name else "UNKNOWN",
+                        fiscal_year_text,
                         len(summary_rows),
                         len(equity_rows),
                         len(grants_rows),
@@ -505,7 +538,7 @@ def main() -> None:
                     )
                 except Exception as exc:
                     elapsed = time.perf_counter() - t0
-                    log.error("  FAILED %s %s: %s", accession, filing.filing_date, exc)
+                    log.error("  FAILED %s %s: %s", accession, filing_date_text, exc)
                     writers["folder_ingest_log.csv"].writerow(
                         {
                             **meta,
