@@ -1,6 +1,6 @@
 # Technical Audit Log — sec-rag-pipeline
 
-## Last updated: 2026-03-02
+## Last updated: 2026-03-03
 
 ## Purpose
 
@@ -47,6 +47,8 @@ The parser can convert filing HTML into typed document blocks, including heading
 The chunking layer can turn parsed blocks into stable, citable chunks with deterministic IDs, token counts, chunk indices, and citation strings. Tables are preserved as atomic chunks so structured compensation data remains intact for audit and downstream analysis.
 
 The storage layer is implemented in `storage/writer.py` with idempotent Postgres upserts for chunks, including citation and table JSON persistence. The migration `storage/migrations/001_add_citation_and_table_json.sql` adds required chunk columns for environments created before these fields existed.
+
+I/O hardening has been added for downloader and storage runtime paths. Downloader file writes and manifest reads now raise explicit path-scoped errors on OS failures, and storage DB URL normalization now converts `postgresql+psycopg2://` and `postgresql+psycopg://` URLs to `postgresql+asyncpg://` to avoid driver mismatch failures at runtime.
 
 The notebook workflow includes single-filing and batch evidence artifacts. `notebooks/03_ingest_parse_chunk.ipynb` provides filing-level audit output, and `notebooks/04_batch_ingest.ipynb` processes all five fixture filings end-to-end and exports `output/m0_batch_summary.csv`.
 

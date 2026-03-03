@@ -163,6 +163,10 @@ class ChunkWriter:
 def _to_async_db_url(db_url: str) -> str:
     if db_url.startswith("postgresql+asyncpg://"):
         return db_url
+    if db_url.startswith("postgresql+psycopg2://"):
+        return db_url.replace("postgresql+psycopg2://", "postgresql+asyncpg://", 1)
+    if db_url.startswith("postgresql+psycopg://"):
+        return db_url.replace("postgresql+psycopg://", "postgresql+asyncpg://", 1)
     if db_url.startswith("postgresql://"):
         return db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if db_url.startswith("postgres://"):

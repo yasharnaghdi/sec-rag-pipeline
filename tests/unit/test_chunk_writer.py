@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncGenerator
 from datetime import date
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ingestion.metadata_model import DocumentMetadata
 from ingestion.sec_chunker import Chunk
-from storage.writer import ChunkWriter
+from storage.writer import ChunkWriter, _to_async_db_url
 
 
 def _async_db_url(raw_db_url: str) -> str:
@@ -81,8 +82,18 @@ def _chunks(metadata: DocumentMetadata) -> list[Chunk]:
     ]
 
 
+def test_to_async_db_url_converts_psycopg_urls() -> None:
+    assert _to_async_db_url("postgresql+psycopg2://user:pw@host/db") == "postgresql+asyncpg://user:pw@host/db"
+    assert _to_async_db_url("postgresql+psycopg://user:pw@host/db") == "postgresql+asyncpg://user:pw@host/db"
+
+
+def test_to_async_db_url_preserves_asyncpg_url() -> None:
+    url = "postgresql+asyncpg://user:pw@host/db"
+    assert _to_async_db_url(url) == url
+
+
 @pytest_asyncio.fixture()
-async def db_engine() -> AsyncEngine:
+async def db_engine() -> AsyncGenerator[AsyncEngine, None]:
     raw_db_url = os.getenv("DB_URL")
     if not raw_db_url:
         pytest.skip("DB_URL is required for integration tests.")
@@ -107,14 +118,17 @@ async def db_engine() -> AsyncEngine:
     await engine.dispose()
 
 
-@pytest_asyncio.fixture(autouse=True)
+@pytest_asyncio.fixture()
 async def _truncate_tables(db_engine: AsyncEngine) -> None:
     async with db_engine.begin() as conn:
         await conn.execute(text("TRUNCATE TABLE embeddings, chunks, sections, documents CASCADE"))
 
 
 @pytest.mark.asyncio
-async def test_write_chunks_and_read_back_fields(db_engine: AsyncEngine) -> None:
+async def test_write_chunks_and_read_back_fields(
+    db_engine: AsyncEngine,
+    _truncate_tables: None,
+) -> None:
     metadata = _metadata()
     chunks = _chunks(metadata)
     writer = ChunkWriter(db_url=os.environ["DB_URL"])
@@ -140,7 +154,10 @@ async def test_write_chunks_and_read_back_fields(db_engine: AsyncEngine) -> None
 
 
 @pytest.mark.asyncio
-async def test_write_chunks_is_idempotent_on_chunk_id(db_engine: AsyncEngine) -> None:
+async def test_write_chunks_is_idempotent_on_chunk_id(
+    db_engine: AsyncEngine,
+    _truncate_tables: None,
+) -> None:
     metadata = _metadata()
     chunks = _chunks(metadata)
     writer = ChunkWriter(db_url=os.environ["DB_URL"])
@@ -156,7 +173,10 @@ async def test_write_chunks_is_idempotent_on_chunk_id(db_engine: AsyncEngine) ->
 
 
 @pytest.mark.asyncio
-async def test_table_json_is_stored_and_retrievable(db_engine: AsyncEngine) -> None:
+async def test_table_json_is_stored_and_retrievable(
+    db_engine: AsyncEngine,
+    _truncate_tables: None,
+) -> None:
     metadata = _metadata()
     chunks = _chunks(metadata)
     writer = ChunkWriter(db_url=os.environ["DB_URL"])

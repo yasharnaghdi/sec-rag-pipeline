@@ -60,7 +60,7 @@ class EdgartoolsClient:
 
     def __init__(self) -> None:
         try:
-            from edgar import Company, set_identity
+            from edgar import Company, set_identity  # type: ignore[import-untyped]
         except Exception as exc:  # pragma: no cover - import/runtime dependency
             raise ImportError(
                 "edgartools is required for downloader runtime operations."
@@ -174,7 +174,10 @@ class FilingDownloader:
                 accession_number=resolved.accession_number,
                 source_url=resolved.edgar_url,
             )
-            output_path.write_text(html, encoding="utf-8")
+            try:
+                output_path.write_text(html, encoding="utf-8")
+            except OSError as exc:
+                raise OSError(f"Failed to write filing HTML to {output_path}.") from exc
             resolved.raw_html_path = str(output_path)
             self._log_event("download", resolved, output_path, payload_size_bytes=len(html.encode("utf-8")))
             downloaded.append(resolved)
@@ -220,25 +223,28 @@ class FilingDownloader:
         """Load FilingMetadata entries from a manifest CSV file."""
         manifest = Path(manifest_path)
         filings: list[FilingMetadata] = []
-        with manifest.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_number, row in enumerate(reader, start=2):
-                filing_date_raw = self._required_field(row, "filing_date", row_number)
-                slot_raw = row.get("slot")
-                slot = int(slot_raw) if slot_raw else None
-                filings.append(
-                    FilingMetadata(
-                        slot=slot,
-                        cik=self._required_field(row, "cik", row_number),
-                        company_name=self._required_field(row, "company_name", row_number),
-                        ticker=row.get("ticker"),
-                        industry=row.get("industry"),
-                        form_type=self._required_field(row, "form_type", row_number),
-                        filing_date=date.fromisoformat(filing_date_raw),
-                        accession_number=self._required_field(row, "accession_number", row_number),
-                        edgar_url=self._required_field(row, "edgar_url", row_number),
+        try:
+            with manifest.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row_number, row in enumerate(reader, start=2):
+                    filing_date_raw = self._required_field(row, "filing_date", row_number)
+                    slot_raw = row.get("slot")
+                    slot = int(slot_raw) if slot_raw else None
+                    filings.append(
+                        FilingMetadata(
+                            slot=slot,
+                            cik=self._required_field(row, "cik", row_number),
+                            company_name=self._required_field(row, "company_name", row_number),
+                            ticker=row.get("ticker"),
+                            industry=row.get("industry"),
+                            form_type=self._required_field(row, "form_type", row_number),
+                            filing_date=date.fromisoformat(filing_date_raw),
+                            accession_number=self._required_field(row, "accession_number", row_number),
+                            edgar_url=self._required_field(row, "edgar_url", row_number),
+                        )
                     )
-                )
+        except OSError as exc:
+            raise OSError(f"Failed to read manifest file {manifest}.") from exc
         return filings
 
     @staticmethod
