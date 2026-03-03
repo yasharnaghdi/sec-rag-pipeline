@@ -16,5 +16,7 @@ coverage.xml
 *.ipynb_checkpoints
 data/raw/
 data/processed/
+output/
+.tmp_jupyter_config/
 *.log
 poetry.lock
