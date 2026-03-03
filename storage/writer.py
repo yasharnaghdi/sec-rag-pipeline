@@ -8,7 +8,7 @@ import os
 from collections import OrderedDict
 from collections.abc import Coroutine
 from threading import Thread
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import text
@@ -194,13 +194,14 @@ def _build_section_id_map(chunks: list[Chunk], document_id: str) -> OrderedDict[
     return section_ids
 
 
-def _json_payload(raw_json: str | None) -> object | None:
+def _json_payload(raw_json: str | None) -> str | None:
     if raw_json is None:
         return None
     try:
-        return cast(object, json.loads(raw_json))
-    except json.JSONDecodeError:
+        json.loads(raw_json)
         return raw_json
+    except json.JSONDecodeError:
+        return json.dumps(raw_json)
 
 
 def _run_coroutine_sync(coroutine: Coroutine[Any, Any, T]) -> T:
