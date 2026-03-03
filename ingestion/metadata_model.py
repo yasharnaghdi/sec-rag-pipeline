@@ -22,6 +22,7 @@ class BaseBlock(BaseModel):
     order_index: int
     source_char_start: int
     source_char_end: int
+    toc_page_range: tuple[int, int] | None = None
 
     @model_validator(mode="after")
     def assign_deterministic_id(self) -> BaseBlock:

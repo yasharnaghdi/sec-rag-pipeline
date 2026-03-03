@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from ingestion.metadata_model import DocumentMetadata, FilingMetadata
 
 if TYPE_CHECKING:
-    import pandas as pd  # type: ignore[import-untyped]
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class EdgartoolsClient:
 
     def __init__(self) -> None:
         try:
-            from edgar import Company, set_identity  # type: ignore[import-untyped]
+            from edgar import Company, set_identity
         except Exception as exc:  # pragma: no cover - import/runtime dependency
             raise ImportError(
                 "edgartools is required for downloader runtime operations."

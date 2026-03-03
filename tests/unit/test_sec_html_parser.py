@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+
 from ingestion.metadata_model import DocumentMetadata, FootnoteBlock, HeadingBlock, ImageBlock, TableBlock, XBRLTaggedBlock
-from ingestion.sec_html_parser import SECHTMLParser
+from ingestion.metadata_model import ProseBlock
+from ingestion.sec_html_parser import SECHTMLParser, _extract_toc
 
 
 def _metadata() -> DocumentMetadata:
@@ -113,3 +116,76 @@ def test_section_id_matches_heading_id_after_heading() -> None:
     first_heading = blocks[first_heading_index]
     assert isinstance(first_heading, HeadingBlock)
     assert blocks[first_heading_index + 1].section_id == first_heading.id
+
+
+def test_page_number_paragraph_not_emitted_as_block() -> None:
+    html = "<html><body><p>- 42 -</p></body></html>"
+    blocks = SECHTMLParser().parse(html, _metadata())
+    assert blocks == []
+
+
+def test_page_number_variations_filtered() -> None:
+    html = (
+        "<html><body>"
+        "<p>Page 42</p>"
+        "<p>42</p>"
+        "<p>Page 42 of 120</p>"
+        "</body></html>"
+    )
+    blocks = SECHTMLParser().parse(html, _metadata())
+    assert blocks == []
+
+
+def test_toc_extraction_returns_section_page_map() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr><td>Section</td><td>Page</td></tr>
+        <tr><td>EXECUTIVE COMPENSATION</td><td>10</td></tr>
+        <tr><td>SUMMARY COMPENSATION TABLE</td><td>12</td></tr>
+        <tr><td>CORPORATE GOVERNANCE</td><td>20</td></tr>
+        <tr><td>SECURITY OWNERSHIP</td><td>30</td></tr>
+      </table>
+    </body></html>
+    """
+    toc_map = _extract_toc(BeautifulSoup(html, "lxml"))
+    assert toc_map["EXECUTIVE COMPENSATION"] == (10, 11)
+    assert toc_map["SUMMARY COMPENSATION TABLE"] == (12, 19)
+    assert toc_map["SECURITY OWNERSHIP"] == (30, 31)
+
+
+def test_heading_block_carries_toc_page_range() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr><td>Section</td><td>Page</td></tr>
+        <tr><td>EXECUTIVE COMPENSATION</td><td>10</td></tr>
+        <tr><td>SUMMARY COMPENSATION TABLE</td><td>12</td></tr>
+        <tr><td>CORPORATE GOVERNANCE</td><td>20</td></tr>
+        <tr><td>SECURITY OWNERSHIP</td><td>30</td></tr>
+      </table>
+      <h2>EXECUTIVE COMPENSATION</h2>
+    </body></html>
+    """
+    blocks = SECHTMLParser().parse(html, _metadata())
+    heading = next(block for block in blocks if isinstance(block, HeadingBlock))
+    assert heading.toc_page_range == (10, 11)
+
+
+def test_prose_block_inherits_toc_page_range_from_section() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr><td>Section</td><td>Page</td></tr>
+        <tr><td>EXECUTIVE COMPENSATION</td><td>10</td></tr>
+        <tr><td>SUMMARY COMPENSATION TABLE</td><td>12</td></tr>
+        <tr><td>CORPORATE GOVERNANCE</td><td>20</td></tr>
+        <tr><td>SECURITY OWNERSHIP</td><td>30</td></tr>
+      </table>
+      <h2>EXECUTIVE COMPENSATION</h2>
+      <p>Compensation narrative paragraph.</p>
+    </body></html>
+    """
+    blocks = SECHTMLParser().parse(html, _metadata())
+    prose = next(block for block in blocks if isinstance(block, ProseBlock))
+    assert prose.toc_page_range == (10, 11)

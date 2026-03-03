@@ -58,6 +58,7 @@ class Chunk(BaseModel):
     chunk_index: int
     citation_string: str
     table_json: str | None = None
+    toc_page_range: tuple[int, int] | None = None
 
 
 class SECChunker:
@@ -65,15 +66,21 @@ class SECChunker:
 
     def __init__(
         self,
-        chunk_size: int = 600,
-        chunk_overlap: int = 100,
+        chunk_size: int = 1200,
+        chunk_overlap: int = 150,
+        table_chunk_size: int = 2400,
     ) -> None:
         if chunk_overlap >= chunk_size:
             msg = "chunk_overlap must be smaller than chunk_size"
             raise ValueError(msg)
+        if table_chunk_size <= 0:
+            msg = "table_chunk_size must be positive"
+            raise ValueError(msg)
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
+        self._table_chunk_size = table_chunk_size
         self._splitter = RecursiveCharacterTextSplitter(
+            separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=tiktoken_len,
@@ -87,7 +94,7 @@ class SECChunker:
         for block in blocks:
             if isinstance(block, TableBlock):
                 text = block.linearized_text
-                token_count = min(tiktoken_len(text), self._chunk_size)
+                token_count = min(tiktoken_len(text), self._table_chunk_size)
                 chunks.append(
                     self._build_chunk(
                         block=block,
@@ -130,9 +137,14 @@ class SECChunker:
         table_json: str | None,
     ) -> Chunk:
         """Construct a single chunk with citation metadata."""
+        page_ref = (
+            f" | pp.{block.toc_page_range[0]}-{block.toc_page_range[1]}"
+            if block.toc_page_range is not None
+            else ""
+        )
         citation_string = (
             f"{metadata.company_name} | {metadata.form_type} | {metadata.filing_date} | "
-            f"{block.section_id} | chunk {chunk_index}"
+            f"{block.section_id}{page_ref} | chunk {chunk_index}"
         )
         return Chunk(
             source_block_id=block.id,
@@ -143,6 +155,7 @@ class SECChunker:
             chunk_index=chunk_index,
             citation_string=citation_string,
             table_json=table_json,
+            toc_page_range=block.toc_page_range,
         )
 
     def _split_text(self, text: str) -> list[str]:

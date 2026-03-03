@@ -27,6 +27,7 @@ def _prose_block(text: str, section_id: str = "preamble", order_index: int = 0) 
         order_index=order_index,
         source_char_start=0,
         source_char_end=len(text),
+        toc_page_range=None,
         text=text,
         token_count=max(1, len(text.split())),
     )
@@ -41,6 +42,7 @@ def _table_block(section_id: str = "sec_table", order_index: int = 1) -> TableBl
         order_index=order_index,
         source_char_start=0,
         source_char_end=100,
+        toc_page_range=None,
         rows=rows,
         header_row_count=1,
         linearized_text=linearized,
@@ -79,10 +81,10 @@ def test_chunk_indices_monotonically_increasing_from_zero() -> None:
     assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
 
 
-def test_chunk_token_count_never_exceeds_600() -> None:
+def test_prose_chunk_max_1200_tokens() -> None:
     long_text = "token " * 1800
     chunks = SECChunker().chunk_blocks([_prose_block(long_text.strip())], _metadata())
-    assert all(chunk.token_count <= 600 for chunk in chunks)
+    assert all(chunk.token_count <= 1200 for chunk in chunks)
 
 
 def test_chunk_inherits_section_id_from_block() -> None:
@@ -108,20 +110,46 @@ def test_chunk_citation_string_format() -> None:
     assert chunk.citation_string == expected
 
 
-def test_table_chunk_token_count_capped_to_chunk_budget() -> None:
-    long_linearized = "token " * 1200
+def test_table_chunk_uses_table_chunk_size_limit() -> None:
+    long_linearized = "token " * 3200
     table_block = TableBlock(
         document_id="712771_000143774925011656",
         section_id="sec_table",
         order_index=0,
         source_char_start=0,
         source_char_end=100,
+        toc_page_range=None,
         rows=[["token", "token"], ["token", "token"]],
         header_row_count=1,
         linearized_text=long_linearized.strip(),
         footnotes={},
         has_merged_cells=False,
-        token_count_linearized=1200,
+        token_count_linearized=3200,
     )
     chunk = SECChunker().chunk_blocks([table_block], _metadata())[0]
-    assert chunk.token_count == 600
+    assert chunk.token_count == 2400
+
+
+def test_chunk_citation_includes_page_range_when_available() -> None:
+    metadata = _metadata()
+    block = _prose_block("Short paragraph.", section_id="section_exec_comp")
+    block.toc_page_range = (42, 43)
+    chunk = SECChunker().chunk_blocks([block], metadata)[0]
+    expected = (
+        f"{metadata.company_name} | {metadata.form_type} | {metadata.filing_date} | "
+        f"{chunk.section_id} | pp.42-43 | chunk {chunk.chunk_index}"
+    )
+    assert chunk.citation_string == expected
+    assert chunk.toc_page_range == (42, 43)
+
+
+def test_chunk_toc_page_range_none_when_not_in_toc() -> None:
+    metadata = _metadata()
+    block = _prose_block("Short paragraph.", section_id="section_exec_comp")
+    chunk = SECChunker().chunk_blocks([block], metadata)[0]
+    assert chunk.toc_page_range is None
+    expected = (
+        f"{metadata.company_name} | {metadata.form_type} | {metadata.filing_date} | "
+        f"{chunk.section_id} | chunk {chunk.chunk_index}"
+    )
+    assert chunk.citation_string == expected

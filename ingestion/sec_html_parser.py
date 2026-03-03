@@ -39,6 +39,11 @@ _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _PARSEABLE_TAGS = [*sorted(_HEADING_TAGS), "p", "div", "table", "img"]
 _XBRL_TAG_NAMES = {"ix:nonnumeric", "ix:nonfraction"}
 _FOOTNOTE_PATTERN = re.compile(r"^\s*([\(\*†‡]\d*[\)\.]?)\s+")
+_PAGE_NUMBER_PATTERN = re.compile(
+    r"^\s*[-–—]?\s*\d{1,3}\s*[-–—]?\s*$"
+    r"|^\s*[Pp]age\s+\d{1,3}\s*$"
+    r"|^\s*[Pp]age\s+\d{1,3}\s+of\s+\d{1,3}\s*$"
+)
 _DetectionMethod = Literal[
     "tag",
     "bold_heuristic",
@@ -52,9 +57,11 @@ class SECHTMLParser:
 
     def parse(self, raw_html: str, metadata: DocumentMetadata) -> list[BaseBlock]:
         soup = BeautifulSoup(raw_html, "lxml")
+        toc_map = _extract_toc(soup)
         blocks: list[BaseBlock] = []
         order_index = 0
         current_section_id = "preamble"
+        current_toc_page_range: tuple[int, int] | None = None
         search_cursor = 0
         footnote_links: dict[int, tuple[str, str, str]] = {}
 
@@ -70,12 +77,14 @@ class SECHTMLParser:
                 text = _tag_text(tag)
                 if not text:
                     continue
+                current_toc_page_range = toc_map.get(_normalize_section_label(text))
                 heading = HeadingBlock(
                     document_id=metadata.document_id,
                     section_id=current_section_id,
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     text=text,
                     level=int(tag.name[1]),
                     detection_method="tag",
@@ -95,6 +104,7 @@ class SECHTMLParser:
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     rows=rows,
                     header_row_count=header_row_count,
                     linearized_text=linearized_text,
@@ -116,6 +126,7 @@ class SECHTMLParser:
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     alt_text=alt_text,
                     position_token=f"[IMAGE:{alt_text}]",
                     caption_text=caption_text,
@@ -133,6 +144,7 @@ class SECHTMLParser:
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     marker=marker,
                     text=footnote_text,
                     linked_table_id=linked_table_id,
@@ -152,6 +164,7 @@ class SECHTMLParser:
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     text=text,
                     xbrl_tags=xbrl_annotations,
                     token_count=_token_count(text),
@@ -167,12 +180,14 @@ class SECHTMLParser:
             heading_info = _classify_heading_from_text(tag, text)
             if heading_info is not None:
                 level, detection_method = heading_info
+                current_toc_page_range = toc_map.get(_normalize_section_label(text))
                 heading = HeadingBlock(
                     document_id=metadata.document_id,
                     section_id=current_section_id,
                     order_index=order_index,
                     source_char_start=source_start,
                     source_char_end=source_end,
+                    toc_page_range=current_toc_page_range,
                     text=text,
                     level=level,
                     detection_method=detection_method,
@@ -182,12 +197,16 @@ class SECHTMLParser:
                 order_index += 1
                 continue
 
+            if _PAGE_NUMBER_PATTERN.match(text):
+                continue
+
             prose = ProseBlock(
                 document_id=metadata.document_id,
                 section_id=current_section_id,
                 order_index=order_index,
                 source_char_start=source_start,
                 source_char_end=source_end,
+                toc_page_range=current_toc_page_range,
                 text=text,
                 token_count=_token_count(text),
             )
@@ -236,6 +255,8 @@ def _classify_heading_from_text(
 ) -> tuple[int, _DetectionMethod] | None:
     if tag.name not in {"p", "div"}:
         return None
+    if _PAGE_NUMBER_PATTERN.match(text):
+        return None
 
     bold_method = _has_sole_bold_child(tag)
     if bold_method is not None and _is_all_caps_heading(text):
@@ -245,6 +266,53 @@ def _classify_heading_from_text(
         return 2, "keyword_match"
 
     return None
+
+
+def _normalize_section_label(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip().upper())
+    normalized = re.sub(r"[\s\.\u2022·•\-–—]+$", "", normalized)
+    return normalized
+
+
+def _extract_toc(soup: BeautifulSoup) -> dict[str, tuple[int, int]]:
+    """Extract a normalized section-to-page-range map from the first ToC-like table."""
+    toc: dict[str, tuple[int, int]] = {}
+    page_ref = re.compile(r"\b(\d{1,3})\s*$")
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 4:
+            continue
+
+        candidate_entries: list[tuple[str, int]] = []
+        for tr in rows:
+            cells = tr.find_all(["td", "th"])
+            if not cells:
+                continue
+            row_text = " ".join(cell.get_text(" ", strip=True) for cell in cells)
+            match = page_ref.search(row_text)
+            if match is None:
+                continue
+
+            label = _normalize_section_label(row_text[: match.start()])
+            if not label:
+                continue
+            candidate_entries.append((label, int(match.group(1))))
+
+        if len(candidate_entries) < 4:
+            continue
+
+        sorted_entries = sorted(candidate_entries, key=lambda item: item[1])
+        for index, (label, start_page) in enumerate(sorted_entries):
+            if index + 1 < len(sorted_entries):
+                next_start_page = sorted_entries[index + 1][1]
+                end_page = max(start_page, next_start_page - 1)
+            else:
+                end_page = start_page + 1
+            toc[label] = (start_page, end_page)
+        break
+
+    return toc
 
 
 def _extract_table_rows(table_tag: Tag) -> tuple[list[list[str]], int, str, bool]:
