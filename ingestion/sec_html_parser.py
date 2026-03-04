@@ -321,34 +321,62 @@ def _extract_table_rows(table_tag: Tag) -> tuple[list[list[str]], int, str, bool
     rows: list[list[str]] = []
     header_row_count = 0
     has_merged_cells = False
+    active_rowspans: dict[int, tuple[int, str]] = {}
 
     for tr in table_tag.find_all("tr"):
         row: list[str] = []
         row_cells = tr.find_all(["th", "td"])
-        if not row_cells:
+        if not row_cells and not active_rowspans:
             continue
 
-        all_header = True
+        col_index = 0
+        all_header = bool(row_cells)
+
+        def consume_rowspans() -> None:
+            nonlocal col_index
+            while col_index in active_rowspans:
+                remaining_rows, span_text = active_rowspans[col_index]
+                row.append(span_text)
+                if remaining_rows <= 1:
+                    del active_rowspans[col_index]
+                else:
+                    active_rowspans[col_index] = (remaining_rows - 1, span_text)
+                col_index += 1
+
+        consume_rowspans()
         for cell in row_cells:
+            consume_rowspans()
             text = cell.get_text(" ", strip=True)
-            colspan_raw = cell.get("colspan", "1")
-            try:
-                colspan = int(str(colspan_raw))
-            except ValueError:
-                colspan = 1
-            colspan = max(1, colspan)
-            if colspan > 1:
+            colspan = _parse_table_span(cell.get("colspan", "1"))
+            rowspan = _parse_table_span(cell.get("rowspan", "1"))
+
+            if colspan > 1 or rowspan > 1:
                 has_merged_cells = True
-            row.extend([text] * colspan)
+            for offset in range(colspan):
+                row.append(text)
+                if rowspan > 1:
+                    active_rowspans[col_index + offset] = (rowspan - 1, text)
+            col_index += colspan
             if cell.name != "th":
                 all_header = False
 
+        consume_rowspans()
+        if not row:
+            continue
         rows.append(row)
         if all_header:
             header_row_count += 1
 
     linearized_text = " | ".join(cell for row in rows for cell in row)
     return rows, header_row_count, linearized_text, has_merged_cells
+
+
+def _parse_table_span(raw_value: object) -> int:
+    try:
+        span = int(str(raw_value))
+    except (TypeError, ValueError):
+        span = 1
+    return max(1, span)
 
 
 def _iter_next_sibling_tags(tag: Tag, limit: int) -> Iterable[Tag]:
