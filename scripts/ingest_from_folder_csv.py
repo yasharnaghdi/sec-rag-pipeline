@@ -142,13 +142,19 @@ _OUTPUT_SCHEMAS: dict[str, list[str]] = {
 _DOLLAR_ONLY_PATTERN = re.compile(r"^\$[\d,\.]+$")
 
 
-def _open_writers(output_dir: Path) -> tuple[dict[str, csv.DictWriter[str]], dict[str, TextIO]]:
+def _open_writers(
+    output_dir: Path,
+    global_log_dir: Path,
+) -> tuple[dict[str, csv.DictWriter[str]], dict[str, TextIO]]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    global_log_dir.mkdir(parents=True, exist_ok=True)
     handles: dict[str, TextIO] = {}
     writers: dict[str, csv.DictWriter[str]] = {}
 
     for filename, fields in _OUTPUT_SCHEMAS.items():
-        path = output_dir / filename
+        # folder_ingest_log always goes to the global output dir.
+        target_dir = global_log_dir if filename == "folder_ingest_log.csv" else output_dir
+        path = target_dir / filename
         is_new = not path.exists()
         handle = path.open("a", newline="", encoding="utf-8")
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -404,6 +410,16 @@ def main() -> None:
         help="Process ALL CIKs - overrides --limit (use deliberately)",
     )
     ap.add_argument(
+        "--batch-label",
+        type=str,
+        default="",
+        help=(
+            "Optional label for this run (e.g. 'b01', 'b02'). "
+            "Outputs go to output/batch_<label>/. "
+            "If omitted, outputs go to output/ as before."
+        ),
+    )
+    ap.add_argument(
         "--build-master-only",
         action="store_true",
         help="Build output/master_compensation.csv from existing output CSV files and exit.",
@@ -415,10 +431,13 @@ def main() -> None:
         help="Max DEF 14A filings per CIK",
     )
     args = ap.parse_args()
+    batch_output_dir: Path = (
+        OUTPUT_DIR / f"batch_{args.batch_label}" if args.batch_label else OUTPUT_DIR
+    )
 
     if args.build_master_only:
-        _normalize_outputs(OUTPUT_DIR)
-        master_path, master_count = _build_master_compensation(OUTPUT_DIR)
+        _normalize_outputs(batch_output_dir)
+        master_path, master_count = _build_master_compensation(batch_output_dir)
         log.info("Master CSV rebuilt: %s (rows=%s)", master_path, master_count)
         return
 
@@ -430,11 +449,13 @@ def main() -> None:
         cik_list = cik_list[: args.limit]
 
     log.info(
-        "CIKs to process: %s  (limit=%s  all=%s  years_back=%s)",
+        "CIKs to process: %s  (limit=%s  all=%s  years_back=%s  batch=%s  out=%s)",
         len(cik_list),
         args.limit,
         args.all,
         args.years_back,
+        args.batch_label or "default",
+        batch_output_dir,
     )
 
     if args.dry_run:
@@ -443,7 +464,7 @@ def main() -> None:
         return
 
     already_done = _load_processed_accessions(OUTPUT_DIR)
-    writers, handles = _open_writers(OUTPUT_DIR)
+    writers, handles = _open_writers(batch_output_dir, OUTPUT_DIR)
     html_parser = SECHTMLParser()
     chunker = SECChunker()
 
@@ -606,10 +627,10 @@ def main() -> None:
         total_success,
         total_failed,
     )
-    _normalize_outputs(OUTPUT_DIR)
-    master_path, master_count = _build_master_compensation(OUTPUT_DIR)
+    _normalize_outputs(batch_output_dir)
+    master_path, master_count = _build_master_compensation(batch_output_dir)
     log.info("Master CSV: %s (rows=%s)", master_path, master_count)
-    log.info("Outputs in %s/", OUTPUT_DIR)
+    log.info("Outputs in %s/", batch_output_dir)
 
 
 if __name__ == "__main__":
