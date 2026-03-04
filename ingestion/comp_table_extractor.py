@@ -14,24 +14,56 @@ _TABLE_SIGNATURES: dict[str, list[str]] = {
     "summary_compensation": [
         "summary compensation table",
         "summary compensation",
+        "named executive officer compensation",
+        "compensation of named executive officers",
+        "annual compensation",
+        "total compensation",
     ],
     "equity_awards": [
         "outstanding equity awards at fiscal year",
+        "outstanding equity awards at year",
         "outstanding equity awards",
+        "unexercised options",
+        "equity awards outstanding",
     ],
     "grants_plan_based": [
         "grants of plan-based awards",
         "grants of plan based awards",
+        "plan-based award grants",
+        "incentive plan awards",
+        "fiscal year grants",
     ],
     "option_exercises": [
         "option exercises and stock vested",
         "options exercised and stock vested",
+        "option exercises and stock awards vested",
+        "exercised options and vested stock",
+        "stock option exercises",
     ],
     "pension_benefits": [
         "pension benefits",
         "defined benefit",
         "supplemental executive retirement",
+        "retirement benefits",
+        "nonqualified deferred compensation",
+        "serp",
     ],
+}
+
+_NUMERIC_COLUMNS = {
+    "salary",
+    "bonus",
+    "stock_awards",
+    "option_awards",
+    "total",
+    "grant_fair_value",
+    "threshold",
+    "target",
+    "maximum",
+    "options_value",
+    "stock_vested_value",
+    "present_value",
+    "payments",
 }
 
 _SUMMARY_COMP_COLS: dict[str, list[str]] = {
@@ -87,6 +119,19 @@ _PENSION_COLS: dict[str, list[str]] = {
 
 def _normalise(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def clean_numeric(val: str) -> float | None:
+    """Strip currency formatting and return float where possible."""
+    if not val or val.strip() in ("", "—", "-", "N/A", "n/a"):
+        return None
+
+    cleaned = re.sub(r"[$,\s]", "", val.strip())
+    cleaned = re.sub(r"^\((.+)\)$", r"-\1", cleaned)
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 def _heading_matches(heading_text: str, signatures: list[str]) -> bool:
@@ -210,7 +255,11 @@ def _map_row(
         canonical = column_map[index]
         if canonical is None:
             continue
-        output[canonical] = cell.strip()
+        value = cell.strip()
+        if canonical in _NUMERIC_COLUMNS:
+            output[canonical] = clean_numeric(value)
+        else:
+            output[canonical] = value
         mapped_values += 1
 
     if mapped_values == 0 and row:
