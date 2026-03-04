@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Iterable, Literal
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from bs4.element import NavigableString, Tag
 
 from ingestion.metadata_model import (
@@ -56,6 +57,7 @@ class SECHTMLParser:
     """Parse raw SEC proxy HTML into typed ingestion blocks."""
 
     def parse(self, raw_html: str, metadata: DocumentMetadata) -> list[BaseBlock]:
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
         soup = BeautifulSoup(raw_html, "lxml")
         toc_map = _extract_toc(soup)
         blocks: list[BaseBlock] = []
