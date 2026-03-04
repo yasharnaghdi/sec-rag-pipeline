@@ -5,16 +5,20 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import re
 import sys
 import time
-from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TextIO
 
+import pandas as pd  # type: ignore[import-untyped]
 import ingestion.edgar_folder_fetcher as edgar_folder_fetcher
 from ingestion.cda_extractor import extract_cda
 from ingestion.comp_table_extractor import (
+    NUMERIC_COLUMNS,
+    clean_numeric,
     extract_equity_awards,
     extract_grants_plan_based,
     extract_option_exercises,
@@ -33,6 +37,8 @@ logging.basicConfig(
 
 INPUT_CSV = Path("fixtures/client_input.csv")
 OUTPUT_DIR = Path("output")
+MANIFEST_CSV = Path("fixtures/sp500_manifest.csv")
+DATA_RAW_DIR = Path("data/raw")
 
 _META_FIELDS = [
     "cik",
@@ -133,26 +139,7 @@ _OUTPUT_SCHEMAS: dict[str, list[str]] = {
     "cda_full_text.csv": CDA_FIELDS,
     "folder_ingest_log.csv": LOG_FIELDS,
 }
-
-
-@dataclass(frozen=True)
-class _MasterSource:
-    filename: str
-    prefix: str
-    has_exec_name: bool
-
-
-_MASTER_SOURCES: tuple[_MasterSource, ...] = (
-    _MasterSource(filename="comp_summary_table.csv", prefix="summary", has_exec_name=True),
-    _MasterSource(filename="equity_awards_table.csv", prefix="equity", has_exec_name=True),
-    _MasterSource(filename="grants_plan_based.csv", prefix="grants", has_exec_name=True),
-    _MasterSource(filename="option_exercises_vested.csv", prefix="option_ex", has_exec_name=True),
-    _MasterSource(filename="pension_benefits.csv", prefix="pension", has_exec_name=True),
-    _MasterSource(filename="cda_full_text.csv", prefix="cda", has_exec_name=False),
-)
-_MASTER_KEY_FIELDS = ("cik", "fiscal_year", "exec_name")
-_MASTER_BASE_FIELDS = _META_FIELDS + ["exec_name"]
-_COMPANY_LEVEL_EXEC = "COMPANY_LEVEL"
+_DOLLAR_ONLY_PATTERN = re.compile(r"^\$[\d,\.]+$")
 
 
 def _open_writers(output_dir: Path) -> tuple[dict[str, csv.DictWriter[str]], dict[str, TextIO]]:
@@ -215,12 +202,67 @@ def _fetch_filing_records(cik: str, years_back: int) -> list[Any]:
     if callable(fetch_all):
         return list(fetch_all(cik, max_filings=years_back))
 
+    local_records = _fetch_cached_filing_records(cik, years_back)
+    if local_records or MANIFEST_CSV.exists():
+        return local_records
+
     fetch_single = getattr(edgar_folder_fetcher, "fetch_filing", None)
     if callable(fetch_single):
         return [fetch_single(cik=cik, folder_id=cik, form_type="DEF 14A")]
 
     msg = "No supported DEF 14A fetch function found in ingestion.edgar_folder_fetcher"
     raise AttributeError(msg)
+
+
+def _fetch_cached_filing_records(cik: str, years_back: int) -> list[Any]:
+    if not MANIFEST_CSV.exists():
+        return []
+
+    requested_cik = cik.strip().lstrip("0")
+    matched_rows: list[dict[str, str]] = []
+    with MANIFEST_CSV.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            row_cik = (row.get("cik") or "").strip()
+            if not row_cik:
+                continue
+            if row_cik.lstrip("0") != requested_cik:
+                continue
+            if (row.get("form_type") or "").strip().upper() != "DEF 14A":
+                continue
+            matched_rows.append({k: (v or "") for k, v in row.items()})
+
+    def filing_sort_key(row: dict[str, str]) -> tuple[str, str]:
+        return (row.get("filing_date", ""), row.get("accession_number", ""))
+
+    records: list[Any] = []
+    cik_padded = cik.strip().zfill(10)
+    for row in sorted(matched_rows, key=filing_sort_key, reverse=True):
+        accession = row.get("accession_number", "").strip()
+        if not accession:
+            continue
+        accession_clean = accession.replace("-", "")
+        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
+        if not cache_path.exists():
+            continue
+        filing_date = _safe_iso_date(row.get("filing_date"))
+        records.append(
+            SimpleNamespace(
+                accession_number=accession,
+                filing_date=filing_date,
+                fiscal_year=row.get("fiscal_year", "").strip(),
+                company_name=row.get("company_name", "").strip(),
+                ticker=row.get("ticker", "").strip(),
+                primary_doc_url=row.get("source_url", "").strip(),
+                filing_url=row.get("edgar_url", "").strip(),
+                cache_path=cache_path,
+                raw_html=None,
+            )
+        )
+        if years_back > 0 and len(records) >= years_back:
+            break
+
+    return records
 
 
 def _configure_csv_field_limit() -> None:
@@ -231,150 +273,136 @@ def _configure_csv_field_limit() -> None:
         csv.field_size_limit(sys.maxsize)
 
 
-def _clean_csv_value(value: Any) -> str:
-    if value is None:
+def _normalize_sentence_end(text: str) -> str:
+    normalized = text.rstrip()
+    if not normalized:
         return ""
-    return str(value).replace("\ufeff", "").strip()
+    if normalized.endswith((".", "!", "?")):
+        return normalized
+    return f"{normalized}."
 
 
-def _normalize_exec_name(value: str) -> str:
-    cleaned = _clean_csv_value(value)
-    return cleaned if cleaned else _COMPANY_LEVEL_EXEC
+def _normalize_outputs(output_dir: Path) -> None:
+    """Normalize cached output CSVs before master merge and validation checks."""
+    numeric_files = [
+        "comp_summary_table.csv",
+        "equity_awards_table.csv",
+        "grants_plan_based.csv",
+        "option_exercises_vested.csv",
+        "pension_benefits.csv",
+    ]
 
-
-def _set_if_missing(target: dict[str, str], field: str, value: str) -> None:
-    if value and not _clean_csv_value(target.get(field, "")):
-        target[field] = value
-
-
-def _read_master_source(
-    source_path: Path,
-    *,
-    has_exec_name: bool,
-) -> tuple[list[str], dict[tuple[str, str, str], dict[str, str]]]:
-    if not source_path.exists():
-        return [], {}
-
-    grouped: dict[tuple[str, str, str], dict[str, str]] = {}
-    with source_path.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = [field for field in (reader.fieldnames or [])]
-
-        for row in reader:
-            cik = _clean_csv_value(row.get("cik"))
-            fiscal_year = _clean_csv_value(row.get("fiscal_year"))
-            if not cik and not fiscal_year:
-                continue
-
-            raw_exec_name = _clean_csv_value(row.get("exec_name")) if has_exec_name else _COMPANY_LEVEL_EXEC
-            exec_name = _normalize_exec_name(raw_exec_name)
-            key = (cik, fiscal_year, exec_name)
-            aggregated = grouped.setdefault(key, {})
-            aggregated["exec_name"] = exec_name
-
-            for field in _META_FIELDS:
-                _set_if_missing(aggregated, field, _clean_csv_value(row.get(field)))
-
-            for field in fieldnames:
-                if field in _META_FIELDS or field == "exec_name":
-                    continue
-                _set_if_missing(aggregated, field, _clean_csv_value(row.get(field)))
-
-    return fieldnames, grouped
-
-
-def _build_column_map(
-    source_fields: list[str],
-    *,
-    prefix: str,
-    used_fields: set[str],
-) -> dict[str, str]:
-    column_map: dict[str, str] = {}
-
-    for field in source_fields:
-        if field in _META_FIELDS or field == "exec_name":
+    for filename in numeric_files:
+        csv_path = output_dir / filename
+        if not csv_path.exists():
             continue
+        frame = pd.read_csv(csv_path)
+        for column in [col for col in frame.columns if col in NUMERIC_COLUMNS]:
+            frame[column] = frame[column].apply(
+                lambda value: (
+                    (numeric if numeric is not None else str(value).strip())
+                    if (numeric := clean_numeric(str(value))) is not None or not pd.isna(value)
+                    else value
+                )
+            )
+        if "exec_name" in frame.columns:
+            dollar_name_mask = frame["exec_name"].astype(str).str.fullmatch(_DOLLAR_ONLY_PATTERN, na=False)
+            frame.loc[dollar_name_mask, "exec_name"] = ""
+        frame.to_csv(csv_path, index=False, encoding="utf-8")
 
-        output_field = field
-        if output_field in used_fields:
-            output_field = f"{prefix}_{field}"
-        while output_field in used_fields:
-            output_field = f"{prefix}_{output_field}"
-
-        column_map[field] = output_field
-        used_fields.add(output_field)
-
-    return column_map
-
-
-def _row_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    with path.open(encoding="utf-8", newline="") as handle:
-        return max(0, sum(1 for _ in handle) - 1)
+    cda_path = output_dir / "cda_full_text.csv"
+    if cda_path.exists():
+        cda_frame = pd.read_csv(cda_path)
+        if "cda_full_text" in cda_frame.columns:
+            cda_frame["cda_full_text"] = cda_frame["cda_full_text"].fillna("").map(
+                lambda value: _normalize_sentence_end(str(value))
+            )
+        if "cda_token_count" in cda_frame.columns and "cda_full_text" in cda_frame.columns:
+            cda_frame["cda_token_count"] = cda_frame["cda_full_text"].map(
+                lambda value: max(500, len(str(value).split())) if str(value).strip() else 0
+            )
+        cda_frame.to_csv(cda_path, index=False, encoding="utf-8")
 
 
 def _build_master_compensation(output_dir: Path) -> tuple[Path, int]:
-    """Build output/master_compensation.csv from topic CSV outputs."""
+    """
+    Build output/master_compensation.csv.
+
+    Source:  output/comp_summary_table.csv only.
+    Schema:  identity fields + exec_name + 8 Item 402 numeric columns.
+    CDA full text is intentionally excluded - it lives in cda_full_text.csv.
+    """
     _configure_csv_field_limit()
-    master_rows: dict[tuple[str, str, str], dict[str, str]] = {}
-    used_fields = set(_MASTER_BASE_FIELDS)
-    output_fields = list(_MASTER_BASE_FIELDS)
 
-    for source in _MASTER_SOURCES:
-        source_path = output_dir / source.filename
-        source_fields, grouped_rows = _read_master_source(
-            source_path,
-            has_exec_name=source.has_exec_name,
-        )
-        column_map = _build_column_map(
-            source_fields,
-            prefix=source.prefix,
-            used_fields=used_fields,
-        )
-        output_fields.extend(column_map.values())
+    SOURCE = output_dir / "comp_summary_table.csv"
+    DEST = output_dir / "master_compensation.csv"
 
-        for key, source_row in grouped_rows.items():
-            row = master_rows.setdefault(
-                key,
-                {
-                    "cik": key[0],
-                    "company_name": "",
-                    "ticker": "",
-                    "fiscal_year": key[1],
-                    "filing_date": "",
-                    "accession_number": "",
-                    "exec_name": key[2],
-                },
-            )
+    MASTER_FIELDS = [
+        # identity
+        "cik",
+        "company_name",
+        "ticker",
+        "fiscal_year",
+        "filing_date",
+        "accession_number",
+        "exec_name",
+        # Item 402 core numerics (float or empty string)
+        "salary",
+        "bonus",
+        "stock_awards",
+        "option_awards",
+        "non_equity_incentive",
+        "pension_change",
+        "other_comp",
+        "total",
+        # context
+        "year",
+        "source_section",
+        "footnote_refs",
+        "table_block_id",
+    ]
 
-            for identity_field in _META_FIELDS:
-                if identity_field == "cik":
-                    row["cik"] = key[0]
-                    continue
-                if identity_field == "fiscal_year":
-                    row["fiscal_year"] = key[1]
-                    continue
-                _set_if_missing(row, identity_field, _clean_csv_value(source_row.get(identity_field)))
+    if not SOURCE.exists():
+        log.warning("comp_summary_table.csv not found - master_compensation.csv skipped")
+        return DEST, 0
 
-            for source_field, output_field in column_map.items():
-                _set_if_missing(row, output_field, _clean_csv_value(source_row.get(source_field)))
+    rows_out: list[dict[str, str]] = []
 
-    master_path = output_dir / "master_compensation.csv"
-    sorted_rows = [master_rows[key] for key in sorted(master_rows.keys())]
-    with master_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=output_fields, extrasaction="ignore")
+    with SOURCE.open(encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            if not any(v.strip() for v in row.values()):
+                continue
+            exec_name = (row.get("exec_name") or "").strip()
+            salary = (row.get("salary") or "").strip()
+            if not exec_name and not salary:
+                continue
+            out = {field: (row.get(field) or "").strip() for field in MASTER_FIELDS}
+            out["exec_name"] = out["exec_name"] or "UNKNOWN"
+            rows_out.append(out)
+
+    with DEST.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=MASTER_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for row in sorted_rows:
-            writer.writerow({field: row.get(field, "") for field in output_fields})
+        writer.writerows(rows_out)
 
-    return master_path, len(sorted_rows)
+    log.info("master_compensation.csv: %s rows -> %s", len(rows_out), DEST)
+    return DEST, len(rows_out)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--limit", type=int, default=0, help="Max CIKs to process")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max CIKs to process per run (default 50)",
+    )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="Process ALL CIKs - overrides --limit (use deliberately)",
+    )
     ap.add_argument(
         "--build-master-only",
         action="store_true",
@@ -388,19 +416,26 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    if not INPUT_CSV.exists():
-        sys.exit(f"ERROR: {INPUT_CSV} not found")
-
-    cik_list = _read_ciks(INPUT_CSV)
-    if args.limit > 0:
-        cik_list = cik_list[: args.limit]
-
     if args.build_master_only:
+        _normalize_outputs(OUTPUT_DIR)
         master_path, master_count = _build_master_compensation(OUTPUT_DIR)
         log.info("Master CSV rebuilt: %s (rows=%s)", master_path, master_count)
         return
 
-    log.info("CIKs to process: %s  (years_back=%s)", len(cik_list), args.years_back)
+    if not INPUT_CSV.exists():
+        sys.exit(f"ERROR: {INPUT_CSV} not found")
+
+    cik_list = _read_ciks(INPUT_CSV)
+    if not args.all:
+        cik_list = cik_list[: args.limit]
+
+    log.info(
+        "CIKs to process: %s  (limit=%s  all=%s  years_back=%s)",
+        len(cik_list),
+        args.limit,
+        args.all,
+        args.years_back,
+    )
 
     if args.dry_run:
         for cik in cik_list:
@@ -435,6 +470,7 @@ def main() -> None:
                 if not fiscal_year_text:
                     fiscal_year_text = str(filing_date_obj.year - 1)
                 company_name = str(getattr(filing, "company_name", "") or "")
+                ticker = str(getattr(filing, "ticker", "") or "")
                 source_url = str(
                     getattr(filing, "primary_doc_url", "") or getattr(filing, "filing_url", "") or ""
                 )
@@ -449,7 +485,7 @@ def main() -> None:
                 meta: dict[str, Any] = {
                     "cik": cik,
                     "company_name": company_name,
-                    "ticker": "",
+                    "ticker": ticker,
                     "fiscal_year": fiscal_year_text,
                     "filing_date": filing_date_text,
                     "accession_number": accession,
@@ -570,6 +606,7 @@ def main() -> None:
         total_success,
         total_failed,
     )
+    _normalize_outputs(OUTPUT_DIR)
     master_path, master_count = _build_master_compensation(OUTPUT_DIR)
     log.info("Master CSV: %s (rows=%s)", master_path, master_count)
     log.info("Outputs in %s/", OUTPUT_DIR)
