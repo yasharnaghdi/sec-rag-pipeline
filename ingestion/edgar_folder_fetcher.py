@@ -303,6 +303,116 @@ def fetch_filing(
             http.close()
 
 
+def fetch_latest_def14a(
+    cik: str,
+    *,
+    session: requests.Session | None = None,
+) -> FetchedFiling:
+    """Return the most recent DEF 14A filing for a given CIK.
+
+    This is the correct acquisition entry point when only CIK codes are
+    available (for example `client_input.csv`). It performs no folder_id
+    or accession-suffix matching.
+
+    Args:
+        cik: SEC Central Index Key. May be zero-padded or bare digits.
+        session: Optional shared requests.Session for connection reuse.
+            If None, a new session is created and closed on exit.
+
+    Returns:
+        FetchedFiling with raw_html, accession_number, filing_date,
+        filing_url, and cache_path populated.
+
+    Raises:
+        ValueError: If CIK contains no digits, or no DEF 14A is found.
+        requests.HTTPError: On non-2xx HTTP responses.
+    """
+    cik_digits = _extract_digits(cik)
+    if not cik_digits:
+        raise ValueError(f"cik must contain at least one digit, got: {cik!r}")
+
+    cik_padded = cik_digits.zfill(10)
+    submissions_url = f"{_SEC_DATA_BASE}/submissions/CIK{cik_padded}.json"
+
+    owns_session = session is None
+    http = session or requests.Session()
+
+    try:
+        log.info("submissions index | cik=%s url=%s", cik_digits, submissions_url)
+        submissions_payload = _get_json(submissions_url, http)
+
+        entries = _extract_entries(submissions_payload)
+        entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
+
+        def14a_entries = [
+            entry
+            for entry in entries
+            if _normalize_form_type(entry.form) == "DEF14A"
+        ]
+        if not def14a_entries:
+            raise ValueError(
+                f"No DEF 14A filing found for CIK={cik_digits}. "
+                f"Checked {len(entries)} total filings in submissions index."
+            )
+
+        def _sort_key(entry: _FilingIndexEntry) -> tuple[int, str]:
+            return (1 if entry.filing_date is not None else 0, str(entry.filing_date or ""))
+
+        matched_entry = sorted(def14a_entries, key=_sort_key, reverse=True)[0]
+        log.info(
+            "latest DEF 14A | cik=%s accession=%s date=%s",
+            cik_digits,
+            matched_entry.accession_number,
+            matched_entry.filing_date,
+        )
+
+        accession_clean = matched_entry.accession_number.replace("-", "")
+        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
+
+        cik_no_leading_zeros = cik_digits.lstrip("0") or cik_digits
+        filing_url_base = (
+            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/"
+            f"{cik_no_leading_zeros}/{accession_clean}"
+        )
+
+        if cache_path.exists():
+            log.info("cache hit | path=%s", cache_path)
+            raw_html = cache_path.read_text(encoding="utf-8", errors="replace")
+            return FetchedFiling(
+                raw_html=raw_html,
+                accession_number=matched_entry.accession_number,
+                filing_date=matched_entry.filing_date,
+                filing_url=f"{filing_url_base}/{matched_entry.primary_document}",
+                cache_path=cache_path,
+            )
+
+        primary_document = _resolve_primary_document(
+            cik_digits,
+            accession_clean,
+            matched_entry.primary_document,
+            http,
+        )
+        filing_url = f"{filing_url_base}/{primary_document}"
+
+        log.info("downloading | url=%s", filing_url)
+        raw_html = _get_text(filing_url, http)
+
+        DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(raw_html, encoding="utf-8")
+        log.info("cached | path=%s chars=%s", cache_path, len(raw_html))
+
+        return FetchedFiling(
+            raw_html=raw_html,
+            accession_number=matched_entry.accession_number,
+            filing_date=matched_entry.filing_date,
+            filing_url=filing_url,
+            cache_path=cache_path,
+        )
+    finally:
+        if owns_session:
+            http.close()
+
+
 def fetch_filing_html(
     cik: str,
     folder_id: str,
