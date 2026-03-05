@@ -50,11 +50,14 @@ _TABLE_SIGNATURES: dict[str, list[str]] = {
     ],
 }
 
-_NUMERIC_COLUMNS = {
+NUMERIC_COLUMNS = {
     "salary",
     "bonus",
     "stock_awards",
     "option_awards",
+    "non_equity_incentive",
+    "pension_change",
+    "other_comp",
     "total",
     "grant_fair_value",
     "threshold",
@@ -64,16 +67,32 @@ _NUMERIC_COLUMNS = {
     "stock_vested_value",
     "present_value",
     "payments",
+    "exercise_price",
+    "stock_awards_unvested_value",
 }
 
 _SUMMARY_COMP_COLS: dict[str, list[str]] = {
-    "exec_name": ["name and principal position", "name", "executive"],
+    "exec_name": [
+        "name and principal position",
+        "name",
+        "executive",
+    ],
+    "exec_title": [
+        "principal position",
+        "title",
+        "position",
+    ],
     "year": ["year", "fiscal year"],
     "salary": ["salary", "base salary"],
     "bonus": ["bonus", "cash bonus"],
     "stock_awards": ["stock awards", "stock award", "restricted stock", "rsu", "dsu"],
     "option_awards": ["option awards", "option award", "options"],
-    "non_equity_incentive": ["non-equity incentive", "non equity incentive", "annual incentive"],
+    "non_equity_incentive": [
+        "non-equity incentive",
+        "non equity incentive",
+        "non-equity incentive plan compensation",
+        "annual incentive",
+    ],
     "pension_change": ["change in pension", "pension value", "nonqualified deferred"],
     "other_comp": ["all other compensation", "all other comp", "other compensation"],
     "total": ["total"],
@@ -123,7 +142,7 @@ def _normalise(value: str) -> str:
 
 def clean_numeric(val: str) -> float | None:
     """Strip currency formatting and return float where possible."""
-    if not val or val.strip() in ("", "—", "-", "N/A", "n/a"):
+    if not val or val.strip() in ("", "—", "-", "N/A", "na", "n/a"):
         return None
 
     cleaned = re.sub(r"[$,\s]", "", val.strip())
@@ -256,14 +275,42 @@ def _map_row(
         if canonical is None:
             continue
         value = cell.strip()
-        if canonical in _NUMERIC_COLUMNS:
-            output[canonical] = clean_numeric(value)
-        else:
-            output[canonical] = value
+        output[canonical] = value
+        if canonical in NUMERIC_COLUMNS:
+            numeric_val = clean_numeric(value)
+            output[canonical] = numeric_val if numeric_val is not None else value
         mapped_values += 1
 
     if mapped_values == 0 and row:
         output["exec_name"] = row[0].strip()
+
+    # Split "Name and Principal Position" cells into name + title when possible.
+    raw_exec = str(output.get("exec_name", "") or "")
+    if raw_exec and not output.get("exec_title"):
+        if "\n" in raw_exec:
+            parts = [part.strip() for part in raw_exec.split("\n", 1) if part.strip()]
+            if len(parts) == 2:
+                output["exec_name"] = parts[0]
+                output["exec_title"] = parts[1]
+        elif "," in raw_exec:
+            name_part, _, title_part = raw_exec.partition(",")
+            title_candidate = title_part.strip()
+            title_keywords = {
+                "officer",
+                "president",
+                "director",
+                "chairman",
+                "executive",
+                "ceo",
+                "cfo",
+                "coo",
+                "svp",
+                "evp",
+                "vp",
+            }
+            if any(keyword in title_candidate.lower() for keyword in title_keywords):
+                output["exec_name"] = name_part.strip()
+                output["exec_title"] = title_candidate
 
     output["footnote_refs"] = _extract_row_footnote_refs(row, footnotes)
     output["source_section"] = source_section
