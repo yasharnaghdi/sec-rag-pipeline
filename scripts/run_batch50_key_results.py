@@ -113,6 +113,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, cast
 
+import ingestion.cda_extractor as cda_extractor
 import ingestion.comp_table_extractor as det_extractor
 import ingestion.edgar_folder_fetcher as fetcher
 from ingestion.llm_comp_extractor import ExecCompRecord, extract_company_comp_from_summary_table
@@ -175,6 +176,9 @@ KEY_RESULTS_COLUMNS = [
     "extraction_method",
     "llm_model",
     "llm_confidence",
+    "cda_token_count",
+    "pay_for_performance_flag",
+    "cda_section_found",
     "status",
     "error",
 ]
@@ -190,6 +194,8 @@ BATCH_LOG_COLUMNS = [
     "comp_table_found",
     "det_rows",
     "llm_confidence",
+    "cda_token_count",
+    "pay_for_performance_flag",
     "elapsed_seconds",
     "error",
 ]
@@ -247,14 +253,17 @@ def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, An
     assigned_names: set[str] = set()
 
     for row in det_rows:
-        title = str(row.get("exec_name", "") or "")
-        if _role_match(title, CEO_KEYWORDS):
+        title_field = str(row.get("exec_title", "") or "")
+        name_field = str(row.get("exec_name", "") or "")
+        role_text = (title_field or name_field).lower()
+
+        if _role_match(role_text, CEO_KEYWORDS):
             ceo_rows.append(row)
-        elif _role_match(title, CFO_KEYWORDS):
+        elif _role_match(role_text, CFO_KEYWORDS):
             cfo_rows.append(row)
-        elif _role_match(title, COO_KEYWORDS):
+        elif _role_match(role_text, COO_KEYWORDS):
             coo_rows.append(row)
-        elif _role_match(title, PRESIDENT_KEYWORDS):
+        elif _role_match(role_text, PRESIDENT_KEYWORDS):
             president_rows.append(row)
         else:
             other_rows.append(row)
@@ -328,7 +337,7 @@ def _row_from_det(role_dict: dict[str, Any], prefix: str) -> dict[str, Any]:
     """Build flat key_results columns for one role from a deterministic row."""
     base = {
         f"{prefix}_name": str(role_dict.get("exec_name", "") or ""),
-        f"{prefix}_title": str(role_dict.get("exec_name", "") or ""),
+        f"{prefix}_title": str(role_dict.get("exec_title", "") or ""),
         f"{prefix}_salary": role_dict.get("salary", ""),
         f"{prefix}_total": role_dict.get("total", ""),
     }
@@ -403,6 +412,9 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
                 "cik": cik,
                 "company_name": company_name,
                 "extraction_method": "failed",
+                "cda_token_count": 0,
+                "pay_for_performance_flag": False,
+                "cda_section_found": False,
                 "status": "failed",
                 "error": reason,
             }
@@ -418,6 +430,8 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             "comp_table_found": False,
             "det_rows": 0,
             "llm_confidence": "",
+            "cda_token_count": 0,
+            "pay_for_performance_flag": False,
             "elapsed_seconds": elapsed,
             "error": reason,
         }
@@ -450,6 +464,24 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
     except Exception as exc:  # noqa: BLE001
         return _failed(f"parse_failed: {exc}", company_name)
 
+    meta_dict: dict[str, Any] = {
+        "cik": cik,
+        "company_name": company_name,
+        "filing_date": str(filing.filing_date or ""),
+        "accession_number": filing.accession_number,
+    }
+
+    try:
+        cda_row = cda_extractor.extract_cda(blocks, meta_dict)
+        cda_token_count = cda_row.get("cda_token_count", 0)
+        pay_for_performance_flag = cda_row.get("pay_for_performance_flag", False)
+        cda_section_found = cda_row.get("cda_section_found", False)
+    except Exception as cda_exc:  # noqa: BLE001
+        log.warning("cda_extraction_failed | cik=%s error=%s", cik, cda_exc)
+        cda_token_count = 0
+        pay_for_performance_flag = False
+        cda_section_found = False
+
     table_blocks = [block for block in blocks if isinstance(block, TableBlock)]
     block_count = len(blocks)
     table_count = len(table_blocks)
@@ -464,13 +496,6 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
     source_table_block_id = comp_table.id if comp_table else ""
     source_section_id = comp_table.section_id if comp_table else ""
     roles: dict[str, Any] = {}
-
-    meta_dict: dict[str, Any] = {
-        "cik": cik,
-        "company_name": company_name,
-        "filing_date": str(filing.filing_date or ""),
-        "accession_number": filing.accession_number,
-    }
 
     try:
         det_rows = det_extractor.extract_summary_compensation(blocks, meta_dict)
@@ -521,6 +546,18 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             },
         )
 
+    fiscal_year_val = ""
+    for role_key in ["ceo", "cfo", "coo", "other1", "other2"]:
+        candidate = roles.get(role_key, {})
+        year_val = (
+            candidate.get("year", "")
+            if isinstance(candidate, dict)
+            else getattr(candidate, "fiscal_year", "")
+        )
+        if year_val:
+            fiscal_year_val = str(year_val)
+            break
+
     result_row: dict[str, Any] = {col: "" for col in KEY_RESULTS_COLUMNS}
     result_row.update(
         {
@@ -528,7 +565,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             "company_name": company_name,
             "ticker": ticker,
             "filing_date": str(filing.filing_date or ""),
-            "fiscal_year": _role_fiscal_year(extraction_method, roles),
+            "fiscal_year": fiscal_year_val,
             "accession_number": filing.accession_number,
             "filing_url": filing.filing_url,
             "source_table_block_id": source_table_block_id,
@@ -536,6 +573,9 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             "extraction_method": extraction_method,
             "llm_model": llm_model_used,
             "llm_confidence": llm_confidence,
+            "cda_token_count": cda_token_count,
+            "pay_for_performance_flag": pay_for_performance_flag,
+            "cda_section_found": cda_section_found,
             "status": "ok",
             "error": "",
         }
@@ -561,6 +601,8 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
         "comp_table_found": comp_table_found,
         "det_rows": len(det_rows),
         "llm_confidence": llm_confidence,
+        "cda_token_count": cda_token_count,
+        "pay_for_performance_flag": pay_for_performance_flag,
         "elapsed_seconds": elapsed,
         "error": "",
     }
