@@ -10,10 +10,9 @@ import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, TextIO
 
-import pandas as pd  # type: ignore[import-untyped]
+import pandas as pd
 import ingestion.edgar_folder_fetcher as edgar_folder_fetcher
 from ingestion.cda_extractor import extract_cda
 from ingestion.comp_table_extractor import (
@@ -37,8 +36,6 @@ logging.basicConfig(
 
 INPUT_CSV = Path("fixtures/client_input.csv")
 OUTPUT_DIR = Path("output")
-MANIFEST_CSV = Path("fixtures/sp500_manifest.csv")
-DATA_RAW_DIR = Path("data/raw")
 
 _META_FIELDS = [
     "cik",
@@ -198,71 +195,27 @@ def _safe_iso_date(value: object) -> date:
 
 
 def _fetch_filing_records(cik: str, years_back: int) -> list[Any]:
-    fetch_all = getattr(edgar_folder_fetcher, "fetch_all_def14a", None)
-    if callable(fetch_all):
-        return list(fetch_all(cik, max_filings=years_back))
+    """
+    Resolve DEF 14A filing records for a single CIK.
 
-    local_records = _fetch_cached_filing_records(cik, years_back)
-    if local_records or MANIFEST_CSV.exists():
-        return local_records
+    Acquisition strategy:
+      1. fetch_latest_def14a(cik) as the CIK-only path.
+      2. years_back is reserved for future multi-year expansion.
 
-    fetch_single = getattr(edgar_folder_fetcher, "fetch_filing", None)
-    if callable(fetch_single):
-        return [fetch_single(cik=cik, folder_id=cik, form_type="DEF 14A")]
+    Args:
+        cik: Bare or zero-padded CIK string from client_input.csv.
+        years_back: Reserved for future multi-year expansion.
 
-    msg = "No supported DEF 14A fetch function found in ingestion.edgar_folder_fetcher"
-    raise AttributeError(msg)
-
-
-def _fetch_cached_filing_records(cik: str, years_back: int) -> list[Any]:
-    if not MANIFEST_CSV.exists():
+    Returns:
+        List with one FetchedFiling on success, or an empty list on failure.
+    """
+    _ = years_back
+    try:
+        filing = edgar_folder_fetcher.fetch_latest_def14a(cik)
+        return [filing]
+    except Exception as exc:  # noqa: BLE001
+        log.error("acquisition failed | cik=%s reason=%s", cik, exc)
         return []
-
-    requested_cik = cik.strip().lstrip("0")
-    matched_rows: list[dict[str, str]] = []
-    with MANIFEST_CSV.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            row_cik = (row.get("cik") or "").strip()
-            if not row_cik:
-                continue
-            if row_cik.lstrip("0") != requested_cik:
-                continue
-            if (row.get("form_type") or "").strip().upper() != "DEF 14A":
-                continue
-            matched_rows.append({k: (v or "") for k, v in row.items()})
-
-    def filing_sort_key(row: dict[str, str]) -> tuple[str, str]:
-        return (row.get("filing_date", ""), row.get("accession_number", ""))
-
-    records: list[Any] = []
-    cik_padded = cik.strip().zfill(10)
-    for row in sorted(matched_rows, key=filing_sort_key, reverse=True):
-        accession = row.get("accession_number", "").strip()
-        if not accession:
-            continue
-        accession_clean = accession.replace("-", "")
-        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
-        if not cache_path.exists():
-            continue
-        filing_date = _safe_iso_date(row.get("filing_date"))
-        records.append(
-            SimpleNamespace(
-                accession_number=accession,
-                filing_date=filing_date,
-                fiscal_year=row.get("fiscal_year", "").strip(),
-                company_name=row.get("company_name", "").strip(),
-                ticker=row.get("ticker", "").strip(),
-                primary_doc_url=row.get("source_url", "").strip(),
-                filing_url=row.get("edgar_url", "").strip(),
-                cache_path=cache_path,
-                raw_html=None,
-            )
-        )
-        if years_back > 0 and len(records) >= years_back:
-            break
-
-    return records
 
 
 def _configure_csv_field_limit() -> None:
@@ -459,6 +412,33 @@ def main() -> None:
                 filing_records = _fetch_filing_records(cik, args.years_back)
             except Exception as exc:
                 log.error("  submissions fetch failed for CIK %s: %s", cik, exc)
+                continue
+
+            if not filing_records:
+                writers["folder_ingest_log.csv"].writerow(
+                    {
+                        "cik": cik,
+                        "company_name": "",
+                        "ticker": "",
+                        "fiscal_year": "",
+                        "filing_date": "",
+                        "accession_number": "",
+                        "status": "failed",
+                        "summary_rows": 0,
+                        "equity_rows": 0,
+                        "grants_rows": 0,
+                        "option_ex_rows": 0,
+                        "pension_rows": 0,
+                        "cda_tokens": 0,
+                        "chunk_count": 0,
+                        "block_count": 0,
+                        "elapsed_seconds": 0,
+                        "flag": "acquisition_failed",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                handles["folder_ingest_log.csv"].flush()
+                total_failed += 1
                 continue
 
             for filing in filing_records:
