@@ -186,22 +186,72 @@ def _build_document_metadata(seed: CompanySeed, filing: FetchedFiling) -> Docume
 def _find_summary_comp_table(blocks: list[BaseBlock]) -> TableBlock | None:
     headings = [block for block in blocks if isinstance(block, HeadingBlock)]
     tables = [block for block in blocks if isinstance(block, TableBlock)]
-    if not headings or not tables:
+    if not tables:
         return None
 
-    matching_headings = [heading for heading in headings if SUMMARY_HEADING_RE.search(heading.text)]
-    for heading in matching_headings:
-        same_section = [
-            table
-            for table in tables
-            if table.section_id == heading.id and table.order_index > heading.order_index
-        ]
-        if same_section:
-            return min(same_section, key=lambda table: table.order_index)
+    def heading_quality(text: str) -> int:
+        lowered = text.lower().strip()
+        if "summary compensation table" in lowered and len(lowered) <= 160:
+            return 3
+        if SUMMARY_HEADING_RE.search(lowered) and len(lowered) <= 100:
+            return 2
+        if SUMMARY_HEADING_RE.search(lowered):
+            return 1
+        return 0
 
-        future_tables = [table for table in tables if table.order_index > heading.order_index]
-        if future_tables:
-            return min(future_tables, key=lambda table: table.order_index - heading.order_index)
+    def table_signature_score(table: TableBlock) -> int:
+        preview_rows = table.rows[:10]
+        preview_text = " ".join(" ".join(row).lower() for row in preview_rows)
+        score = 0
+        if "summary compensation table" in preview_text:
+            score += 3
+        if "name and principal position" in preview_text:
+            score += 4
+        elif (
+            "name" in preview_text and "principal position" in preview_text
+        ):
+            score += 3
+        elif "name" in preview_text and ("officer" in preview_text or "position" in preview_text):
+            score += 2
+        if "salary" in preview_text:
+            score += 2
+        if "total" in preview_text:
+            score += 2
+        if "chief executive officer" in preview_text or " ceo" in preview_text:
+            score += 1
+        if len(table.rows) < 5:
+            score -= 2
+        if YEAR_RE.search(preview_text):
+            score += 1
+        return score
+
+    best_table: TableBlock | None = None
+    best_score = -1
+
+    matching_headings = [heading for heading in headings if heading_quality(heading.text) > 0]
+    for heading in matching_headings:
+        quality = heading_quality(heading.text)
+        candidate_tables = [
+            table for table in tables if table.order_index > heading.order_index and table.order_index - heading.order_index <= 40
+        ]
+        for table in candidate_tables:
+            score = table_signature_score(table) + quality
+            if table.section_id == heading.id:
+                score += 2
+            if score > best_score:
+                best_score = score
+                best_table = table
+
+    if best_table is not None and best_score >= 4:
+        return best_table
+
+    for table in tables:
+        score = table_signature_score(table)
+        if score > best_score:
+            best_score = score
+            best_table = table
+    if best_score >= 5:
+        return best_table
     return None
 
 
@@ -224,7 +274,7 @@ def _infer_fiscal_year(seed_fiscal_year: str, table: TableBlock | None) -> str:
     return seed_fiscal_year
 
 
-def _table_to_compact_tsv(rows: list[list[str]], *, max_rows: int = 20, max_cols: int = 12) -> str:
+def _table_to_compact_tsv(rows: list[list[str]], *, max_rows: int = 240, max_cols: int = 64) -> str:
     tsv_lines: list[str] = []
     for row in rows[:max_rows]:
         normalized_cells = [cell.replace("\n", " ").strip() for cell in row[:max_cols]]

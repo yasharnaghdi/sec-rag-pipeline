@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import csv
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -20,6 +21,7 @@ _DEFAULT_USER_AGENT = "sec-rag-pipeline contact@yourorg.com"
 _RATE_LIMIT_SEC = 0.12
 
 DATA_RAW_DIR = Path("data/raw")
+_MANIFEST_PATH = Path("fixtures/sp500_manifest.csv")
 
 
 @dataclass(frozen=True)
@@ -243,6 +245,60 @@ def _select_most_recent_form_entry(
     )
 
 
+def _fallback_from_local_manifest(cik_digits: str) -> FetchedFiling | None:
+    if not _MANIFEST_PATH.exists():
+        return None
+
+    cik_unpadded = cik_digits.lstrip("0")
+    candidates: list[tuple[date | None, str, str, str, Path]] = []
+    with _MANIFEST_PATH.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            row_cik = str(row.get("cik", "")).strip().lstrip("0")
+            if row_cik != cik_unpadded:
+                continue
+            if str(row.get("form_type", "")).strip().upper() != "DEF 14A":
+                continue
+
+            accession = str(row.get("accession_number", "")).strip()
+            if not accession:
+                continue
+            accession_clean = accession.replace("-", "")
+            cache_path = DATA_RAW_DIR / f"{cik_digits.zfill(10)}_{accession_clean}.html"
+            if not cache_path.exists():
+                continue
+
+            filing_date = _parse_date(row.get("filing_date"))
+            filing_url = str(row.get("source_url", "")).strip() or str(row.get("edgar_url", "")).strip()
+            candidates.append((filing_date, accession, filing_url, accession_clean, cache_path))
+
+    if not candidates:
+        return None
+
+    filing_date, accession, filing_url, accession_clean, cache_path = max(
+        candidates,
+        key=lambda item: (
+            item[0] or date.min,
+            item[1],
+        ),
+    )
+    resolved_url = filing_url
+    if not resolved_url:
+        resolved_url = (
+            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
+            f"{accession_clean}/"
+        )
+    return FetchedFiling(
+        raw_html=cache_path.read_text(encoding="utf-8", errors="replace"),
+        accession_number=accession,
+        filing_date=filing_date,
+        filing_url=resolved_url,
+        cache_path=cache_path,
+    )
+
+
 def fetch_latest_def14a(
     cik: str,
     *,
@@ -259,51 +315,63 @@ def fetch_latest_def14a(
     owns_session = session is None
     http = session or requests.Session()
     try:
-        log.info("Fetching submissions index for latest DEF 14A: %s", submissions_url)
-        submissions_payload = _get_json(submissions_url, http)
-        entries = _extract_entries(submissions_payload)
-        entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
-        latest_entry = _select_most_recent_form_entry(entries, "DEF 14A")
-        if latest_entry is None:
-            msg = f"No DEF 14A filing found for CIK={cik_digits}"
-            raise ValueError(msg)
+        try:
+            log.info("Fetching submissions index for latest DEF 14A: %s", submissions_url)
+            submissions_payload = _get_json(submissions_url, http)
+            entries = _extract_entries(submissions_payload)
+            entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
+            latest_entry = _select_most_recent_form_entry(entries, "DEF 14A")
+            if latest_entry is None:
+                msg = f"No DEF 14A filing found for CIK={cik_digits}"
+                raise ValueError(msg)
 
-        accession_clean = latest_entry.accession_number.replace("-", "")
-        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
+            accession_clean = latest_entry.accession_number.replace("-", "")
+            cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
 
-        primary_document = _resolve_primary_document(
-            cik_digits,
-            accession_clean,
-            latest_entry.primary_document,
-            http,
-        )
-        filing_url = (
-            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
-            f"{accession_clean}/{primary_document}"
-        )
+            primary_document = _resolve_primary_document(
+                cik_digits,
+                accession_clean,
+                latest_entry.primary_document,
+                http,
+            )
+            filing_url = (
+                f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
+                f"{accession_clean}/{primary_document}"
+            )
 
-        if cache_path.exists():
-            log.info("Cache hit for latest DEF 14A: %s", cache_path)
+            if cache_path.exists():
+                log.info("Cache hit for latest DEF 14A: %s", cache_path)
+                return FetchedFiling(
+                    raw_html=cache_path.read_text(encoding="utf-8", errors="replace"),
+                    accession_number=latest_entry.accession_number,
+                    filing_date=latest_entry.filing_date,
+                    filing_url=filing_url,
+                    cache_path=cache_path,
+                )
+
+            log.info("Fetching latest DEF 14A filing: %s", filing_url)
+            raw_html = _get_text(filing_url, http)
+            DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(raw_html, encoding="utf-8")
+            log.info("Cached latest DEF 14A -> %s (%s chars)", cache_path, len(raw_html))
             return FetchedFiling(
-                raw_html=cache_path.read_text(encoding="utf-8", errors="replace"),
+                raw_html=raw_html,
                 accession_number=latest_entry.accession_number,
                 filing_date=latest_entry.filing_date,
                 filing_url=filing_url,
                 cache_path=cache_path,
             )
-
-        log.info("Fetching latest DEF 14A filing: %s", filing_url)
-        raw_html = _get_text(filing_url, http)
-        DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(raw_html, encoding="utf-8")
-        log.info("Cached latest DEF 14A -> %s (%s chars)", cache_path, len(raw_html))
-        return FetchedFiling(
-            raw_html=raw_html,
-            accession_number=latest_entry.accession_number,
-            filing_date=latest_entry.filing_date,
-            filing_url=filing_url,
-            cache_path=cache_path,
-        )
+        except Exception as exc:
+            log.warning(
+                "Network/latest-lookup path failed for CIK %s; trying local manifest cache fallback: %s",
+                cik_digits,
+                exc,
+            )
+            fallback = _fallback_from_local_manifest(cik_digits)
+            if fallback is not None:
+                log.info("Using local manifest fallback for CIK %s (%s)", cik_digits, fallback.accession_number)
+                return fallback
+            raise
     finally:
         if owns_session:
             http.close()
