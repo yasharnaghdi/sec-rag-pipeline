@@ -17,6 +17,8 @@ coverage.xml
 data/raw/
 data/processed/
 output/
+output/**/*.csv
 .tmp_jupyter_config/
 *.log
 poetry.lock
+.DS_Store

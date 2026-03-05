@@ -13,17 +13,28 @@ TODO (Phase 2 implementation):
 """
 from __future__ import annotations
 
+import logging
+
 import tiktoken
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.config import get_settings
 from core.models import BlockType, Chunk, SECBlock
 
-_ENCODING = tiktoken.get_encoding("cl100k_base")
+log = logging.getLogger(__name__)
+_ENCODING: tiktoken.Encoding | None
+
+try:
+    _ENCODING = tiktoken.get_encoding("cl100k_base")
+except Exception:  # pragma: no cover - depends on runtime cache/network
+    _ENCODING = None
+    log.warning("Falling back to heuristic token counting (cl100k_base unavailable).")
 
 
 def count_tokens(text: str) -> int:
-    return len(_ENCODING.encode(text))
+    if _ENCODING is not None:
+        return len(_ENCODING.encode(text))
+    return len(text.split())
 
 
 class SECChunker:
@@ -31,10 +42,10 @@ class SECChunker:
 
     def __init__(self) -> None:
         s = get_settings()
-        self._splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            encoding_name="cl100k_base",
+        self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=s.chunk_size_tokens,
             chunk_overlap=s.chunk_overlap_tokens,
+            length_function=count_tokens,
         )
         self._chunk_size = s.chunk_size_tokens
 
