@@ -16,8 +16,7 @@ log = logging.getLogger(__name__)
 
 _SEC_DATA_BASE = "https://data.sec.gov"
 _SEC_ARCHIVES_BASE = "https://www.sec.gov"
-_USER_AGENT = os.getenv("SEC_USER_AGENT", "sec-rag-pipeline contact@yourorg.com")
-_HEADERS = {"User-Agent": _USER_AGENT}
+_DEFAULT_USER_AGENT = "sec-rag-pipeline contact@yourorg.com"
 _RATE_LIMIT_SEC = 0.12
 
 DATA_RAW_DIR = Path("data/raw")
@@ -87,8 +86,13 @@ def _throttle() -> None:
     time.sleep(_RATE_LIMIT_SEC)
 
 
+def _request_headers() -> dict[str, str]:
+    user_agent = os.getenv("SEC_USER_AGENT", _DEFAULT_USER_AGENT)
+    return {"User-Agent": user_agent}
+
+
 def _get_json(url: str, session: requests.Session) -> dict[str, Any]:
-    response = session.get(url, headers=_HEADERS, timeout=30)
+    response = session.get(url, headers=_request_headers(), timeout=30)
     response.raise_for_status()
     _throttle()
     payload = response.json()
@@ -99,7 +103,7 @@ def _get_json(url: str, session: requests.Session) -> dict[str, Any]:
 
 
 def _get_text(url: str, session: requests.Session) -> str:
-    response = session.get(url, headers=_HEADERS, timeout=60)
+    response = session.get(url, headers=_request_headers(), timeout=60)
     response.raise_for_status()
     _throttle()
     return cast(str, response.text)
@@ -220,6 +224,89 @@ def _resolve_primary_document(
 
     msg = f"Unable to find .htm/.html primary document for accession {accession_clean}"
     raise ValueError(msg)
+
+
+def _select_most_recent_form_entry(
+    entries: list[_FilingIndexEntry],
+    form_type: str,
+) -> _FilingIndexEntry | None:
+    target_form = _normalize_form_type(form_type)
+    matching = [entry for entry in entries if _normalize_form_type(entry.form) == target_form]
+    if not matching:
+        return None
+    return max(
+        matching,
+        key=lambda entry: (
+            entry.filing_date or date.min,
+            entry.accession_number,
+        ),
+    )
+
+
+def fetch_latest_def14a(
+    cik: str,
+    *,
+    session: requests.Session | None = None,
+) -> FetchedFiling:
+    """Fetch the latest DEF 14A filing HTML for a CIK using SEC submissions index."""
+    cik_digits = _extract_digits(cik)
+    if not cik_digits:
+        raise ValueError("cik must include at least one digit")
+
+    cik_padded = cik_digits.zfill(10)
+    submissions_url = f"{_SEC_DATA_BASE}/submissions/CIK{cik_padded}.json"
+
+    owns_session = session is None
+    http = session or requests.Session()
+    try:
+        log.info("Fetching submissions index for latest DEF 14A: %s", submissions_url)
+        submissions_payload = _get_json(submissions_url, http)
+        entries = _extract_entries(submissions_payload)
+        entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
+        latest_entry = _select_most_recent_form_entry(entries, "DEF 14A")
+        if latest_entry is None:
+            msg = f"No DEF 14A filing found for CIK={cik_digits}"
+            raise ValueError(msg)
+
+        accession_clean = latest_entry.accession_number.replace("-", "")
+        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
+
+        primary_document = _resolve_primary_document(
+            cik_digits,
+            accession_clean,
+            latest_entry.primary_document,
+            http,
+        )
+        filing_url = (
+            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
+            f"{accession_clean}/{primary_document}"
+        )
+
+        if cache_path.exists():
+            log.info("Cache hit for latest DEF 14A: %s", cache_path)
+            return FetchedFiling(
+                raw_html=cache_path.read_text(encoding="utf-8", errors="replace"),
+                accession_number=latest_entry.accession_number,
+                filing_date=latest_entry.filing_date,
+                filing_url=filing_url,
+                cache_path=cache_path,
+            )
+
+        log.info("Fetching latest DEF 14A filing: %s", filing_url)
+        raw_html = _get_text(filing_url, http)
+        DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(raw_html, encoding="utf-8")
+        log.info("Cached latest DEF 14A -> %s (%s chars)", cache_path, len(raw_html))
+        return FetchedFiling(
+            raw_html=raw_html,
+            accession_number=latest_entry.accession_number,
+            filing_date=latest_entry.filing_date,
+            filing_url=filing_url,
+            cache_path=cache_path,
+        )
+    finally:
+        if owns_session:
+            http.close()
 
 
 def fetch_filing(
