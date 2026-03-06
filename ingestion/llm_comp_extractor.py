@@ -167,6 +167,23 @@ schema. Return ONLY the corrected JSON object using the schema provided.
 Do not include any explanation, markdown, or code fences.
 """
 
+# ── Ollama fallback configuration ────────────────────────────────
+# When OPENAI_API_KEY is "dummy", empty, or an OpenAI auth error
+# occurs, the extractor falls back to a local Ollama instance.
+# The Ollama base URL and model are configurable via environment
+# variables so Docker Compose can override them without code changes.
+# OLLAMA_BASE_URL: full URL of the Ollama HTTP API
+#   default: http://localhost:11434
+#   docker compose override: http://ollama:11434
+# OLLAMA_MODEL: model tag pulled into the Ollama instance
+#   default: llama3.1 (8B, good balance of speed and accuracy)
+#   alternatives: mistral, qwen2.5, phi3
+# The Ollama prompt is identical to the OpenAI prompt so extraction
+# quality is comparable for standard DEF 14A tables.
+_OLLAMA_BASE_URL_DEFAULT = "http://localhost:11434"
+_OLLAMA_MODEL_DEFAULT = "llama3.1"
+_DUMMY_KEY_VALUES = {"dummy", "", "your-key-here", "sk-dummy"}
+
 
 def _build_user_message(
     company_name: str,
@@ -220,6 +237,61 @@ def _call_openai(
         max_tokens=800,
     )
     return response.choices[0].message.content or ""
+
+
+def _call_ollama(
+    messages: list[dict[str, str]],
+    model: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Call a local Ollama instance and return raw response text.
+
+    Uses the ollama Python client which communicates with the Ollama
+    HTTP API. The model must already be pulled in the Ollama instance
+    (handled by Docker Compose entrypoint or manual `ollama pull`).
+
+    Prompt construction mirrors the OpenAI path exactly so extraction
+    logic is model-agnostic. We request JSON output via the system
+    prompt; Ollama does not have a native json_object response_format
+    enforcer, so we rely on the system prompt instruction and the
+    retry path in extract_company_comp_from_summary_table().
+
+    Args:
+        messages: Chat history in OpenAI-compatible message format.
+                  Ollama's Python client accepts the same format.
+        model: Ollama model tag. Defaults to OLLAMA_MODEL env var
+               or _OLLAMA_MODEL_DEFAULT.
+        base_url: Ollama API base URL. Defaults to OLLAMA_BASE_URL
+                  env var or _OLLAMA_BASE_URL_DEFAULT.
+
+    Returns:
+        Raw string content from the Ollama response.
+
+    Raises:
+        Exception: Any connection or model error from the Ollama client.
+                   Caller handles all exceptions.
+    """
+    import ollama
+
+    resolved_model = model or os.environ.get("OLLAMA_MODEL", _OLLAMA_MODEL_DEFAULT)
+    resolved_url = base_url or os.environ.get("OLLAMA_BASE_URL", _OLLAMA_BASE_URL_DEFAULT)
+
+    # Ollama client accepts host as a constructor argument.
+    client = ollama.Client(host=resolved_url)
+    response = client.chat(
+        model=resolved_model,
+        messages=messages,
+        options={"temperature": 0},
+    )
+    return str(response["message"]["content"])
+
+
+def _is_openai_auth_error(exc: Exception) -> bool:
+    """Return True when an OpenAI exception looks like an auth failure."""
+    class_name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    auth_markers = ("auth", "api key", "unauthorized", "invalid_api_key", "permission")
+    return "authentication" in class_name or any(marker in message for marker in auth_markers)
 
 
 def _parse_and_validate(raw: str) -> CompanyCompResult | None:
@@ -285,8 +357,9 @@ def extract_company_comp_from_summary_table(
         )
         return CompanyCompResult()
 
-    if client is None:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    use_ollama = client is None and api_key.strip().lower() in _DUMMY_KEY_VALUES
+    if client is None and not use_ollama:
         client = OpenAI(api_key=api_key)
 
     user_message = _build_user_message(company_name, cik, filing_date, table_text)
@@ -296,18 +369,61 @@ def extract_company_comp_from_summary_table(
         {"role": "user", "content": user_message},
     ]
 
-    log.info(
-        "llm_extractor | attempt 1 | cik=%s model=%s tokens_approx=%d",
-        cik,
-        model,
-        len(table_text.split()),
-    )
+    # ── Route to Ollama if OpenAI key is absent/dummy ─────────────
+    # This allows full local operation (Docker Compose, offline dev)
+    # without requiring a paid OpenAI key. The Ollama path uses the
+    # same prompts and validation logic as the OpenAI path.
+    if use_ollama:
+        log.info(
+            "llm_extractor | routing to Ollama (no valid OpenAI key) | "
+            "cik=%s model=%s",
+            cik,
+            os.environ.get("OLLAMA_MODEL", _OLLAMA_MODEL_DEFAULT),
+        )
+    else:
+        log.info(
+            "llm_extractor | attempt 1 via OpenAI | cik=%s model=%s "
+            "tokens_approx=%d",
+            cik,
+            model,
+            len(table_text.split()),
+        )
 
+    # Attempt 1
     try:
-        raw = _call_openai(client, messages, model)
+        if use_ollama:
+            raw = _call_ollama(messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw = _call_openai(client, messages, model)
     except Exception as exc:  # noqa: BLE001
-        log.error("llm_extractor | API error attempt 1 | cik=%s error=%s", cik, exc)
-        return CompanyCompResult()
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor | OpenAI auth failed, falling back to Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw = _call_ollama(messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor | API error attempt 1 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyCompResult()
+        else:
+            log.error(
+                "llm_extractor | API error attempt 1 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyCompResult()
 
     result = _parse_and_validate(raw)
     if result is not None:
@@ -328,10 +444,39 @@ def extract_company_comp_from_summary_table(
     log.info("llm_extractor | attempt 2 (retry) | cik=%s", cik)
 
     try:
-        raw_retry = _call_openai(client, retry_messages, model)
+        if use_ollama:
+            raw_retry = _call_ollama(retry_messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw_retry = _call_openai(client, retry_messages, model)
     except Exception as exc:  # noqa: BLE001
-        log.error("llm_extractor | API error attempt 2 | cik=%s error=%s", cik, exc)
-        return CompanyCompResult()
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor | OpenAI auth failed on retry, using Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw_retry = _call_ollama(retry_messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor | API error attempt 2 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyCompResult()
+        else:
+            log.error(
+                "llm_extractor | API error attempt 2 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyCompResult()
 
     result_retry = _parse_and_validate(raw_retry)
     if result_retry is not None:
