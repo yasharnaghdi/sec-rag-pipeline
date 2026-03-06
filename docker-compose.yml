@@ -1,7 +1,32 @@
+# ─────────────────────────────────────────────────────────────────
+# SEC RAG Pipeline — local development stack
+# Services:
+#   postgres  pgvector/pgvector:pg16 — vector-capable Postgres
+#   ollama    ollama/ollama:latest   — local LLM (llama3.1 pulled on start)
+#   app       python:3.11-slim       — pipeline app (poetry install)
+# Usage:
+#   docker compose up --build
+#   docker compose exec app bash
+# Inside container:
+#   poetry run python scripts/run_batch50_key_results.py \
+#     --input fixtures/client_input.csv --batch-label b01 --limit 10
+# Environment:
+#   EDGAR_USER_AGENT must be set in .env (e.g. "Name email@example.com")
+#   OPENAI_API_KEY can be "dummy" — Ollama fallback activates automatically
+#   OLLAMA_BASE_URL is set to http://ollama:11434 inside the stack
+# First run:
+#   The ollama service pulls llama3.1 (~4.7GB) on startup.
+#   Subsequent runs use the Docker volume cache.
+# ─────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
 services:
+
+  # ── Postgres + pgvector ─────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: sec_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: sec_rag
       POSTGRES_USER: postgres
@@ -10,42 +35,80 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./storage/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d sec_rag"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: sec_qdrant
+  # ── Ollama — local LLM server ───────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "11434:11434"
     volumes:
-      - qdrant_data:/qdrant/storage
+      - ollama_models:/root/.ollama
+    # Pull llama3.1 on container start if not already cached.
+    # The entrypoint starts the server, waits for it to be ready,
+    # then pulls the model in the background so the container
+    # reports healthy immediately and pull happens asynchronously.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        OLLAMA_PID=$$!
+        echo "Waiting for Ollama to be ready..."
+        until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do
+          sleep 2
+        done
+        echo "Ollama ready. Pulling llama3.1..."
+        ollama pull llama3.1
+        echo "Model pull complete."
+        wait $$OLLAMA_PID
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
+  # ── Pipeline app ────────────────────────────────────────────────
   app:
-    build: .
-    container_name: sec_app
-    env_file: .env
-    ports:
-      - "8000:8000"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
+      ollama:
         condition: service_healthy
+    environment:
+      # Postgres
+      DB_URL: postgresql+asyncpg://postgres:password@postgres:5432/sec_rag
+      # Ollama — points to the ollama service inside the stack
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.1
+      # OpenAI — set to dummy; Ollama fallback activates automatically
+      OPENAI_API_KEY: dummy
+      # EDGAR — override with your real identity in .env
+      EDGAR_USER_AGENT: ${EDGAR_USER_AGENT:-"Dev User dev@example.com"}
+    env_file:
+      - .env
     volumes:
-      - ./data:/app/data
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+      # Mount repo root so edits are reflected without rebuild
+      - .:/app
+      # Persist EDGAR HTML cache across container restarts
+      - edgar_cache:/app/data/raw
+      # Persist batch output
+      - batch_output:/app/output
+    working_dir: /app
+    # Keep container alive for `docker compose exec app bash`
+    command: ["tail", "-f", "/dev/null"]
 
 volumes:
   postgres_data:
-  qdrant_data:
+  ollama_models:
+  edgar_cache:
+  batch_output:
