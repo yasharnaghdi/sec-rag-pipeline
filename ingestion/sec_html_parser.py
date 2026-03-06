@@ -39,18 +39,60 @@ _SEC_SECTION_REGEXES: list[re.Pattern[str]] = [
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _PARSEABLE_TAGS = [*sorted(_HEADING_TAGS), "p", "div", "table", "img"]
 _XBRL_TAG_NAMES = {"ix:nonnumeric", "ix:nonfraction"}
+_XBRL_INLINE_TAGS: frozenset[str] = frozenset({"ix:nonfraction", "ix:nonnumeric"})
 _FOOTNOTE_PATTERN = re.compile(r"^\s*([\(\*†‡]\d*[\)\.]?)\s+")
 _PAGE_NUMBER_PATTERN = re.compile(
     r"^\s*[-–—]?\s*\d{1,3}\s*[-–—]?\s*$"
     r"|^\s*[Pp]age\s+\d{1,3}\s*$"
     r"|^\s*[Pp]age\s+\d{1,3}\s+of\s+\d{1,3}\s*$"
 )
+_MIN_HEADING_COLSPAN = 3
 _DetectionMethod = Literal[
     "tag",
     "bold_heuristic",
     "allcaps_heuristic",
     "keyword_match",
 ]
+
+
+def _cell_text(cell: Tag) -> str:
+    """Return the best available text for a table cell."""
+    for child in cell.find_all(True):
+        child_name = (child.name or "").lower()
+        if child_name in _XBRL_INLINE_TAGS:
+            xbrl_value = child.get_text(" ", strip=True)
+            if xbrl_value:
+                return xbrl_value
+
+    raw = cell.get_text(" ", strip=True)
+    normalised = re.sub(r"[\s\xa0]+", " ", raw).strip()
+    if re.search(r"[$€£,]", normalised):
+        normalised = re.sub(r"\s*,\s*", ",", normalised)
+        normalised = re.sub(r"(?<=\d)\s+(?=\d)", "", normalised)
+        normalised = re.sub(r"([$€£])\s+(?=\d)", r"\1", normalised)
+    return normalised
+
+
+def _extract_table_heading_row(table_tag: Tag) -> str | None:
+    """Return heading text when table's first rows encode a section heading."""
+    rows = table_tag.find_all("tr", recursive=False)
+    if not rows:
+        rows = table_tag.find_all("tr")
+
+    for tr in rows[:2]:
+        cells = tr.find_all(["td", "th"])
+        if len(cells) != 1:
+            continue
+        cell = cells[0]
+        colspan = _parse_table_span(cell.get("colspan", "1"))
+        if colspan < _MIN_HEADING_COLSPAN:
+            continue
+        text = cell.get_text(" ", strip=True)
+        if not text:
+            continue
+        if any(pattern.search(text) for pattern in _SEC_SECTION_REGEXES):
+            return text
+    return None
 
 
 class SECHTMLParser:
@@ -97,6 +139,26 @@ class SECHTMLParser:
                 continue
 
             if tag.name == "table":
+                embedded_heading_text = _extract_table_heading_row(tag)
+                if embedded_heading_text is not None:
+                    current_toc_page_range = toc_map.get(
+                        _normalize_section_label(embedded_heading_text)
+                    )
+                    embedded_heading = HeadingBlock(
+                        document_id=metadata.document_id,
+                        section_id=current_section_id,
+                        order_index=order_index,
+                        source_char_start=source_start,
+                        source_char_end=source_end,
+                        toc_page_range=current_toc_page_range,
+                        text=embedded_heading_text,
+                        level=2,
+                        detection_method="keyword_match",
+                    )
+                    blocks.append(embedded_heading)
+                    current_section_id = embedded_heading.id
+                    order_index += 1
+
                 rows, header_row_count, linearized_text, has_merged_cells = _extract_table_rows(tag)
                 if not rows:
                     continue
@@ -321,32 +383,41 @@ def _extract_table_rows(table_tag: Tag) -> tuple[list[list[str]], int, str, bool
     rows: list[list[str]] = []
     header_row_count = 0
     has_merged_cells = False
-    active_rowspans: dict[int, tuple[int, str]] = {}
+    rowspan_carry: dict[int, tuple[int, str]] = {}
 
     for tr in table_tag.find_all("tr"):
+        tr_cells = tr.find_all(["td", "th"])
+        if len(tr_cells) == 1:
+            single_cell = tr_cells[0]
+            colspan = _parse_table_span(single_cell.get("colspan", "1"))
+            if colspan >= _MIN_HEADING_COLSPAN:
+                heading_candidate = single_cell.get_text(" ", strip=True)
+                if any(pattern.search(heading_candidate) for pattern in _SEC_SECTION_REGEXES):
+                    continue
+
         row: list[str] = []
-        row_cells = tr.find_all(["th", "td"])
-        if not row_cells and not active_rowspans:
+        row_cells = tr_cells
+        if not row_cells and not rowspan_carry:
             continue
 
         col_index = 0
         all_header = bool(row_cells)
 
-        def consume_rowspans() -> None:
+        def inject_rowspan_carry() -> None:
             nonlocal col_index
-            while col_index in active_rowspans:
-                remaining_rows, span_text = active_rowspans[col_index]
+            while col_index in rowspan_carry:
+                remaining_rows, span_text = rowspan_carry[col_index]
                 row.append(span_text)
                 if remaining_rows <= 1:
-                    del active_rowspans[col_index]
+                    del rowspan_carry[col_index]
                 else:
-                    active_rowspans[col_index] = (remaining_rows - 1, span_text)
+                    rowspan_carry[col_index] = (remaining_rows - 1, span_text)
                 col_index += 1
 
-        consume_rowspans()
+        inject_rowspan_carry()
         for cell in row_cells:
-            consume_rowspans()
-            text = cell.get_text(" ", strip=True)
+            inject_rowspan_carry()
+            text = _cell_text(cell)
             colspan = _parse_table_span(cell.get("colspan", "1"))
             rowspan = _parse_table_span(cell.get("rowspan", "1"))
 
@@ -355,12 +426,12 @@ def _extract_table_rows(table_tag: Tag) -> tuple[list[list[str]], int, str, bool
             for offset in range(colspan):
                 row.append(text)
                 if rowspan > 1:
-                    active_rowspans[col_index + offset] = (rowspan - 1, text)
+                    rowspan_carry[col_index + offset] = (rowspan - 1, text)
             col_index += colspan
             if cell.name != "th":
                 all_header = False
 
-        consume_rowspans()
+        inject_rowspan_carry()
         if not row:
             continue
         rows.append(row)
