@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
 
-import pandas as pd  # type: ignore[import-untyped]
+import pandas as pd
 import ingestion.edgar_folder_fetcher as edgar_folder_fetcher
 from ingestion.cda_extractor import extract_cda
 from ingestion.comp_table_extractor import (
