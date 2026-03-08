@@ -98,6 +98,17 @@ _SUMMARY_COMP_COLS: dict[str, list[str]] = {
     "total": ["total"],
 }
 
+_SUMMARY_COMP_REQUIRED_NUMERIC_COLS = {
+    "salary",
+    "bonus",
+    "stock_awards",
+    "option_awards",
+    "non_equity_incentive",
+    "pension_change",
+    "other_comp",
+    "total",
+}
+
 _EQUITY_AWARDS_COLS: dict[str, list[str]] = {
     "exec_name": ["name", "executive"],
     "option_grant_date": ["grant date", "option grant"],
@@ -241,6 +252,11 @@ def _data_rows(table_block: TableBlock) -> list[list[str]]:
     return table_block.rows[min(start, len(table_block.rows)) :]
 
 
+def _summary_table_has_comp_columns(column_map: list[str | None]) -> bool:
+    mapped = {column for column in column_map if column is not None}
+    return bool(mapped & _SUMMARY_COMP_REQUIRED_NUMERIC_COLS)
+
+
 def _collect_table_footnotes(
     table_block: TableBlock,
     indexed_footnotes: dict[str, dict[str, str]],
@@ -367,12 +383,38 @@ def extract_summary_compensation(
     meta: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Extract Summary Compensation Table rows."""
-    return _extract_table(
+    raw_rows = _extract_table(
         blocks,
         _TABLE_SIGNATURES["summary_compensation"],
         _SUMMARY_COMP_COLS,
         meta,
     )
+    if not raw_rows:
+        return []
+
+    valid_rows: list[dict[str, Any]] = []
+    by_table: dict[str, list[dict[str, Any]]] = {}
+    for row in raw_rows:
+        table_id = str(row.get("table_block_id", "") or "")
+        if not table_id:
+            continue
+        by_table.setdefault(table_id, []).append(row)
+
+    table_by_id = {
+        block.id: block
+        for block in blocks
+        if isinstance(block, TableBlock)
+    }
+    for table_id, table_rows in by_table.items():
+        table = table_by_id.get(table_id)
+        if table is None:
+            continue
+        column_map = _build_column_map(table, _SUMMARY_COMP_COLS)
+        if not _summary_table_has_comp_columns(column_map):
+            continue
+        valid_rows.extend(table_rows)
+
+    return valid_rows
 
 
 def extract_equity_awards(

@@ -32,6 +32,8 @@ class FetchedFiling:
     filing_date: date | None
     filing_url: str
     cache_path: Path
+    company_name: str = ""
+    ticker: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,33 @@ def _extract_entries(submissions_payload: dict[str, Any]) -> list[_FilingIndexEn
     return entries
 
 
+def _extract_company_identity(submissions_payload: dict[str, Any]) -> tuple[str, str]:
+    """Extract issuer company name and ticker from SEC submissions payload."""
+    company_name = ""
+    ticker = ""
+
+    name_val = submissions_payload.get("name")
+    if isinstance(name_val, str):
+        company_name = name_val.strip()
+    if not company_name:
+        entity_val = submissions_payload.get("entityName")
+        if isinstance(entity_val, str):
+            company_name = entity_val.strip()
+
+    tickers_val = submissions_payload.get("tickers")
+    if isinstance(tickers_val, list):
+        for item in tickers_val:
+            if isinstance(item, str) and item.strip():
+                ticker = item.strip()
+                break
+    if not ticker:
+        ticker_val = submissions_payload.get("ticker")
+        if isinstance(ticker_val, str):
+            ticker = ticker_val.strip()
+
+    return company_name, ticker
+
+
 def _fetch_historical_submission_entries(
     submissions_payload: dict[str, Any],
     session: requests.Session,
@@ -222,6 +251,73 @@ def _resolve_primary_document(
     raise ValueError(msg)
 
 
+def _select_latest_form_entry(entries: list[_FilingIndexEntry], form_type: str) -> _FilingIndexEntry | None:
+    """Pick the most recent filing entry for a target form."""
+    target_form = _normalize_form_type(form_type)
+    candidates = [entry for entry in entries if _normalize_form_type(entry.form) == target_form]
+    if not candidates:
+        return None
+
+    def _sort_key(entry: _FilingIndexEntry) -> tuple[date, str]:
+        return (entry.filing_date or date.min, entry.accession_number)
+
+    return sorted(candidates, key=_sort_key, reverse=True)[0]
+
+
+def _fetch_entry_filing(
+    cik_digits: str,
+    cik_padded: str,
+    matched_entry: _FilingIndexEntry,
+    session: requests.Session,
+    company_name: str = "",
+    ticker: str = "",
+) -> FetchedFiling:
+    accession_clean = matched_entry.accession_number.replace("-", "")
+    cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
+    if cache_path.exists():
+        log.info("Cache hit: %s", cache_path)
+        raw_html = cache_path.read_text(encoding="utf-8", errors="replace")
+        filing_url = (
+            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
+            f"{accession_clean}/{matched_entry.primary_document}"
+        )
+        return FetchedFiling(
+            raw_html=raw_html,
+            accession_number=matched_entry.accession_number,
+            filing_date=matched_entry.filing_date,
+            filing_url=filing_url,
+            cache_path=cache_path,
+            company_name=company_name,
+            ticker=ticker,
+        )
+
+    primary_document = _resolve_primary_document(
+        cik_digits,
+        accession_clean,
+        matched_entry.primary_document,
+        session,
+    )
+    filing_url = (
+        f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
+        f"{accession_clean}/{primary_document}"
+    )
+    log.info("Fetching filing: %s", filing_url)
+    raw_html = _get_text(filing_url, session)
+
+    DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(raw_html, encoding="utf-8")
+    log.info("Cached -> %s (%s chars)", cache_path, len(raw_html))
+    return FetchedFiling(
+        raw_html=raw_html,
+        accession_number=matched_entry.accession_number,
+        filing_date=matched_entry.filing_date,
+        filing_url=filing_url,
+        cache_path=cache_path,
+        company_name=company_name,
+        ticker=ticker,
+    )
+
+
 def fetch_filing(
     cik: str,
     folder_id: str,
@@ -243,6 +339,7 @@ def fetch_filing(
     try:
         log.info("Fetching submissions index: %s", submissions_url)
         submissions_payload = _get_json(submissions_url, http)
+        company_name, ticker = _extract_company_identity(submissions_payload)
         entries = _extract_entries(submissions_payload)
         entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
 
@@ -258,45 +355,53 @@ def fetch_filing(
             msg = f"No {form_type} found for CIK={cik_digits}, folder_id={folder_id}"
             raise ValueError(msg)
 
-        accession_clean = matched_entry.accession_number.replace("-", "")
-        cache_path = DATA_RAW_DIR / f"{cik_padded}_{accession_clean}.html"
-        if cache_path.exists():
-            log.info("Cache hit: %s", cache_path)
-            raw_html = cache_path.read_text(encoding="utf-8", errors="replace")
-            filing_url = (
-                f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
-                f"{accession_clean}/{matched_entry.primary_document}"
-            )
-            return FetchedFiling(
-                raw_html=raw_html,
-                accession_number=matched_entry.accession_number,
-                filing_date=matched_entry.filing_date,
-                filing_url=filing_url,
-                cache_path=cache_path,
-            )
-
-        primary_document = _resolve_primary_document(
+        return _fetch_entry_filing(
             cik_digits,
-            accession_clean,
-            matched_entry.primary_document,
+            cik_padded,
+            matched_entry,
             http,
+            company_name=company_name,
+            ticker=ticker,
         )
-        filing_url = (
-            f"{_SEC_ARCHIVES_BASE}/Archives/edgar/data/{cik_digits.lstrip('0')}/"
-            f"{accession_clean}/{primary_document}"
-        )
-        log.info("Fetching filing: %s", filing_url)
-        raw_html = _get_text(filing_url, http)
+    finally:
+        if owns_session:
+            http.close()
 
-        DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(raw_html, encoding="utf-8")
-        log.info("Cached -> %s (%s chars)", cache_path, len(raw_html))
-        return FetchedFiling(
-            raw_html=raw_html,
-            accession_number=matched_entry.accession_number,
-            filing_date=matched_entry.filing_date,
-            filing_url=filing_url,
-            cache_path=cache_path,
+
+def fetch_latest_def14a(
+    cik: str,
+    *,
+    session: requests.Session | None = None,
+) -> FetchedFiling:
+    """Fetch the latest DEF 14A for a CIK without requiring folder/accession input."""
+    cik_digits = _extract_digits(cik)
+    if not cik_digits:
+        raise ValueError("cik must include at least one digit")
+
+    cik_padded = cik_digits.zfill(10)
+    submissions_url = f"{_SEC_DATA_BASE}/submissions/CIK{cik_padded}.json"
+
+    owns_session = session is None
+    http = session or requests.Session()
+    try:
+        log.info("Fetching submissions index: %s", submissions_url)
+        submissions_payload = _get_json(submissions_url, http)
+        company_name, ticker = _extract_company_identity(submissions_payload)
+        entries = _extract_entries(submissions_payload)
+        entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
+
+        matched_entry = _select_latest_form_entry(entries, "DEF 14A")
+        if matched_entry is None:
+            msg = f"No DEF 14A found for CIK={cik_digits}"
+            raise ValueError(msg)
+
+        return _fetch_entry_filing(
+            cik_digits,
+            cik_padded,
+            matched_entry,
+            http,
+            company_name=company_name,
+            ticker=ticker,
         )
     finally:
         if owns_session:

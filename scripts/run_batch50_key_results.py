@@ -113,6 +113,18 @@ from datetime import date
 from pathlib import Path
 from typing import Any, cast
 
+from dotenv import load_dotenv
+
+if __package__ in {None, ""}:
+    project_root = Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+else:
+    project_root = Path(__file__).resolve().parents[1]
+
+# Ensure local .env is loaded when running this script directly.
+load_dotenv(project_root / ".env", override=False)
+
 import ingestion.cda_extractor as cda_extractor
 import ingestion.comp_table_extractor as det_extractor
 import ingestion.edgar_folder_fetcher as fetcher
@@ -139,6 +151,37 @@ _COMP_SIGNATURES = [
     "named executive officer compensation",
     "compensation of named executive officers",
 ]
+_COMP_NAME_HEADER_HINTS = {
+    "name and principal position",
+    "name",
+    "principal position",
+    "executive officer",
+    "named executive",
+}
+_COMP_VALUE_HEADER_HINTS = {
+    "salary",
+    "bonus",
+    "stock awards",
+    "option awards",
+    "non-equity",
+    "non equity",
+    "all other compensation",
+    "total",
+    "compensation",
+    "fiscal year",
+    "year",
+}
+_COMP_REJECT_HEADER_HINTS = {
+    "beneficial ownership",
+    "principal stockholder",
+    "principal stockholders",
+    "shares owned",
+    "percent of shares",
+    "percentage",
+    "peer group",
+    "stockholder return",
+    "total stockholder return",
+}
 
 KEY_RESULTS_COLUMNS = [
     "cik",
@@ -305,30 +348,107 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
 
     Returns (TableBlock, HeadingBlock) or (None, None).
     """
-    comp_headings = [
-        block
-        for block in blocks
+    def _table_header_text(table: TableBlock) -> str:
+        if not table.rows:
+            return ""
+        header_rows = table.header_row_count if table.header_row_count > 0 else min(2, len(table.rows))
+        header_rows = min(max(1, header_rows), len(table.rows), 3)
+        parts: list[str] = []
+        for row in table.rows[:header_rows]:
+            parts.extend(cell.strip() for cell in row if cell.strip())
+        return " | ".join(parts).lower()
+
+    def _score_comp_table_candidate(table: TableBlock, heading_text: str) -> int:
+        header_text = _table_header_text(table)
+        if not header_text:
+            return -10
+
+        row_count = len(table.rows)
+        col_count = max((len(row) for row in table.rows), default=0)
+        header_rows = table.header_row_count if table.header_row_count > 0 else min(2, row_count)
+        header_rows = min(max(1, header_rows), row_count) if row_count else 0
+        data_row_count = max(0, row_count - header_rows)
+
+        score = 0
+        if any(hint in header_text for hint in _COMP_NAME_HEADER_HINTS):
+            score += 3
+        if any(hint in header_text for hint in _COMP_VALUE_HEADER_HINTS):
+            score += 3
+        if "salary" in header_text and "total" in header_text:
+            score += 2
+
+        # Summary compensation tables are typically matrix-style;
+        # tiny 1-row/2-col note tables are usually footnotes.
+        if row_count >= 4:
+            score += 2
+        elif row_count <= 2:
+            score -= 8
+        if col_count >= 5:
+            score += 2
+        elif col_count <= 3:
+            score -= 4
+        if data_row_count <= 1:
+            score -= 4
+
+        heading_lc = heading_text.lower()
+        if any(signature in heading_lc for signature in _COMP_SIGNATURES):
+            score += 2
+
+        if any(hint in header_text for hint in _COMP_REJECT_HEADER_HINTS):
+            score -= 6
+        if "beneficial ownership" in header_text:
+            score -= 10
+
+        return score
+
+    comp_headings: list[tuple[int, HeadingBlock]] = [
+        (index, block)
+        for index, block in enumerate(blocks)
         if isinstance(block, HeadingBlock)
         and any(signature in block.text.lower() for signature in _COMP_SIGNATURES)
     ]
 
-    for heading in comp_headings:
-        for block in blocks:
-            if isinstance(block, TableBlock) and block.section_id == heading.id:
-                return block, heading
+    scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
 
-    for heading_index, block in enumerate(blocks):
-        if not isinstance(block, HeadingBlock):
-            continue
-        if not any(signature in block.text.lower() for signature in _COMP_SIGNATURES):
-            continue
+    for heading_index, heading in comp_headings:
+        # Section-linked candidates.
+        for block in blocks:
+            if not isinstance(block, TableBlock):
+                continue
+            if block.section_id != heading.id:
+                continue
+            score = _score_comp_table_candidate(block, heading.text)
+            if score >= 4:
+                scored_candidates.append((score, 1, 0, block, heading))
+
+        # Nearby fallback candidates.
         for offset in range(1, 16):
             candidate_index = heading_index + offset
             if candidate_index >= len(blocks):
                 break
             candidate = blocks[candidate_index]
-            if isinstance(candidate, TableBlock):
-                return candidate, block
+            if not isinstance(candidate, TableBlock):
+                continue
+            score = _score_comp_table_candidate(candidate, heading.text)
+            if score >= 4:
+                scored_candidates.append((score, 0, -offset, candidate, heading))
+
+    if scored_candidates:
+        best = max(scored_candidates, key=lambda item: (item[0], item[1], item[2]))
+        return best[3], best[4]
+
+    # Last fallback: choose a globally strong summary-comp style table,
+    # even if heading linking failed.
+    global_candidates: list[tuple[int, TableBlock]] = []
+    for block in blocks:
+        if not isinstance(block, TableBlock):
+            continue
+        score = _score_comp_table_candidate(block, "")
+        if score >= 6:
+            global_candidates.append((score, block))
+    if global_candidates:
+        best_global = max(global_candidates, key=lambda item: item[0])
+        return best_global[1], None
 
     return None, None
 
@@ -388,6 +508,78 @@ def _role_fiscal_year(
     return ""
 
 
+def _det_rows_have_comp_payload(det_rows: list[dict[str, Any]]) -> bool:
+    """Return True when deterministic rows contain at least one real comp value."""
+    comp_fields = ("salary", "bonus", "stock_awards", "option_awards", "total")
+    empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
+
+    for row in det_rows:
+        for field in comp_fields:
+            value = row.get(field)
+            if isinstance(value, (int, float)):
+                return True
+            text = str(value or "").strip().lower()
+            if not text or text in empty_markers:
+                continue
+            if any(char.isdigit() for char in text):
+                return True
+    return False
+
+
+def _llm_result_has_comp_payload(result: Any) -> bool:
+    """Return True if LLM result contains at least one populated role value."""
+    roles = [
+        getattr(result, "ceo", None),
+        getattr(result, "cfo", None),
+        getattr(result, "coo", None),
+        getattr(result, "other1", None),
+        getattr(result, "other2", None),
+    ]
+    for role in roles:
+        if role is None:
+            continue
+        values = [
+            str(getattr(role, "name", "") or "").strip(),
+            str(getattr(role, "title", "") or "").strip(),
+            str(getattr(role, "salary", "") or "").strip(),
+            str(getattr(role, "bonus", "") or "").strip(),
+            str(getattr(role, "stock_awards", "") or "").strip(),
+            str(getattr(role, "option_awards", "") or "").strip(),
+            str(getattr(role, "total", "") or "").strip(),
+        ]
+        if any(value for value in values):
+            return True
+    return False
+
+
+def _result_row_has_comp_payload(result_row: dict[str, Any]) -> bool:
+    """Return True if mapped output row has at least one numeric comp value."""
+    comp_fields = (
+        "ceo_salary",
+        "ceo_bonus",
+        "ceo_stock_awards",
+        "ceo_option_awards",
+        "ceo_total",
+        "cfo_salary",
+        "cfo_total",
+        "coo_salary",
+        "coo_total",
+        "other1_salary",
+        "other1_total",
+        "other2_salary",
+        "other2_total",
+    )
+    empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
+
+    for field in comp_fields:
+        text = str(result_row.get(field, "") or "").strip().lower()
+        if not text or text in empty_markers:
+            continue
+        if any(char.isdigit() for char in text):
+            return True
+    return False
+
+
 def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Full pipeline for one CIK. Returns (key_results_row, log_row).
@@ -436,8 +628,9 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             "error": reason,
         }
         if extra:
-            base.update(extra)
             for key, value in extra.items():
+                if key in KEY_RESULTS_COLUMNS:
+                    base[key] = value
                 if key in BATCH_LOG_COLUMNS:
                     log_row[key] = value
         return base, log_row
@@ -511,7 +704,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             },
         )
 
-    if det_rows:
+    if det_rows and _det_rows_have_comp_payload(det_rows):
         extraction_method = "deterministic"
         roles = _collapse_to_roles(det_rows)
     elif comp_table is not None:
@@ -526,6 +719,18 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
         )
         llm_confidence = llm_result.confidence
         llm_model_used = model
+        if not _llm_result_has_comp_payload(llm_result):
+            return _failed(
+                "llm_extract_failed_empty_result",
+                company_name,
+                {
+                    "block_count": block_count,
+                    "table_count": table_count,
+                    "comp_heading_found": comp_heading_found,
+                    "comp_table_found": comp_table_found,
+                    "llm_confidence": llm_confidence,
+                },
+            )
         extraction_method = "llm"
         roles = {
             "ceo": llm_result.ceo,
@@ -588,6 +793,19 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             continue
         if isinstance(role_data, dict):
             result_row.update(_row_from_det(role_data, prefix))
+
+    if not _result_row_has_comp_payload(result_row):
+        return _failed(
+            "extraction_empty_after_mapping",
+            company_name,
+            {
+                "block_count": block_count,
+                "table_count": table_count,
+                "comp_heading_found": comp_heading_found,
+                "comp_table_found": comp_table_found,
+                "llm_confidence": llm_confidence,
+            },
+        )
 
     elapsed = round(time.monotonic() - t0, 2)
     log_row: dict[str, Any] = {

@@ -47,8 +47,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field, model_validator
 
@@ -358,6 +360,12 @@ def extract_company_comp_from_summary_table(
         return CompanyCompResult()
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key.strip():
+        # Best-effort load of project .env for script/CLI code paths
+        # that do not go through Settings() initialization.
+        project_root = Path(__file__).resolve().parents[1]
+        load_dotenv(project_root / ".env", override=False)
+        api_key = os.environ.get("OPENAI_API_KEY", "")
     use_ollama = client is None and api_key.strip().lower() in _DUMMY_KEY_VALUES
     if client is None and not use_ollama:
         client = OpenAI(api_key=api_key)
