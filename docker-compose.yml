@@ -1,11 +1,17 @@
 # -------------------------------------------------------------------
 # SEC RAG Pipeline - local Docker stack
 #
-# Infra only:
+# Infra only (development, no app container):
 #   docker compose up -d postgres qdrant
 #
-# Full stack:
+# OpenAI mode (recommended):
+#   docker compose up -d postgres qdrant app
+#
+# Full stack with Ollama LLM fallback:
 #   docker compose --profile full up --build -d
+#
+# Reset volumes (wipe DB):
+#   docker compose down -v
 # -------------------------------------------------------------------
 
 services:
@@ -40,7 +46,51 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  # FastAPI app + pipeline scripts.
+  # No dependency on ollama — OpenAI mode works without it.
+  # For Ollama fallback, set LLM_PROVIDER=ollama in .env and use --profile full.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sec_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      APP_ENV: docker
+      DB_URL: postgresql+asyncpg://postgres:password@postgres:5432/sec_rag
+      QDRANT_URL: http://qdrant:6333
+      EDGAR_DOWNLOAD_DIR: /app/data/raw
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://sec_ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./fixtures:/app/fixtures
+      - ./output:/app/output
+    working_dir: /app
+    command: ["poetry", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
   # Local Ollama runtime for offline LLM fallback.
+  # Only starts with: docker compose --profile full up -d
+  # First run pulls llama3.1 (~4.7 GB) — takes 3–5 min.
   ollama:
     image: ollama/ollama:latest
     container_name: sec_ollama
@@ -67,51 +117,6 @@ services:
       timeout: 10s
       retries: 10
       start_period: 120s
-
-  # FastAPI app container for health checks and future query endpoints.
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: sec_app
-    profiles: ["full"]
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
-      ollama:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      APP_ENV: docker
-      DB_URL: postgresql+asyncpg://postgres:password@postgres:5432/sec_rag
-      QDRANT_URL: http://qdrant:6333
-      EDGAR_USER_AGENT: ${EDGAR_USER_AGENT:-Dev User dev@example.com}
-      SEC_USER_AGENT: ${SEC_USER_AGENT:-Dev User dev@example.com}
-      EDGAR_DOWNLOAD_DIR: /app/data/raw
-      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-dummy}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o}
-      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://sec_ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
-    ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
-      - ./fixtures:/app/fixtures
-      - ./output:/app/output
-    working_dir: /app
-    command: ["poetry", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
 
 volumes:
   postgres_data:

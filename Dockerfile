@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────────────
 # SEC RAG Pipeline — application image
 # Base: python:3.11-slim (matches pyproject.toml python = "^3.11")
+# Poetry: 2.1.1 (matches poetry.lock format version)
 # ─────────────────────────────────────────────────────────────────
 
 FROM python:3.11-slim
@@ -12,8 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Poetry — pin to same version as CI (1.8.3)
-RUN pip install --no-cache-dir poetry==1.8.3
+# Install Poetry — pin to 2.1.1 to match regenerated poetry.lock
+RUN pip install --no-cache-dir poetry==2.1.1
+
+# Disable virtualenv creation inside container (we run as root in /app)
+ENV POETRY_VIRTUALENVS_CREATE=false
 
 WORKDIR /app
 
@@ -21,13 +25,14 @@ WORKDIR /app
 # when pyproject.toml or poetry.lock changes, not on code changes)
 COPY pyproject.toml poetry.lock ./
 
-# Install all dependencies including dev (for ruff/mypy/pytest)
-# --no-root: don't install the project package itself yet (mounted as volume)
+# Install all dependencies including dev (for ruff/mypy/pytest in CI)
+# --no-root: don’t install the project package itself yet
 RUN poetry install --no-interaction --no-root
 
-# Copy the rest of the source (will be overridden by volume mount in dev)
+# Copy the rest of the source
+# (overridden by volume mount in docker compose dev mode)
 COPY . .
 
-# Default command: keep container alive for exec usage
-# Override with `docker compose run app poetry run python ...`
+# Default: keep container alive for exec usage
+# Override via docker compose command: field
 CMD ["tail", "-f", "/dev/null"]
