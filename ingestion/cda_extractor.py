@@ -42,23 +42,58 @@ def _is_text_block(block: BaseBlock) -> TypeGuard[ProseBlock | XBRLTaggedBlock]:
     return isinstance(block, (ProseBlock, XBRLTaggedBlock))
 
 
+def _block_page_start(block: BaseBlock) -> int | None:
+    if block.toc_page_range is None:
+        return None
+    return block.toc_page_range[0]
+
+
+def _block_page_end(block: BaseBlock) -> int | None:
+    if block.toc_page_range is None:
+        return None
+    return block.toc_page_range[1]
+
+
+def _is_after_toc_end(block: BaseBlock, toc_end_page: int) -> bool:
+    block_page_start = _block_page_start(block)
+    return block_page_start is not None and block_page_start > toc_end_page
+
+
 def _extract_primary_cda_parts(blocks: list[BaseBlock]) -> list[str]:
     in_cda = False
     cda_parts: list[str] = []
+    toc_end_page: int | None = None
 
     for block in blocks:
         if isinstance(block, HeadingBlock):
             heading = _normalise(block.text)
             if any(pattern in heading for pattern in _CDA_START_PATTERNS):
                 in_cda = True
+                heading_page_end = _block_page_end(block)
+                if heading_page_end is not None:
+                    toc_end_page = heading_page_end
                 continue
             if in_cda and any(pattern in heading for pattern in _CDA_END_PATTERNS):
+                heading_page_start = _block_page_start(block)
+                if heading_page_start is not None:
+                    end_before_heading = max(0, heading_page_start - 1)
+                    toc_end_page = (
+                        end_before_heading
+                        if toc_end_page is None
+                        else min(toc_end_page, end_before_heading)
+                    )
                 break
 
         if in_cda and _is_text_block(block):
+            if toc_end_page is not None and _is_after_toc_end(block, toc_end_page):
+                break
             text = block.text.strip()
             if text:
                 cda_parts.append(text)
+                if toc_end_page is None:
+                    block_page_end = _block_page_end(block)
+                    if block_page_end is not None:
+                        toc_end_page = block_page_end
 
     return cda_parts
 
@@ -67,14 +102,22 @@ def _extract_fallback_cda_parts(blocks: list[BaseBlock]) -> list[str]:
     """Fallback when heading-based CD&A boundaries are missing in the parsed HTML."""
     in_comp_section = False
     cda_parts: list[str] = []
+    toc_end_page: int | None = None
 
     for block in blocks:
         if isinstance(block, HeadingBlock):
             heading = _normalise(block.text)
             if any(pattern in heading for pattern in _CDA_END_PATTERNS) and cda_parts:
+                heading_page_start = _block_page_start(block)
+                if heading_page_start is not None and toc_end_page is None:
+                    toc_end_page = max(0, heading_page_start - 1)
                 break
             if any(pattern in heading for pattern in _FALLBACK_START_PATTERNS):
                 in_comp_section = True
+                if toc_end_page is None:
+                    heading_page_end = _block_page_end(block)
+                    if heading_page_end is not None:
+                        toc_end_page = heading_page_end
                 continue
 
         if not _is_text_block(block):
@@ -87,9 +130,19 @@ def _extract_fallback_cda_parts(blocks: list[BaseBlock]) -> list[str]:
         normalized_text = _normalise(text)
         if any(pattern in normalized_text for pattern in _CDA_START_PATTERNS):
             in_comp_section = True
+            if toc_end_page is None:
+                text_page_end = _block_page_end(block)
+                if text_page_end is not None:
+                    toc_end_page = text_page_end
 
         if in_comp_section:
+            if toc_end_page is not None and _is_after_toc_end(block, toc_end_page):
+                break
             cda_parts.append(text)
+            if toc_end_page is None:
+                text_page_end = _block_page_end(block)
+                if text_page_end is not None:
+                    toc_end_page = text_page_end
 
     return cda_parts
 

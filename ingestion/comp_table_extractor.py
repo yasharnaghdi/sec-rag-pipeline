@@ -366,7 +366,6 @@ def _build_grants_column_map(
                 group_context[column_index] = last_group
 
     column_map: list[str | None] = []
-    seen: set[str] = set()
 
     for column_index in range(column_count):
         column_cells: list[str] = []
@@ -431,10 +430,6 @@ def _build_grants_column_map(
         else:
             canonical = _match_col(combined_header, schema)
 
-        if canonical in seen:
-            canonical = None
-        if canonical is not None:
-            seen.add(canonical)
         column_map.append(canonical)
 
     return column_map
@@ -467,6 +462,79 @@ def _extract_row_footnote_refs(row: list[str], footnotes: dict[str, str]) -> str
         if any(marker in cell for cell in row):
             refs.append(f"{marker}: {text[:120]}")
     return " || ".join(refs)
+
+
+def _normalize_grants_row_cells(row: list[str]) -> list[str]:
+    """Normalize split currency symbol + numeric cells for grants rows."""
+    normalized = [cell.strip() for cell in row]
+    for idx in range(len(normalized) - 1):
+        left = normalized[idx]
+        right = normalized[idx + 1]
+        if left == "$" and right and any(char.isdigit() for char in right) and not right.startswith("$"):
+            normalized[idx] = ""
+            normalized[idx + 1] = f"${right}"
+    return normalized
+
+
+def _grants_candidate_indices(column_map: list[str | None]) -> dict[str, list[int]]:
+    candidates: dict[str, list[int]] = {}
+    for index, canonical in enumerate(column_map):
+        if canonical is None:
+            continue
+        candidates.setdefault(canonical, []).append(index)
+    return candidates
+
+
+def _select_best_grants_cell(row: list[str], indices: list[int]) -> str:
+    values: list[str] = []
+    for index in indices:
+        if index >= len(row):
+            continue
+        value = row[index].strip()
+        if value:
+            values.append(value)
+    if not values:
+        return ""
+
+    def _rank(value: str) -> tuple[int, int]:
+        if any(char.isdigit() for char in value):
+            return (3, len(value))
+        if value in {"$", "—", "-", "n/a", "na"}:
+            return (1, len(value))
+        return (2, len(value))
+
+    return max(values, key=_rank)
+
+
+def _map_grants_row(
+    row: list[str],
+    column_map: list[str | None],
+    metadata: Mapping[str, Any],
+    footnotes: dict[str, str],
+    source_section: str,
+    table_block_id: str,
+) -> dict[str, Any]:
+    output: dict[str, Any] = dict(metadata)
+    normalized_row = _normalize_grants_row_cells(row)
+    candidates = _grants_candidate_indices(column_map)
+    mapped_values = 0
+    for canonical, indices in candidates.items():
+        value = _select_best_grants_cell(normalized_row, indices)
+        if not value:
+            continue
+        output[canonical] = value
+        if canonical in NUMERIC_COLUMNS:
+            numeric_val = clean_numeric(value)
+            output[canonical] = numeric_val if numeric_val is not None else value
+        mapped_values += 1
+
+    if mapped_values == 0 and normalized_row:
+        output["exec_name"] = normalized_row[0].strip()
+
+    output["footnote_refs"] = _extract_row_footnote_refs(normalized_row, footnotes)
+    output["source_section"] = source_section
+    output["table_block_id"] = table_block_id
+    return output
 
 
 def _map_row(
@@ -756,7 +824,7 @@ def _extract_grants_from_table_block(
     for source_row_index, row in _grants_data_rows_with_index(table_block):
         if not any(cell.strip() for cell in row):
             continue
-        mapped = _map_row(
+        mapped = _map_grants_row(
             row=row,
             column_map=column_map,
             metadata=meta,

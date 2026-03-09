@@ -57,3 +57,11 @@ This file records the architectural decisions that define `sec-rag-pipeline` as 
 - Decision: Use the S&P 500 as the default batch universe for the first large-scale manifest and extraction workflow.
 - Reason: It is a practical, high-signal benchmark set for executive compensation coverage and repeatable evaluation.
 - Consequence: The repo ships manifest tooling, download logs, and validation expectations shaped around S&P 500 scale rather than ad hoc one-off filings.
+
+## ADR-008: TOC-Bounded CD&A Extraction with Heading Fallback
+
+- Status: Accepted
+- Date: 2026-03-09
+- Decision: Bound CD&A narrative extraction by TOC-derived page ranges when available, while preserving heading and text-pattern boundaries as fallback.
+- Reason: Cached SEC HTML frequently includes strong pagination markers and TOC page ranges, but heading detection coverage is not universal across filers and templates.
+- Consequence: CD&A extraction is more deterministic for long sections and less likely to run into downstream compensation tables, while still remaining robust when TOC or heading signals are incomplete.

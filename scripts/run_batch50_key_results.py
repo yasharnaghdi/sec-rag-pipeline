@@ -230,6 +230,9 @@ _GRANTS_GRANT_TYPE_HINTS = {
 }
 
 GRANTS_OUTPUT_COLUMNS = [
+    "CIK",
+    "Company Name",
+    "Filing URL",
     "Name",
     "Grant Type",
     "Grant Date",
@@ -243,6 +246,25 @@ GRANTS_OUTPUT_COLUMNS = [
     "All other option awards: Number of securities underlying options",
     "Exercise or base price of option awards",
     "Grant date fair value of stock and option awards",
+]
+
+COMPENSATION_OUTPUT_COLUMNS = [
+    "CIK",
+    "Company Name",
+    "Filing URL",
+    "ticker",
+    "Name",
+    "Title",
+    "Year",
+    "Salary ($)",
+    "Bonus Awards ($)",
+    "Stock Awards ($)",
+    "Option Awards ($)",
+    "Non-Equity Incentive Plan Compensation ($)",
+    "Change in pension value and nonqualified deferred compensation earnings ($)",
+    "All Other Compensation ($)",
+    "Total ($)",
+    "Extra information",
 ]
 
 KEY_RESULTS_COLUMNS = [
@@ -339,6 +361,10 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _as_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """
     Collapse deterministic extractor rows (one per exec per year)
@@ -413,11 +439,36 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
     def _table_header_text(table: TableBlock) -> str:
         if not table.rows:
             return ""
-        header_rows = table.header_row_count if table.header_row_count > 0 else min(2, len(table.rows))
-        header_rows = min(max(1, header_rows), len(table.rows), 3)
+        scan_rows = min(12, len(table.rows))
+        hint_terms = _COMP_NAME_HEADER_HINTS | _COMP_VALUE_HEADER_HINTS | {"name"}
+        scored_rows: list[tuple[int, int, list[str]]] = []
+
+        for row_index in range(scan_rows):
+            cells = [cell.strip() for cell in table.rows[row_index] if cell.strip()]
+            if not cells:
+                continue
+            row_text = " | ".join(cells).lower()
+            alpha_cells = sum(1 for cell in cells if any(char.isalpha() for char in cell))
+            digit_cells = sum(1 for cell in cells if any(char.isdigit() for char in cell))
+            score = (alpha_cells * 2) - digit_cells
+            if len(cells) >= 4:
+                score += 2
+            if any(term in row_text for term in hint_terms):
+                score += 10
+            if "table of contents" in row_text:
+                score -= 4
+            if any(hint in row_text for hint in _COMP_REJECT_HEADER_HINTS):
+                score -= 6
+            scored_rows.append((score, row_index, cells))
+
+        if not scored_rows:
+            return ""
+
+        scored_rows.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        selected = sorted(scored_rows[:4], key=lambda item: item[1])
         parts: list[str] = []
-        for row in table.rows[:header_rows]:
-            parts.extend(cell.strip() for cell in row if cell.strip())
+        for _, _, cells in selected:
+            parts.extend(cells)
         return " | ".join(parts).lower()
 
     def _score_comp_table_candidate(table: TableBlock, heading_text: str) -> int:
@@ -572,7 +623,16 @@ def _role_fiscal_year(
 
 def _det_rows_have_comp_payload(det_rows: list[dict[str, Any]]) -> bool:
     """Return True when deterministic rows contain at least one real comp value."""
-    comp_fields = ("salary", "bonus", "stock_awards", "option_awards", "total")
+    comp_fields = (
+        "salary",
+        "bonus",
+        "stock_awards",
+        "option_awards",
+        "non_equity_incentive",
+        "pension_change",
+        "other_comp",
+        "total",
+    )
     empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
 
     for row in det_rows:
@@ -607,7 +667,11 @@ def _llm_result_has_comp_payload(result: Any) -> bool:
             str(getattr(role, "bonus", "") or "").strip(),
             str(getattr(role, "stock_awards", "") or "").strip(),
             str(getattr(role, "option_awards", "") or "").strip(),
+            str(getattr(role, "non_equity_incentive", "") or "").strip(),
+            str(getattr(role, "pension_change", "") or "").strip(),
+            str(getattr(role, "other_comp", "") or "").strip(),
             str(getattr(role, "total", "") or "").strip(),
+            str(getattr(role, "footnotes", "") or "").strip(),
         ]
         if any(value for value in values):
             return True
@@ -857,33 +921,33 @@ def _grant_row_from_det(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "Name": name,
         "Grant Type": raw_type,
-        "Grant Date": str(row.get("grant_date", "") or ""),
-        "Estimated future payouts under non-equity incentive plan awards (Threshold)": str(
-            row.get("non_equity_threshold", "") or ""
+        "Grant Date": _as_text(row.get("grant_date", "")),
+        "Estimated future payouts under non-equity incentive plan awards (Threshold)": _as_text(
+            row.get("non_equity_threshold", "")
         ),
-        "Estimated future payouts under non-equity incentive plan awards (Target)": str(
-            row.get("non_equity_target", "") or ""
+        "Estimated future payouts under non-equity incentive plan awards (Target)": _as_text(
+            row.get("non_equity_target", "")
         ),
-        "Estimated future payouts under non-equity incentive plan awards (Maximum)": str(
-            row.get("non_equity_maximum", "") or ""
+        "Estimated future payouts under non-equity incentive plan awards (Maximum)": _as_text(
+            row.get("non_equity_maximum", "")
         ),
-        "Estimated future payouts under equity incentive plan awards (Threshold)": str(
-            row.get("equity_threshold", "") or ""
+        "Estimated future payouts under equity incentive plan awards (Threshold)": _as_text(
+            row.get("equity_threshold", "")
         ),
-        "Estimated future payouts under equity incentive plan awards (Target)": str(
-            row.get("equity_target", "") or ""
+        "Estimated future payouts under equity incentive plan awards (Target)": _as_text(
+            row.get("equity_target", "")
         ),
-        "Estimated future payouts under equity incentive plan awards (Maximum)": str(
-            row.get("equity_maximum", "") or ""
+        "Estimated future payouts under equity incentive plan awards (Maximum)": _as_text(
+            row.get("equity_maximum", "")
         ),
-        "All other stock awards: Number of shares of stock or units": str(
-            row.get("all_other_stock_awards_shares", "") or ""
+        "All other stock awards: Number of shares of stock or units": _as_text(
+            row.get("all_other_stock_awards_shares", "")
         ),
-        "All other option awards: Number of securities underlying options": str(
-            row.get("all_other_option_awards_securities", "") or ""
+        "All other option awards: Number of securities underlying options": _as_text(
+            row.get("all_other_option_awards_securities", "")
         ),
-        "Exercise or base price of option awards": str(row.get("exercise_or_base_price", "") or ""),
-        "Grant date fair value of stock and option awards": str(row.get("grant_date_fair_value", "") or ""),
+        "Exercise or base price of option awards": _as_text(row.get("exercise_or_base_price", "")),
+        "Grant date fair value of stock and option awards": _as_text(row.get("grant_date_fair_value", "")),
     }
 
 
@@ -905,9 +969,105 @@ def _grant_row_from_llm(row: GrantPlanAwardRecord) -> dict[str, Any]:
     }
 
 
-def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+def _normalize_compensation_year(raw_year: str, fallback_year: str) -> str:
+    if re.fullmatch(r"\d{4}", raw_year.strip()):
+        return raw_year.strip()
+    if re.fullmatch(r"\d{4}", fallback_year.strip()):
+        return fallback_year.strip()
+    return "unknown"
+
+
+def _compensation_row_from_det(
+    *,
+    row: dict[str, Any],
+    cik: str,
+    company_name: str,
+    filing_url: str,
+    ticker: str,
+    fallback_year: str,
+) -> dict[str, str]:
+    resolved_year = _normalize_compensation_year(str(row.get("year", "") or ""), fallback_year)
+    return {
+        "CIK": cik,
+        "Company Name": company_name,
+        "Filing URL": filing_url,
+        "ticker": ticker,
+        "Name": str(row.get("exec_name", "") or "").strip(),
+        "Title": str(row.get("exec_title", "") or "").strip(),
+        "Year": resolved_year,
+        "Salary ($)": _as_text(row.get("salary", "")),
+        "Bonus Awards ($)": _as_text(row.get("bonus", "")),
+        "Stock Awards ($)": _as_text(row.get("stock_awards", "")),
+        "Option Awards ($)": _as_text(row.get("option_awards", "")),
+        "Non-Equity Incentive Plan Compensation ($)": _as_text(row.get("non_equity_incentive", "")),
+        "Change in pension value and nonqualified deferred compensation earnings ($)": _as_text(
+            row.get("pension_change", "")
+        ),
+        "All Other Compensation ($)": _as_text(row.get("other_comp", "")),
+        "Total ($)": _as_text(row.get("total", "")),
+        "Extra information": _as_text(row.get("footnote_refs", "")).strip(),
+        "__cik": cik,
+        "__year": resolved_year,
+    }
+
+
+def _compensation_row_from_llm(
+    *,
+    record: ExecCompRecord,
+    cik: str,
+    company_name: str,
+    filing_url: str,
+    ticker: str,
+    fallback_year: str,
+) -> dict[str, str]:
+    resolved_year = _normalize_compensation_year(record.fiscal_year, fallback_year)
+    return {
+        "CIK": cik,
+        "Company Name": company_name,
+        "Filing URL": filing_url,
+        "ticker": ticker,
+        "Name": record.name.strip(),
+        "Title": record.title.strip(),
+        "Year": resolved_year,
+        "Salary ($)": record.salary or "",
+        "Bonus Awards ($)": record.bonus or "",
+        "Stock Awards ($)": record.stock_awards or "",
+        "Option Awards ($)": record.option_awards or "",
+        "Non-Equity Incentive Plan Compensation ($)": record.non_equity_incentive or "",
+        "Change in pension value and nonqualified deferred compensation earnings ($)": record.pension_change or "",
+        "All Other Compensation ($)": record.other_comp or "",
+        "Total ($)": record.total or "",
+        "Extra information": (record.footnotes or "").strip(),
+        "__cik": cik,
+        "__year": resolved_year,
+    }
+
+
+def _compensation_row_has_payload(row: dict[str, str]) -> bool:
+    values = [
+        row.get("Name", "").strip(),
+        row.get("Title", "").strip(),
+        row.get("Salary ($)", "").strip(),
+        row.get("Bonus Awards ($)", "").strip(),
+        row.get("Stock Awards ($)", "").strip(),
+        row.get("Option Awards ($)", "").strip(),
+        row.get("Non-Equity Incentive Plan Compensation ($)", "").strip(),
+        row.get("Change in pension value and nonqualified deferred compensation earnings ($)", "").strip(),
+        row.get("All Other Compensation ($)", "").strip(),
+        row.get("Total ($)", "").strip(),
+        row.get("Extra information", "").strip(),
+    ]
+    return any(values)
+
+
+def process_cik(
+    cik: str,
+    model: str,
+    skip_db: bool,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
     """
-    Full pipeline for one CIK. Returns (key_results_row, log_row, grants_rows).
+    Full pipeline for one CIK.
+    Returns (key_results_row, log_row, grants_rows, compensation_rows).
 
     This function never raises. All errors are caught and returned
     as a failed row so the batch loop stays clean.
@@ -917,12 +1077,13 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
     """
     t0 = time.monotonic()
     grants_rows_out: list[dict[str, Any]] = []
+    compensation_rows_out: list[dict[str, str]] = []
 
     def _failed(
         reason: str,
         company_name: str = "",
         extra: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
         elapsed = round(time.monotonic() - t0, 2)
         base: dict[str, Any] = {col: "" for col in KEY_RESULTS_COLUMNS}
         base.update(
@@ -959,7 +1120,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
                     base[key] = value
                 if key in BATCH_LOG_COLUMNS:
                     log_row[key] = value
-        return base, log_row, grants_rows_out
+        return base, log_row, grants_rows_out, compensation_rows_out
 
     try:
         filing = _fetch_latest_def14a(cik)
@@ -1023,6 +1184,9 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
     if grants_det_rows and _det_rows_have_grants_payload(grants_det_rows):
         for det_row in grants_det_rows:
             output_row = _grant_row_from_det(det_row)
+            output_row["CIK"] = cik
+            output_row["Company Name"] = company_name
+            output_row["Filing URL"] = filing.filing_url
             output_row["__cik"] = cik
             output_row["__fiscal_year"] = grants_fiscal_year
             grants_rows_out.append(output_row)
@@ -1038,6 +1202,9 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
         if _llm_result_has_grants_payload(llm_grants_result):
             for llm_row in llm_grants_result.rows:
                 output_row = _grant_row_from_llm(llm_row)
+                output_row["CIK"] = cik
+                output_row["Company Name"] = company_name
+                output_row["Filing URL"] = filing.filing_url
                 output_row["__cik"] = cik
                 output_row["__fiscal_year"] = grants_fiscal_year
                 grants_rows_out.append(output_row)
@@ -1067,8 +1234,20 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             },
         )
 
+    inferred_comp_year = _infer_fiscal_year_from_filing_date(filing.filing_date)
     if det_rows and _det_rows_have_comp_payload(det_rows):
         extraction_method = "deterministic"
+        for det_row in det_rows:
+            output_row = _compensation_row_from_det(
+                row=det_row,
+                cik=cik,
+                company_name=company_name,
+                filing_url=filing.filing_url,
+                ticker=ticker,
+                fallback_year=inferred_comp_year,
+            )
+            if _compensation_row_has_payload(output_row):
+                compensation_rows_out.append(output_row)
         roles = _collapse_to_roles(det_rows)
     elif comp_table is not None:
         log.info("llm_fallback triggered | cik=%s", cik)
@@ -1102,6 +1281,20 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
             "other1": llm_result.other1,
             "other2": llm_result.other2,
         }
+        for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
+            role_record = roles[role_key]
+            if not isinstance(role_record, ExecCompRecord):
+                continue
+            output_row = _compensation_row_from_llm(
+                record=role_record,
+                cik=cik,
+                company_name=company_name,
+                filing_url=filing.filing_url,
+                ticker=ticker,
+                fallback_year=inferred_comp_year,
+            )
+            if _compensation_row_has_payload(output_row):
+                compensation_rows_out.append(output_row)
     else:
         return _failed(
             "no_comp_table_located",
@@ -1198,7 +1391,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
         except Exception as db_exc:  # noqa: BLE001
             log.warning("db_write_failed | cik=%s error=%s", cik, db_exc)
 
-    return result_row, log_row, grants_rows_out
+    return result_row, log_row, grants_rows_out, compensation_rows_out
 
 
 def main() -> None:
@@ -1261,18 +1454,23 @@ def main() -> None:
     key_results_path = out_dir / "key_results.csv"
     batch_log_path = out_dir / "batch_log.csv"
     grants_master_path = out_dir / "grants_plan_based_master.csv"
+    compensation_master_path = out_dir / "compensation_table_master.csv"
     grants_by_cik_year_dir = out_dir / "grants_plan_based_by_cik_year"
+    compensation_by_cik_year_dir = out_dir / "compensation_by_cik_year"
     grants_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
+    compensation_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
     failed_count = 0
     ceo_total_populated = 0
     all_grants_rows: list[dict[str, Any]] = []
+    all_compensation_rows: list[dict[str, str]] = []
 
     with (
         key_results_path.open("w", newline="", encoding="utf-8") as key_results_file,
         batch_log_path.open("w", newline="", encoding="utf-8") as batch_log_file,
         grants_master_path.open("w", newline="", encoding="utf-8") as grants_master_file,
+        compensation_master_path.open("w", newline="", encoding="utf-8") as compensation_master_file,
     ):
         kr_writer = csv.DictWriter(key_results_file, fieldnames=KEY_RESULTS_COLUMNS)
         log_writer = csv.DictWriter(batch_log_file, fieldnames=BATCH_LOG_COLUMNS)
@@ -1281,21 +1479,36 @@ def main() -> None:
             fieldnames=GRANTS_OUTPUT_COLUMNS,
             extrasaction="ignore",
         )
+        compensation_writer = csv.DictWriter(
+            compensation_master_file,
+            fieldnames=COMPENSATION_OUTPUT_COLUMNS,
+            extrasaction="ignore",
+        )
         kr_writer.writeheader()
         log_writer.writeheader()
         grants_writer.writeheader()
+        compensation_writer.writeheader()
 
         for index, cik in enumerate(ciks, start=1):
             log.info("[%d/%d] processing | cik=%s", index, len(ciks), cik)
-            result_row, log_row, grants_rows = process_cik(cik, args.model, args.no_db)
+            process_result = cast(Any, process_cik(cik, args.model, args.no_db))
+            if isinstance(process_result, tuple) and len(process_result) == 3:
+                result_row, log_row, grants_rows = process_result
+                compensation_rows: list[dict[str, str]] = []
+            else:
+                result_row, log_row, grants_rows, compensation_rows = process_result
             kr_writer.writerow(result_row)
             log_writer.writerow(log_row)
             for grants_row in grants_rows:
                 grants_writer.writerow(grants_row)
                 all_grants_rows.append(grants_row)
+            for compensation_row in compensation_rows:
+                compensation_writer.writerow(compensation_row)
+                all_compensation_rows.append(compensation_row)
             key_results_file.flush()
             batch_log_file.flush()
             grants_master_file.flush()
+            compensation_master_file.flush()
 
             if result_row.get("status") == "ok":
                 success_count += 1
@@ -1322,6 +1535,24 @@ def main() -> None:
             for row in rows:
                 writer.writerow(row)
 
+    grouped_compensation_rows: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in all_compensation_rows:
+        row_cik = str(row.get("__cik", "") or "").strip()
+        row_year = str(row.get("__year", "") or "").strip()
+        if not row_cik:
+            continue
+        if not re.fullmatch(r"\d{4}", row_year):
+            row_year = "unknown"
+        grouped_compensation_rows.setdefault((row_cik, row_year), []).append(row)
+
+    for (row_cik, row_year), rows in grouped_compensation_rows.items():
+        per_file_path = compensation_by_cik_year_dir / f"{row_cik}_{row_year}.csv"
+        with per_file_path.open("w", newline="", encoding="utf-8") as per_file:
+            writer = csv.DictWriter(per_file, fieldnames=COMPENSATION_OUTPUT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
     log.info(
         "batch complete | success=%d failed=%d ceo_total_populated=%d/%d",
         success_count,
@@ -1333,6 +1564,8 @@ def main() -> None:
     log.info("batch_log   -> %s", batch_log_path)
     log.info("grants master -> %s", grants_master_path)
     log.info("grants by cik/year -> %s", grants_by_cik_year_dir)
+    log.info("compensation master -> %s", compensation_master_path)
+    log.info("compensation by cik/year -> %s", compensation_by_cik_year_dir)
 
     if ceo_total_populated < MIN_CEO_COVERAGE:
         log.error(

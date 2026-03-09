@@ -196,6 +196,55 @@ def test_grant_row_from_det_preserves_name_and_classifies_type() -> None:
     assert mapped["Grant Type"] == "Performance Restricted Stock Units (PRSU)"
 
 
+def test_grant_row_from_det_preserves_zero_values() -> None:
+    row: dict[str, Any] = {
+        "exec_name": "Alex Smith",
+        "grant_type": "AIA",
+        "grant_date": "2024-01-01",
+        "non_equity_threshold": 0.0,
+        "non_equity_target": 100.0,
+        "equity_threshold": 0.0,
+    }
+    mapped = run_batch._grant_row_from_det(row)
+    assert mapped["Estimated future payouts under non-equity incentive plan awards (Threshold)"] == "0.0"
+    assert mapped["Estimated future payouts under equity incentive plan awards (Threshold)"] == "0.0"
+
+
+def test_extract_grants_prefers_numeric_over_currency_symbol_split_cells() -> None:
+    rows = [
+        [
+            "Name",
+            "Award Type",
+            "Grant Date",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+            "Estimated Future Payouts Under Non-Equity Incentive Plan Awards",
+        ],
+        [
+            "Name",
+            "Award Type",
+            "Grant Date",
+            "Threshold ($)",
+            "Threshold ($)",
+            "Target ($)",
+            "Target ($)",
+            "Maximum ($)",
+            "Maximum ($)",
+        ],
+        ["Jane Doe", "AIA", "2024-01-01", "$0", "", "$", "6,000,000", "$", "11,250,000"],
+    ]
+    table = _table(rows, section_id="sec-grants", order_index=1, header_row_count=2)
+    extracted = extract_grants_plan_based([table], {"cik": "0000001"}, selected_table=table)
+    assert len(extracted) == 1
+    row = extracted[0]
+    assert row["non_equity_threshold"] == pytest.approx(0.0)
+    assert row["non_equity_target"] == pytest.approx(6000000.0)
+    assert row["non_equity_maximum"] == pytest.approx(11250000.0)
+
+
 def test_extract_grants_selected_table_without_heading_handles_header_row_count_zero() -> None:
     rows = [
         ["", "", "", "", "", "", "", ""],
@@ -257,6 +306,9 @@ def test_main_writes_grants_master_and_per_cik_year_csvs(tmp_path: Path, monkeyp
         log_row.update({"cik": cik, "company_name": "Acme Corp", "status": "ok", "extraction_method": "deterministic"})
         grants_rows = [
             {
+                "CIK": cik,
+                "Company Name": "Acme Corp",
+                "Filing URL": "https://example.com/filing",
                 "Name": "Alex Smith",
                 "Grant Type": "Incentive Plan",
                 "Grant Date": "2024-01-01",
@@ -274,6 +326,9 @@ def test_main_writes_grants_master_and_per_cik_year_csvs(tmp_path: Path, monkeyp
                 "__fiscal_year": "2024",
             },
             {
+                "CIK": cik,
+                "Company Name": "Acme Corp",
+                "Filing URL": "https://example.com/filing",
                 "Name": "Alex Smith",
                 "Grant Type": "Stock Options",
                 "Grant Date": "2024-01-01",
@@ -325,6 +380,9 @@ def test_main_writes_grants_master_and_per_cik_year_csvs(tmp_path: Path, monkeyp
         assert reader.fieldnames == run_batch.GRANTS_OUTPUT_COLUMNS
         rows = list(reader)
         assert len(rows) == 2
+        assert rows[0]["CIK"] == "1234567"
+        assert rows[0]["Company Name"] == "Acme Corp"
+        assert rows[0]["Filing URL"] == "https://example.com/filing"
         assert rows[0]["Name"] == "Alex Smith"
 
     with grouped_path.open(newline="", encoding="utf-8") as handle:
@@ -332,3 +390,6 @@ def test_main_writes_grants_master_and_per_cik_year_csvs(tmp_path: Path, monkeyp
         assert reader.fieldnames == run_batch.GRANTS_OUTPUT_COLUMNS
         rows = list(reader)
         assert len(rows) == 2
+        assert rows[1]["CIK"] == "1234567"
+        assert rows[1]["Company Name"] == "Acme Corp"
+        assert rows[1]["Filing URL"] == "https://example.com/filing"

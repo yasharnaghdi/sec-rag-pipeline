@@ -81,12 +81,31 @@ class ExecCompRecord(BaseModel):
         default=None,
         description="Option awards value as plain digit string or null.",
     )
+    non_equity_incentive: str | None = Field(
+        default=None,
+        description="Non-equity incentive plan compensation as plain digit string or null.",
+    )
+    pension_change: str | None = Field(
+        default=None,
+        description=(
+            "Change in pension value and nonqualified deferred compensation earnings "
+            "as plain digit string or null."
+        ),
+    )
+    other_comp: str | None = Field(
+        default=None,
+        description="All other compensation as plain digit string or null.",
+    )
     total: str | None = Field(
         default=None,
         description=(
             "Total compensation for the most recent fiscal year as a plain digit "
             "string (e.g. '1800000'). No currency symbols. Null if not found."
         ),
+    )
+    footnotes: str | None = Field(
+        default=None,
+        description="Footnote references/text for the row, or null if unavailable.",
     )
     fiscal_year: str = Field(
         default="",
@@ -185,21 +204,24 @@ EXTRACTION RULES:
    - If a role has multiple candidates, select the one with the highest total.
    - If no CEO but a "President" exists with no CEO, map President -> ceo.
    - Remaining executives (up to 2) -> other1, other2 (highest total first).
-3. salary, bonus, stock_awards, option_awards, total must be plain digit
+3. salary, bonus, stock_awards, option_awards, non_equity_incentive,
+   pension_change, other_comp, total must be plain digit
    strings without currency symbols or commas (e.g. "1250000").
    Use null if the value is missing, zero, or a dash.
-4. fiscal_year should be a 4-digit year string (e.g. "2023").
-5. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
-6. Do NOT invent values. If data is absent, use empty string or null.
-7. Return ONLY the JSON object. No prose, no markdown code fences.
+4. footnotes should contain row-level footnote refs/text when available;
+   otherwise use null.
+5. fiscal_year should be a 4-digit year string (e.g. "2023").
+6. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
+7. Do NOT invent values. If data is absent, use empty string or null.
+8. Return ONLY the JSON object. No prose, no markdown code fences.
 
 REQUIRED JSON SCHEMA:
 {
-  "ceo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"total":null,"fiscal_year":""},
-  "cfo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"total":null,"fiscal_year":""},
-  "coo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"total":null,"fiscal_year":""},
-  "other1":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"total":null,"fiscal_year":""},
-  "other2":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"total":null,"fiscal_year":""},
+  "ceo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
+  "cfo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
+  "coo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
+  "other1":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
+  "other2":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
   "confidence": 0.0,
   "notes": ""
 }

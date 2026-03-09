@@ -1,110 +1,126 @@
 # SEC RAG Batch Pipeline Agent Handoff
 
-Last updated: 2026-03-08
+Last updated: 2026-03-09
 Primary script: `scripts/run_batch50_key_results.py`
 
-This document is a persistent context handoff for future agents working on
-the DEF 14A compensation extraction pipeline.
+This document is a persistent context handoff for agents working on DEF 14A
+extraction paths (summary compensation + grants of plan-based awards).
 
 ## 1. Pipeline Purpose
 
-Generate one output row per CIK in `output/<batch_label>/key_results.csv`,
-with role-keyed executive compensation fields (CEO/CFO/COO/other1/other2),
-plus batch diagnostics in `output/<batch_label>/batch_log.csv`.
+Per CIK, batch now writes:
+
+- `output/<batch_label>/key_results.csv` (one row per CIK, role-keyed comp)
+- `output/<batch_label>/batch_log.csv` (diagnostics)
+- `output/<batch_label>/grants_plan_based_master.csv` (all grants rows)
+- `output/<batch_label>/grants_plan_based_by_cik_year/<cik>_<fiscal_year>.csv`
 
 ## 2. End-to-End Flow
 
 Per CIK, `process_cik(...)` does:
 
-1. Acquire filing: `_fetch_latest_def14a(cik)`
-2. Parse HTML into blocks: `SECHTMLParser().parse(...)`
-3. Locate candidate compensation table: `_locate_comp_table(...)`
-4. Deterministic extraction: `comp_table_extractor.extract_summary_compensation(...)`
-5. If deterministic is not trustworthy, fallback to LLM
-6. Collapse rows into roles and write `key_results` + `batch_log`
+1. Acquire filing via `_fetch_latest_def14a(cik)`
+2. Parse HTML into blocks with `SECHTMLParser().parse(...)`
+3. Grants path:
+   - locate grants table with `_locate_grants_table(...)`
+   - deterministic extract via `extract_grants_plan_based(...)`
+   - if deterministic has no payload and table exists, run grants LLM fallback
+4. Summary comp path:
+   - locate comp table with `_locate_comp_table(...)`
+   - deterministic summary extraction
+   - if deterministic has no payload and table exists, run LLM fallback
+5. Write key results + logs + grants outputs
 
-Key decision point:
+Important: grants and summary-comp are independent. Summary-comp failure can still
+produce grants CSV rows for the same CIK.
 
-- Deterministic is used only if:
-  - extractor returns rows, and
-  - `_det_rows_have_comp_payload(det_rows)` is true
-- Else, if a table was located, LLM fallback runs.
-- If no table was located, row is marked failed (`no_comp_table_located`).
+## 3. Grants Table Locator (Deterministic Scoring)
 
-## 3. Deterministic Extractor Constraints
+File: `scripts/run_batch50_key_results.py`, function `_locate_grants_table(...)`.
 
-File: `ingestion/comp_table_extractor.py`
+Current grants locator behavior:
 
-Important behavior:
+- Scores table candidates (heading-linked first, then nearby, then global fallback).
+- Uses required positive terms in scoring:
+  - `grant`
+  - `incentive plan award`
+- Uses grants structure/schema checks (grant date + payout triplets + grants-specific columns).
+- Includes additional grant-type cues in body text (`AIA`, `PRSU`, `Time-Lapse RSU`,
+  `Stock Option`, `Incentive Plan` variants).
+- Rejects likely non-grants tables using ownership/peer-return hints.
 
-- `extract_summary_compensation(...)` first gets candidate rows via `_extract_table(...)`.
-- It then keeps only table IDs whose mapped columns include at least one required
-  numeric comp column (`salary`, `bonus`, `stock_awards`, `option_awards`, etc.).
-- This reduces false positives but can zero out many rows if header mapping fails.
+Thresholds:
 
-## 4. Table Locator Heuristics
+- heading-linked / nearby candidates require score `>= 8`
+- global fallback candidates require score `>= 10`
 
-File: `scripts/run_batch50_key_results.py`, function `_locate_comp_table(...)`.
+## 4. Grants Deterministic Extraction
 
-Current logic:
+File: `ingestion/comp_table_extractor.py`, function `extract_grants_plan_based(...)`.
 
-- Uses heading signatures (`summary compensation`, etc.).
-- Scores nearby/section-linked `TableBlock`s with:
-  - header hints (`name and principal position`, `salary`, `total`, etc.)
-  - structural checks (min rows/cols, data rows present)
-  - reject hints (ownership/peer group patterns)
-- If no heading-linked candidate qualifies, tries a global high-score table fallback.
+Key details:
 
-This was tightened to avoid selecting footnote/ownership tables.
+- Supports explicit selected table extraction (`selected_table=...`) without requiring
+  heading resolution.
+- Merges heading-based rows and explicit-table rows, deduping by `(table_block_id, source_row_index)`.
+- Handles `header_row_count=0` with grants-specific header inference from first rows.
+- Preserves non-equity vs equity triplets via header group context propagation.
+- Keeps duplicate mapped columns and chooses best value per canonical field at row mapping time.
+- Normalizes split currency cells (`$` + adjacent numeric cell).
+- Preserves row granularity; same name may appear on multiple rows.
+- Row-shape normalization carries person name forward across grant-type-only rows.
+- `grant_type` is preserved as source wording (no canonical remap).
 
-## 5. LLM Fallback Behavior
+## 5. Grants LLM Fallback
 
-File: `ingestion/llm_comp_extractor.py`
+File: `ingestion/llm_comp_extractor.py`, function `extract_grants_from_plan_based_table(...)`.
 
-- Uses OpenAI when `OPENAI_API_KEY` is present and non-dummy.
-- Falls back to Ollama only when key is missing/dummy or on OpenAI auth failure.
-- Returns structured `CompanyCompResult`.
-- If result is empty, pipeline marks failure as `llm_extract_failed_empty_result`.
+- Invoked only when grants table is found but deterministic grants payload is empty.
+- Uses same retry/validation routing pattern as summary-comp LLM extractor.
+- Output model: `CompanyGrantsResult` with `GrantPlanAwardRecord` rows.
+- Prompt explicitly requires preserving `grant_type` source wording and keeping non-equity/equity triplets separate.
 
-## 6. Recent Fixes (Critical Context)
+## 6. Grants Output Schema
 
-Applied in this workspace:
+CSV columns are fixed in `GRANTS_OUTPUT_COLUMNS` and written in this exact order:
 
-1. Added true CIK-based latest DEF 14A fetch (`fetch_latest_def14a`) instead of
-   overloading `folder_id=cik`.
-2. Added `company_name` and `ticker` propagation in `FetchedFiling`.
-3. Ensured `.env` is loaded for script + extractor paths, so OpenAI key is used.
-4. Fixed CSV writer mismatch from extra fields leaking into `key_results`.
-5. Hardened `_locate_comp_table` scoring to reduce wrong table selection.
-6. Added failure guards:
-   - `llm_extract_failed_empty_result`
-   - `extraction_empty_after_mapping`
-   so empty rows are not silently marked `ok`.
+1. `Name`
+2. `Grant Type`
+3. `Grant Date`
+4. `Estimated future payouts under non-equity incentive plan awards (Threshold)`
+5. `Estimated future payouts under non-equity incentive plan awards (Target)`
+6. `Estimated future payouts under non-equity incentive plan awards (Maximum)`
+7. `Estimated future payouts under equity incentive plan awards (Threshold)`
+8. `Estimated future payouts under equity incentive plan awards (Target)`
+9. `Estimated future payouts under equity incentive plan awards (Maximum)`
+10. `All other stock awards: Number of shares of stock or units`
+11. `All other option awards: Number of securities underlying options`
+12. `Exercise or base price of option awards`
+13. `Grant date fair value of stock and option awards`
 
-## 7. Why Many Rows Still Fall Back to LLM
+Notes:
 
-Observed pattern:
+- Missing values are blank.
+- Deterministic `0.0` values are preserved (not dropped as blank).
 
-- Deterministic often returns zero usable rows after filtering, or rows with
-  placeholders (`$`, `($)`, empty strings) that fail payload checks.
-- DEF 14A table formatting varies heavily across issuers.
-- Header mapping in deterministic extractor is strict and brittle for merged/multirow headers.
+## 7. Recent Grants Fixes (CIK 731802 + 4962)
 
-Net effect:
+1. Fixed 731802-style filings where parser reports `header_row_count=0` and heading gating
+   previously zeroed deterministic rows.
+2. Added robust explicit-table grants extraction path + multirow header inference.
+3. Fixed 4962-style split-cell rows where currency symbol and numeric value are split across
+   adjacent cells, which previously caused `$`/blank-heavy output.
+4. Updated grants deterministic row serialization to preserve numeric zero values.
 
-- Most CIKs route to LLM fallback by design in current quality gate setup.
+## 8. Current Known Issues
 
-## 8. Known Remaining Issues
-
-1. Some `ok` rows may still be partial (role mapping not ideal, CEO missing).
-2. Deterministic role collapse can pick non-exec rows in edge cases.
-3. Very large linearized tables can produce invalid/empty LLM outputs.
-4. Batch exits non-zero when `ceo_total_populated < MIN_CEO_COVERAGE` even if many
-   rows are otherwise valid.
+1. Summary compensation extraction still fails for some issuers even when grants extraction succeeds.
+2. Batch exit code may be non-zero due to `MIN_CEO_COVERAGE`, even with valid grants outputs.
+3. LLM paths can still return empty outputs on very noisy/large tables.
 
 ## 9. Operational Notes
 
-Run command (project root):
+Run command:
 
 ```bash
 poetry run python scripts/run_batch50_key_results.py \
@@ -114,25 +130,12 @@ poetry run python scripts/run_batch50_key_results.py \
   --model gpt-4o-mini
 ```
 
-Expected non-zero exit is common when coverage threshold is not met.
-Always inspect output CSVs rather than relying only on exit code.
+Expected non-zero exit is common when CEO coverage threshold is unmet.
+Always inspect all CSV outputs.
 
 ## 10. Quick Debug Commands
 
-Status/method distribution:
-
-```bash
-python3 - <<'PY'
-import csv
-from collections import Counter
-rows=list(csv.DictReader(open('output/b01/key_results.csv', newline='', encoding='utf-8')))
-print('status', Counter(r['status'] for r in rows))
-print('method', Counter(r['extraction_method'] for r in rows))
-print('errors', Counter(r['error'] for r in rows if r['error']))
-PY
-```
-
-Inspect selected comp table for one CIK:
+Check grants table selection and extracted rows for one CIK:
 
 ```bash
 PYTHONPATH=. poetry run python - <<'PY'
@@ -140,9 +143,10 @@ from datetime import date
 from ingestion.edgar_folder_fetcher import fetch_latest_def14a
 from ingestion.metadata_model import DocumentMetadata
 from ingestion.sec_html_parser import SECHTMLParser
-from scripts.run_batch50_key_results import _locate_comp_table
+from scripts.run_batch50_key_results import _locate_grants_table
+from ingestion.comp_table_extractor import extract_grants_plan_based
 
-cik='1518621'
+cik='4962'
 filing=fetch_latest_def14a(cik)
 meta=DocumentMetadata(
     document_id=f"{cik}_{filing.accession_number.replace('-','')}",
@@ -154,18 +158,21 @@ meta=DocumentMetadata(
     source_url=filing.filing_url,
 )
 blocks=SECHTMLParser().parse(filing.raw_html, meta)
-table, heading=_locate_comp_table(blocks)
+table, heading=_locate_grants_table(blocks)
 print('heading:', heading.text if heading else None)
-print('table head:', ' '.join(table.linearized_text.split())[:500] if table else None)
+print('table found:', bool(table), 'header_row_count:', table.header_row_count if table else None)
+rows=extract_grants_plan_based(blocks, {"cik": cik}, selected_table=table)
+print('det rows:', len(rows))
+print(rows[0] if rows else {})
 PY
 ```
 
 ## 11. Handoff Rule of Thumb
 
-When debugging empty cells:
+When grants output is empty/mostly blanks:
 
-1. Check `key_results.status` and `error`.
-2. Cross-check `batch_log` for `comp_heading_found`, `comp_table_found`, `det_rows`.
-3. If `det_rows == 0` and `comp_table_found == True`, inspect table selection quality.
-4. If LLM confidence is `0.0` with empty output, inspect `table_text` relevance/size.
-
+1. Confirm `_locate_grants_table(...)` selected the expected table.
+2. Inspect inferred header depth and column map quality on the selected table.
+3. Check for split symbol/number cells (`$` in one column, number in the next).
+4. Verify deterministic payload gate `_det_rows_have_grants_payload(...)`.
+5. If deterministic has no payload but table is correct, inspect grants LLM fallback input/output.
