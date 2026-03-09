@@ -11,7 +11,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ingestion.llm_comp_extractor import CompanyCompResult, extract_company_comp_from_summary_table
+from ingestion.llm_comp_extractor import (
+    CompanyCompResult,
+    extract_company_comp_from_summary_table,
+    extract_grants_from_plan_based_table,
+)
 
 VALID_RESPONSE = {
     "ceo": {
@@ -66,6 +70,28 @@ VALID_RESPONSE = {
     },
     "confidence": 0.92,
     "notes": "Clean extraction from standard table.",
+}
+
+VALID_GRANTS_RESPONSE = {
+    "rows": [
+        {
+            "name": "Jane Smith",
+            "grant_type": "Performance Restricted Stock Units (PRSU)",
+            "grant_date": "2024-03-01",
+            "non_equity_threshold": "100000",
+            "non_equity_target": "200000",
+            "non_equity_maximum": "300000",
+            "equity_threshold": "1000",
+            "equity_target": "2000",
+            "equity_maximum": "3000",
+            "all_other_stock_awards_shares": "500",
+            "all_other_option_awards_securities": None,
+            "exercise_or_base_price": None,
+            "grant_date_fair_value": "400000",
+        }
+    ],
+    "confidence": 0.88,
+    "notes": "Structured grants extracted.",
 }
 
 
@@ -179,3 +205,47 @@ class TestExtractCompanyComp:
         )
         assert result.cfo.name == "Bob Lee"
         assert result.cfo.total == "900000"
+
+
+class TestExtractGrants:
+    def test_valid_grants_response_returns_rows(self) -> None:
+        client = _mock_client([json.dumps(VALID_GRANTS_RESPONSE)])
+        result = extract_grants_from_plan_based_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="Name | Grant Date | Threshold | Target | Maximum",
+            client=client,
+        )
+        assert len(result.rows) == 1
+        assert result.rows[0].name == "Jane Smith"
+        assert result.rows[0].grant_type == "Performance Restricted Stock Units (PRSU)"
+        assert result.confidence == pytest.approx(0.88)
+
+    def test_invalid_json_triggers_retry_for_grants(self) -> None:
+        client = _mock_client(["not json", json.dumps(VALID_GRANTS_RESPONSE)])
+        result = extract_grants_from_plan_based_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="Name | Grant Date | Threshold",
+            client=client,
+        )
+        assert len(result.rows) == 1
+        assert client.chat.completions.create.call_count == 2
+
+    def test_empty_table_text_returns_empty_grants_result_without_api_call(self) -> None:
+        client = _mock_client([])
+        result = extract_grants_from_plan_based_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="",
+            client=client,
+        )
+        assert result.confidence == 0.0
+        assert result.rows == []
+        assert client.chat.completions.create.call_count == 0

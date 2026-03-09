@@ -48,7 +48,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -126,6 +126,48 @@ class CompanyCompResult(BaseModel):
         return self
 
 
+class GrantPlanAwardRecord(BaseModel):
+    """One row from Grants of Plan-Based Awards."""
+
+    name: str = Field(default="", description="Name column value as shown in filing.")
+    grant_type: str = Field(default="", description="Grant type text as stated in filing.")
+    grant_date: str | None = Field(default=None, description="Grant date text.")
+    non_equity_threshold: str | None = Field(default=None, description="Non-equity threshold amount.")
+    non_equity_target: str | None = Field(default=None, description="Non-equity target amount.")
+    non_equity_maximum: str | None = Field(default=None, description="Non-equity maximum amount.")
+    equity_threshold: str | None = Field(default=None, description="Equity threshold amount.")
+    equity_target: str | None = Field(default=None, description="Equity target amount.")
+    equity_maximum: str | None = Field(default=None, description="Equity maximum amount.")
+    all_other_stock_awards_shares: str | None = Field(
+        default=None,
+        description="All other stock awards number of shares/units.",
+    )
+    all_other_option_awards_securities: str | None = Field(
+        default=None,
+        description="All other option awards number of securities underlying options.",
+    )
+    exercise_or_base_price: str | None = Field(
+        default=None,
+        description="Exercise or base price of option awards.",
+    )
+    grant_date_fair_value: str | None = Field(
+        default=None,
+        description="Grant date fair value of stock and option awards.",
+    )
+
+class CompanyGrantsResult(BaseModel):
+    """Structured grants extraction result for one filing."""
+
+    rows: list[GrantPlanAwardRecord] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    notes: str = Field(default="")
+
+    @model_validator(mode="after")
+    def clamp_confidence(self) -> CompanyGrantsResult:
+        self.confidence = max(0.0, min(1.0, self.confidence))
+        return self
+
+
 _SYSTEM_PROMPT = """\
 You are a financial data extraction assistant specialised in SEC DEF 14A
 proxy statement compensation tables.
@@ -169,6 +211,49 @@ schema. Return ONLY the corrected JSON object using the schema provided.
 Do not include any explanation, markdown, or code fences.
 """
 
+_GRANTS_SYSTEM_PROMPT = """\
+You are a financial data extraction assistant specialised in SEC DEF 14A
+proxy statement compensation tables.
+
+You will receive the linearized text of a Grants of Plan-Based Awards table.
+Extract each row and return ONLY valid JSON matching the schema below.
+
+EXTRACTION RULES:
+1. Preserve row granularity. If one person appears multiple times for different
+   grant types, keep separate rows with the same name.
+2. Keep non-equity and equity triplets semantically distinct:
+   - non_equity_threshold/target/maximum come ONLY from non-equity incentive plan awards.
+   - equity_threshold/target/maximum come ONLY from equity incentive plan awards.
+3. grant_type should preserve the source row wording (do not normalize labels).
+4. Numeric values must be plain digit strings where possible; use null for
+   missing/dash values.
+5. Do NOT invent values. Return empty strings or null where data is absent.
+6. Return ONLY JSON. No prose and no markdown.
+
+REQUIRED JSON SCHEMA:
+{
+  "rows": [
+    {
+      "name": "",
+      "grant_type": "",
+      "grant_date": null,
+      "non_equity_threshold": null,
+      "non_equity_target": null,
+      "non_equity_maximum": null,
+      "equity_threshold": null,
+      "equity_target": null,
+      "equity_maximum": null,
+      "all_other_stock_awards_shares": null,
+      "all_other_option_awards_securities": null,
+      "exercise_or_base_price": null,
+      "grant_date_fair_value": null
+    }
+  ],
+  "confidence": 0.0,
+  "notes": ""
+}
+"""
+
 # ── Ollama fallback configuration ────────────────────────────────
 # When OPENAI_API_KEY is "dummy", empty, or an OpenAI auth error
 # occurs, the extractor falls back to a local Ollama instance.
@@ -192,6 +277,7 @@ def _build_user_message(
     cik: str,
     filing_date: str,
     table_text: str,
+    table_label: str = "Summary Compensation Table",
 ) -> str:
     """Build the user turn message for the extraction prompt.
 
@@ -202,7 +288,7 @@ def _build_user_message(
         f"Company: {company_name}\n"
         f"CIK: {cik}\n"
         f"Filing date: {filing_date}\n\n"
-        f"Summary Compensation Table (linearized):\n"
+        f"{table_label} (linearized):\n"
         f"{table_text}"
     )
 
@@ -280,12 +366,14 @@ def _call_ollama(
 
     # Ollama client accepts host as a constructor argument.
     client = ollama.Client(host=resolved_url)
-    response = client.chat(
+    raw_response = client.chat(
         model=resolved_model,
-        messages=messages,
+        messages=messages,  # type: ignore[arg-type]
         options={"temperature": 0},
     )
-    return str(response["message"]["content"])
+    response = cast(dict[str, Any], raw_response)
+    message = cast(dict[str, Any], response.get("message", {}))
+    return str(message.get("content", ""))
 
 
 def _is_openai_auth_error(exc: Exception) -> bool:
@@ -311,6 +399,20 @@ def _parse_and_validate(raw: str) -> CompanyCompResult | None:
         return CompanyCompResult.model_validate(data)
     except Exception as exc:  # noqa: BLE001
         log.debug("LLM schema validation error: %s", exc)
+        return None
+
+
+def _parse_and_validate_grants(raw: str) -> CompanyGrantsResult | None:
+    """Parse raw LLM JSON string into a validated CompanyGrantsResult."""
+    try:
+        data: dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.debug("LLM JSON parse error (grants): %s", exc)
+        return None
+    try:
+        return CompanyGrantsResult.model_validate(data)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("LLM schema validation error (grants): %s", exc)
         return None
 
 
@@ -501,3 +603,163 @@ def extract_company_comp_from_summary_table(
         accession_number,
     )
     return CompanyCompResult()
+
+
+def extract_grants_from_plan_based_table(
+    *,
+    company_name: str,
+    cik: str,
+    filing_date: str,
+    accession_number: str,
+    table_text: str,
+    model: str = "gpt-4o-mini",
+    client: OpenAI | None = None,
+) -> CompanyGrantsResult:
+    """Extract row-level Grants of Plan-Based Awards data from one table."""
+    if not table_text or not table_text.strip():
+        log.warning(
+            "llm_extractor_grants | empty table_text | cik=%s accession=%s",
+            cik,
+            accession_number,
+        )
+        return CompanyGrantsResult()
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key.strip():
+        project_root = Path(__file__).resolve().parents[1]
+        load_dotenv(project_root / ".env", override=False)
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+    use_ollama = client is None and api_key.strip().lower() in _DUMMY_KEY_VALUES
+    if client is None and not use_ollama:
+        client = OpenAI(api_key=api_key)
+
+    user_message = _build_user_message(
+        company_name,
+        cik,
+        filing_date,
+        table_text,
+        table_label="Grants of Plan-Based Awards Table",
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _GRANTS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    if use_ollama:
+        log.info(
+            "llm_extractor_grants | routing to Ollama (no valid OpenAI key) | "
+            "cik=%s model=%s",
+            cik,
+            os.environ.get("OLLAMA_MODEL", _OLLAMA_MODEL_DEFAULT),
+        )
+    else:
+        log.info(
+            "llm_extractor_grants | attempt 1 via OpenAI | cik=%s model=%s tokens_approx=%d",
+            cik,
+            model,
+            len(table_text.split()),
+        )
+
+    try:
+        if use_ollama:
+            raw = _call_ollama(messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw = _call_openai(client, messages, model)
+    except Exception as exc:  # noqa: BLE001
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor_grants | OpenAI auth failed, falling back to Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw = _call_ollama(messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor_grants | API error attempt 1 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyGrantsResult()
+        else:
+            log.error(
+                "llm_extractor_grants | API error attempt 1 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyGrantsResult()
+
+    result = _parse_and_validate_grants(raw)
+    if result is not None:
+        log.info(
+            "llm_extractor_grants | success attempt 1 | cik=%s confidence=%.2f rows=%d",
+            cik,
+            result.confidence,
+            len(result.rows),
+        )
+        return result
+
+    log.warning("llm_extractor_grants | invalid response attempt 1 | cik=%s", cik)
+    retry_messages = messages + [
+        {"role": "assistant", "content": raw},
+        {"role": "user", "content": _RETRY_SYSTEM_PROMPT},
+    ]
+
+    log.info("llm_extractor_grants | attempt 2 (retry) | cik=%s", cik)
+    try:
+        if use_ollama:
+            raw_retry = _call_ollama(retry_messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw_retry = _call_openai(client, retry_messages, model)
+    except Exception as exc:  # noqa: BLE001
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor_grants | OpenAI auth failed on retry, using Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw_retry = _call_ollama(retry_messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor_grants | API error attempt 2 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyGrantsResult()
+        else:
+            log.error(
+                "llm_extractor_grants | API error attempt 2 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyGrantsResult()
+
+    result_retry = _parse_and_validate_grants(raw_retry)
+    if result_retry is not None:
+        log.info(
+            "llm_extractor_grants | success attempt 2 | cik=%s confidence=%.2f rows=%d",
+            cik,
+            result_retry.confidence,
+            len(result_retry.rows),
+        )
+        return result_retry
+
+    log.error(
+        "llm_extractor_grants | failed both attempts | cik=%s accession=%s",
+        cik,
+        accession_number,
+    )
+    return CompanyGrantsResult()

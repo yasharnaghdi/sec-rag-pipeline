@@ -107,6 +107,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import sys
 import time
 from datetime import date
@@ -125,13 +126,19 @@ else:
 # Ensure local .env is loaded when running this script directly.
 load_dotenv(project_root / ".env", override=False)
 
-import ingestion.cda_extractor as cda_extractor
-import ingestion.comp_table_extractor as det_extractor
-import ingestion.edgar_folder_fetcher as fetcher
-from ingestion.llm_comp_extractor import ExecCompRecord, extract_company_comp_from_summary_table
-from ingestion.metadata_model import BaseBlock, DocumentMetadata, HeadingBlock, TableBlock
-from ingestion.sec_chunker import SECChunker
-from ingestion.sec_html_parser import SECHTMLParser
+import ingestion.cda_extractor as cda_extractor  # noqa: E402
+import ingestion.comp_table_extractor as det_extractor  # noqa: E402
+import ingestion.edgar_folder_fetcher as fetcher  # noqa: E402
+from ingestion.llm_comp_extractor import (  # noqa: E402
+    CompanyGrantsResult,
+    ExecCompRecord,
+    GrantPlanAwardRecord,
+    extract_company_comp_from_summary_table,
+    extract_grants_from_plan_based_table,
+)
+from ingestion.metadata_model import BaseBlock, DocumentMetadata, HeadingBlock, TableBlock  # noqa: E402
+from ingestion.sec_chunker import SECChunker  # noqa: E402
+from ingestion.sec_html_parser import SECHTMLParser  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +157,14 @@ _COMP_SIGNATURES = [
     "summary compensation",
     "named executive officer compensation",
     "compensation of named executive officers",
+]
+_GRANTS_SIGNATURES = [
+    "grants of plan-based awards",
+    "grants of plan based awards",
+    "grant of plan-based award",
+    "grant of plan based award",
+    "incentive plan awards",
+    "plan-based award grants",
 ]
 _COMP_NAME_HEADER_HINTS = {
     "name and principal position",
@@ -182,6 +197,53 @@ _COMP_REJECT_HEADER_HINTS = {
     "stockholder return",
     "total stockholder return",
 }
+
+_GRANTS_REQUIRED_SCORE_TERMS = {
+    "grant",
+    "incentive plan award",
+}
+_GRANTS_HEADER_HINTS = {
+    "grant date",
+    "award type",
+    "threshold",
+    "target",
+    "maximum",
+    "all other stock awards",
+    "all other option awards",
+    "exercise or base price",
+    "grant date fair value",
+    "non-equity incentive plan awards",
+    "non equity incentive plan awards",
+    "equity incentive plan awards",
+}
+_GRANTS_GRANT_TYPE_HINTS = {
+    "annual incentive award",
+    "aia",
+    "performance restricted stock unit",
+    "prsu",
+    "performance-based rsu",
+    "performance based rsu",
+    "time-lapse rsu",
+    "time lapse rsu",
+    "stock option",
+    "incentive plan",
+}
+
+GRANTS_OUTPUT_COLUMNS = [
+    "Name",
+    "Grant Type",
+    "Grant Date",
+    "Estimated future payouts under non-equity incentive plan awards (Threshold)",
+    "Estimated future payouts under non-equity incentive plan awards (Target)",
+    "Estimated future payouts under non-equity incentive plan awards (Maximum)",
+    "Estimated future payouts under equity incentive plan awards (Threshold)",
+    "Estimated future payouts under equity incentive plan awards (Target)",
+    "Estimated future payouts under equity incentive plan awards (Maximum)",
+    "All other stock awards: Number of shares of stock or units",
+    "All other option awards: Number of securities underlying options",
+    "Exercise or base price of option awards",
+    "Grant date fair value of stock and option awards",
+]
 
 KEY_RESULTS_COLUMNS = [
     "cik",
@@ -580,9 +642,272 @@ def _result_row_has_comp_payload(result_row: dict[str, Any]) -> bool:
     return False
 
 
-def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def _infer_fiscal_year_from_filing_date(filing_date: date | None) -> str:
+    """Infer fiscal year using Jan-Aug => prior year, Sep-Dec => current year."""
+    if filing_date is None:
+        return ""
+    return str(filing_date.year - 1 if filing_date.month <= 8 else filing_date.year)
+
+
+def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, HeadingBlock | None]:
+    """Locate the Grants of Plan-Based Awards table and heading."""
+
+    def _table_prefix_text(table: TableBlock, max_rows: int = 10) -> str:
+        if not table.rows:
+            return ""
+        parts: list[str] = []
+        for row in table.rows[: min(max_rows, len(table.rows))]:
+            parts.extend(cell.strip() for cell in row if cell.strip())
+        return " | ".join(parts).lower()
+
+    def _table_header_text(table: TableBlock) -> str:
+        if not table.rows:
+            return ""
+        scan_rows = min(10, len(table.rows))
+        hint_terms = _GRANTS_REQUIRED_SCORE_TERMS | _GRANTS_HEADER_HINTS | _GRANTS_GRANT_TYPE_HINTS | {"name"}
+        scored_rows: list[tuple[int, int, list[str]]] = []
+        for row_index in range(scan_rows):
+            cells = [cell.strip() for cell in table.rows[row_index] if cell.strip()]
+            if not cells:
+                continue
+            row_text = " | ".join(cells).lower()
+            alpha_cells = sum(1 for cell in cells if any(char.isalpha() for char in cell))
+            digit_cells = sum(1 for cell in cells if any(char.isdigit() for char in cell))
+            score = (alpha_cells * 2) - digit_cells
+            if len(cells) >= 5:
+                score += 2
+            if any(term in row_text for term in hint_terms):
+                score += 10
+            if "table of contents" in row_text:
+                score -= 4
+            scored_rows.append((score, row_index, cells))
+
+        if not scored_rows:
+            return ""
+        scored_rows.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        selected = sorted(scored_rows[:5], key=lambda item: item[1])
+        parts: list[str] = []
+        for _, _, cells in selected:
+            parts.extend(cells)
+        return " | ".join(parts).lower()
+
+    def _grants_schema_fit(header_text: str, prefix_text: str) -> bool:
+        combined = f"{header_text} | {prefix_text}"
+        has_grant_date = "grant date" in combined
+        has_payout_structure = (
+            ("non-equity incentive plan award" in combined)
+            or ("non equity incentive plan award" in combined)
+            or ("equity incentive plan award" in combined)
+            or ("threshold" in combined and "target" in combined)
+        )
+        has_grants_columns = any(
+            token in combined
+            for token in (
+                "award type",
+                "all other stock awards",
+                "all other option awards",
+                "exercise or base price",
+                "grant date fair value",
+            )
+        )
+        return has_grant_date and has_payout_structure and has_grants_columns
+
+    def _score_grants_table_candidate(table: TableBlock, heading_text: str) -> int:
+        header_text = _table_header_text(table)
+        prefix_text = _table_prefix_text(table)
+        body_text = table.linearized_text.lower()
+        if not header_text and not prefix_text:
+            return -10
+
+        row_count = len(table.rows)
+        col_count = max((len(row) for row in table.rows), default=0)
+        header_rows = table.header_row_count if table.header_row_count > 0 else min(4, row_count)
+        header_rows = min(max(1, header_rows), row_count) if row_count else 0
+        data_row_count = max(0, row_count - header_rows)
+
+        combined = f"{header_text} | {prefix_text}"
+        score = 0
+        if any(term in combined for term in _GRANTS_REQUIRED_SCORE_TERMS):
+            score += 4
+        if any(term in body_text for term in _GRANTS_REQUIRED_SCORE_TERMS):
+            score += 2
+        if any(hint in combined for hint in _GRANTS_HEADER_HINTS):
+            score += 4
+        if any(hint in body_text for hint in _GRANTS_GRANT_TYPE_HINTS):
+            score += 3
+        if row_count >= 4:
+            score += 2
+        if col_count >= 8:
+            score += 2
+        if data_row_count <= 1:
+            score -= 4
+        if col_count <= 3:
+            score -= 5
+
+        heading_lc = heading_text.lower()
+        if any(signature in heading_lc for signature in _GRANTS_SIGNATURES):
+            score += 3
+
+        if any(hint in combined for hint in _COMP_REJECT_HEADER_HINTS):
+            score -= 6
+        if "beneficial ownership" in combined:
+            score -= 10
+        if not _grants_schema_fit(header_text, prefix_text):
+            score -= 12
+
+        return score
+
+    grants_headings: list[tuple[int, HeadingBlock]] = [
+        (index, block)
+        for index, block in enumerate(blocks)
+        if isinstance(block, HeadingBlock)
+        and any(signature in block.text.lower() for signature in _GRANTS_SIGNATURES)
+    ]
+
+    scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
+    for heading_index, heading in grants_headings:
+        for block in blocks:
+            if not isinstance(block, TableBlock) or block.section_id != heading.id:
+                continue
+            score = _score_grants_table_candidate(block, heading.text)
+            if score >= 8:
+                scored_candidates.append((score, 1, 0, block, heading))
+
+        for offset in range(1, 16):
+            candidate_index = heading_index + offset
+            if candidate_index >= len(blocks):
+                break
+            candidate = blocks[candidate_index]
+            if not isinstance(candidate, TableBlock):
+                continue
+            score = _score_grants_table_candidate(candidate, heading.text)
+            if score >= 8:
+                scored_candidates.append((score, 0, -offset, candidate, heading))
+
+    if scored_candidates:
+        best = max(scored_candidates, key=lambda item: (item[0], item[1], item[2]))
+        return best[3], best[4]
+
+    global_candidates: list[tuple[int, TableBlock]] = []
+    for block in blocks:
+        if not isinstance(block, TableBlock):
+            continue
+        score = _score_grants_table_candidate(block, "")
+        if score >= 10:
+            global_candidates.append((score, block))
+    if global_candidates:
+        best_global = max(global_candidates, key=lambda item: item[0])
+        return best_global[1], None
+    return None, None
+
+
+def _det_rows_have_grants_payload(det_rows: list[dict[str, Any]]) -> bool:
+    """Return True when deterministic grant rows contain at least one usable value."""
+    grant_fields = (
+        "non_equity_threshold",
+        "non_equity_target",
+        "non_equity_maximum",
+        "equity_threshold",
+        "equity_target",
+        "equity_maximum",
+        "all_other_stock_awards_shares",
+        "all_other_option_awards_securities",
+        "exercise_or_base_price",
+        "grant_date_fair_value",
+    )
+    empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
+
+    for row in det_rows:
+        for field in grant_fields:
+            value = row.get(field)
+            if isinstance(value, (int, float)):
+                return True
+            text = str(value or "").strip().lower()
+            if not text or text in empty_markers:
+                continue
+            if any(char.isdigit() for char in text):
+                return True
+    return False
+
+
+def _llm_result_has_grants_payload(result: CompanyGrantsResult) -> bool:
+    for row in result.rows:
+        values = [
+            row.name.strip(),
+            row.grant_date or "",
+            row.non_equity_threshold or "",
+            row.non_equity_target or "",
+            row.non_equity_maximum or "",
+            row.equity_threshold or "",
+            row.equity_target or "",
+            row.equity_maximum or "",
+            row.all_other_stock_awards_shares or "",
+            row.all_other_option_awards_securities or "",
+            row.exercise_or_base_price or "",
+            row.grant_date_fair_value or "",
+        ]
+        if any(str(value).strip() for value in values):
+            return True
+    return False
+
+
+def _grant_row_from_det(row: dict[str, Any]) -> dict[str, Any]:
+    name = str(row.get("exec_name", "") or "").strip()
+    raw_type = str(row.get("grant_type", "") or "").strip()
+    return {
+        "Name": name,
+        "Grant Type": raw_type,
+        "Grant Date": str(row.get("grant_date", "") or ""),
+        "Estimated future payouts under non-equity incentive plan awards (Threshold)": str(
+            row.get("non_equity_threshold", "") or ""
+        ),
+        "Estimated future payouts under non-equity incentive plan awards (Target)": str(
+            row.get("non_equity_target", "") or ""
+        ),
+        "Estimated future payouts under non-equity incentive plan awards (Maximum)": str(
+            row.get("non_equity_maximum", "") or ""
+        ),
+        "Estimated future payouts under equity incentive plan awards (Threshold)": str(
+            row.get("equity_threshold", "") or ""
+        ),
+        "Estimated future payouts under equity incentive plan awards (Target)": str(
+            row.get("equity_target", "") or ""
+        ),
+        "Estimated future payouts under equity incentive plan awards (Maximum)": str(
+            row.get("equity_maximum", "") or ""
+        ),
+        "All other stock awards: Number of shares of stock or units": str(
+            row.get("all_other_stock_awards_shares", "") or ""
+        ),
+        "All other option awards: Number of securities underlying options": str(
+            row.get("all_other_option_awards_securities", "") or ""
+        ),
+        "Exercise or base price of option awards": str(row.get("exercise_or_base_price", "") or ""),
+        "Grant date fair value of stock and option awards": str(row.get("grant_date_fair_value", "") or ""),
+    }
+
+
+def _grant_row_from_llm(row: GrantPlanAwardRecord) -> dict[str, Any]:
+    return {
+        "Name": row.name,
+        "Grant Type": row.grant_type,
+        "Grant Date": row.grant_date or "",
+        "Estimated future payouts under non-equity incentive plan awards (Threshold)": row.non_equity_threshold or "",
+        "Estimated future payouts under non-equity incentive plan awards (Target)": row.non_equity_target or "",
+        "Estimated future payouts under non-equity incentive plan awards (Maximum)": row.non_equity_maximum or "",
+        "Estimated future payouts under equity incentive plan awards (Threshold)": row.equity_threshold or "",
+        "Estimated future payouts under equity incentive plan awards (Target)": row.equity_target or "",
+        "Estimated future payouts under equity incentive plan awards (Maximum)": row.equity_maximum or "",
+        "All other stock awards: Number of shares of stock or units": row.all_other_stock_awards_shares or "",
+        "All other option awards: Number of securities underlying options": row.all_other_option_awards_securities or "",
+        "Exercise or base price of option awards": row.exercise_or_base_price or "",
+        "Grant date fair value of stock and option awards": row.grant_date_fair_value or "",
+    }
+
+
+def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """
-    Full pipeline for one CIK. Returns (key_results_row, log_row).
+    Full pipeline for one CIK. Returns (key_results_row, log_row, grants_rows).
 
     This function never raises. All errors are caught and returned
     as a failed row so the batch loop stays clean.
@@ -591,12 +916,13 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
       acquire -> parse -> locate -> extract (det or llm) -> collapse -> build rows
     """
     t0 = time.monotonic()
+    grants_rows_out: list[dict[str, Any]] = []
 
     def _failed(
         reason: str,
         company_name: str = "",
         extra: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
         elapsed = round(time.monotonic() - t0, 2)
         base: dict[str, Any] = {col: "" for col in KEY_RESULTS_COLUMNS}
         base.update(
@@ -633,7 +959,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
                     base[key] = value
                 if key in BATCH_LOG_COLUMNS:
                     log_row[key] = value
-        return base, log_row
+        return base, log_row, grants_rows_out
 
     try:
         filing = _fetch_latest_def14a(cik)
@@ -678,6 +1004,43 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
     table_blocks = [block for block in blocks if isinstance(block, TableBlock)]
     block_count = len(blocks)
     table_count = len(table_blocks)
+
+    grants_table, _ = _locate_grants_table(blocks)
+    grants_det_rows: list[dict[str, Any]] = []
+    try:
+        if grants_table is not None:
+            grants_det_rows = det_extractor.extract_grants_plan_based(
+                blocks,
+                meta_dict,
+                selected_table=grants_table,
+            )
+        else:
+            grants_det_rows = det_extractor.extract_grants_plan_based(blocks, meta_dict)
+    except Exception as grants_exc:  # noqa: BLE001
+        log.warning("grants_det_extract_failed | cik=%s error=%s", cik, grants_exc)
+
+    grants_fiscal_year = _infer_fiscal_year_from_filing_date(filing.filing_date)
+    if grants_det_rows and _det_rows_have_grants_payload(grants_det_rows):
+        for det_row in grants_det_rows:
+            output_row = _grant_row_from_det(det_row)
+            output_row["__cik"] = cik
+            output_row["__fiscal_year"] = grants_fiscal_year
+            grants_rows_out.append(output_row)
+    elif grants_table is not None:
+        llm_grants_result = extract_grants_from_plan_based_table(
+            company_name=company_name,
+            cik=cik,
+            filing_date=str(filing.filing_date or ""),
+            accession_number=filing.accession_number,
+            table_text=grants_table.linearized_text,
+            model=model,
+        )
+        if _llm_result_has_grants_payload(llm_grants_result):
+            for llm_row in llm_grants_result.rows:
+                output_row = _grant_row_from_llm(llm_row)
+                output_row["__cik"] = cik
+                output_row["__fiscal_year"] = grants_fiscal_year
+                grants_rows_out.append(output_row)
 
     comp_table, comp_heading = _locate_comp_table(blocks)
     comp_heading_found = comp_heading is not None
@@ -835,7 +1198,7 @@ def process_cik(cik: str, model: str, skip_db: bool) -> tuple[dict[str, Any], di
         except Exception as db_exc:  # noqa: BLE001
             log.warning("db_write_failed | cik=%s error=%s", cik, db_exc)
 
-    return result_row, log_row
+    return result_row, log_row, grants_rows_out
 
 
 def main() -> None:
@@ -897,27 +1260,42 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     key_results_path = out_dir / "key_results.csv"
     batch_log_path = out_dir / "batch_log.csv"
+    grants_master_path = out_dir / "grants_plan_based_master.csv"
+    grants_by_cik_year_dir = out_dir / "grants_plan_based_by_cik_year"
+    grants_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
     failed_count = 0
     ceo_total_populated = 0
+    all_grants_rows: list[dict[str, Any]] = []
 
     with (
         key_results_path.open("w", newline="", encoding="utf-8") as key_results_file,
         batch_log_path.open("w", newline="", encoding="utf-8") as batch_log_file,
+        grants_master_path.open("w", newline="", encoding="utf-8") as grants_master_file,
     ):
         kr_writer = csv.DictWriter(key_results_file, fieldnames=KEY_RESULTS_COLUMNS)
         log_writer = csv.DictWriter(batch_log_file, fieldnames=BATCH_LOG_COLUMNS)
+        grants_writer = csv.DictWriter(
+            grants_master_file,
+            fieldnames=GRANTS_OUTPUT_COLUMNS,
+            extrasaction="ignore",
+        )
         kr_writer.writeheader()
         log_writer.writeheader()
+        grants_writer.writeheader()
 
         for index, cik in enumerate(ciks, start=1):
             log.info("[%d/%d] processing | cik=%s", index, len(ciks), cik)
-            result_row, log_row = process_cik(cik, args.model, args.no_db)
+            result_row, log_row, grants_rows = process_cik(cik, args.model, args.no_db)
             kr_writer.writerow(result_row)
             log_writer.writerow(log_row)
+            for grants_row in grants_rows:
+                grants_writer.writerow(grants_row)
+                all_grants_rows.append(grants_row)
             key_results_file.flush()
             batch_log_file.flush()
+            grants_master_file.flush()
 
             if result_row.get("status") == "ok":
                 success_count += 1
@@ -925,6 +1303,24 @@ def main() -> None:
                     ceo_total_populated += 1
             else:
                 failed_count += 1
+
+    grouped_grants_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in all_grants_rows:
+        row_cik = str(row.get("__cik", "") or "").strip()
+        row_fiscal_year = str(row.get("__fiscal_year", "") or "").strip()
+        if not row_cik:
+            continue
+        if not re.fullmatch(r"\d{4}", row_fiscal_year):
+            row_fiscal_year = "unknown"
+        grouped_grants_rows.setdefault((row_cik, row_fiscal_year), []).append(row)
+
+    for (row_cik, row_fiscal_year), rows in grouped_grants_rows.items():
+        per_file_path = grants_by_cik_year_dir / f"{row_cik}_{row_fiscal_year}.csv"
+        with per_file_path.open("w", newline="", encoding="utf-8") as per_file:
+            writer = csv.DictWriter(per_file, fieldnames=GRANTS_OUTPUT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
 
     log.info(
         "batch complete | success=%d failed=%d ceo_total_populated=%d/%d",
@@ -935,6 +1331,8 @@ def main() -> None:
     )
     log.info("key_results -> %s", key_results_path)
     log.info("batch_log   -> %s", batch_log_path)
+    log.info("grants master -> %s", grants_master_path)
+    log.info("grants by cik/year -> %s", grants_by_cik_year_dir)
 
     if ceo_total_populated < MIN_CEO_COVERAGE:
         log.error(

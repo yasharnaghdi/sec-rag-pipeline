@@ -64,6 +64,7 @@ services:
       - .env
     environment:
       APP_ENV: docker
+      PYTHONPATH: /app
       DB_URL: postgresql+asyncpg://postgres:password@postgres:5432/sec_rag
       QDRANT_URL: http://qdrant:6333
       EDGAR_DOWNLOAD_DIR: /app/data/raw
