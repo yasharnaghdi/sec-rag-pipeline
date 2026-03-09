@@ -28,6 +28,7 @@ ollama = "^0.2.0"
 tiktoken = "^0.7.0"
 rank-bm25 = "^0.2.2"
 python-dotenv = "^1.0.1"
+sec2md = "^0.1.20"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.0"

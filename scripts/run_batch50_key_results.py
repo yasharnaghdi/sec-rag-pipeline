@@ -63,7 +63,7 @@ Output columns - batch_log.csv
 -------------------------------
   cik, company_name, status, extraction_method,
   block_count, table_count, comp_heading_found,
-  comp_table_found, det_rows, llm_confidence,
+  comp_table_found, grant_table_found, det_rows, llm_confidence,
   elapsed_seconds, error
 
 Constants (configurable via CLI args)
@@ -319,6 +319,7 @@ BATCH_LOG_COLUMNS = [
     "table_count",
     "comp_heading_found",
     "comp_table_found",
+    "grant_table_found",
     "det_rows",
     "llm_confidence",
     "cda_token_count",
@@ -1107,6 +1108,7 @@ def process_cik(
             "table_count": 0,
             "comp_heading_found": False,
             "comp_table_found": False,
+            "grant_table_found": False,
             "det_rows": 0,
             "llm_confidence": "",
             "cda_token_count": 0,
@@ -1167,6 +1169,7 @@ def process_cik(
     table_count = len(table_blocks)
 
     grants_table, _ = _locate_grants_table(blocks)
+    grant_table_found = grants_table is not None
     grants_det_rows: list[dict[str, Any]] = []
     try:
         if grants_table is not None:
@@ -1231,6 +1234,7 @@ def process_cik(
                 "table_count": table_count,
                 "comp_heading_found": comp_heading_found,
                 "comp_table_found": comp_table_found,
+                "grant_table_found": grant_table_found,
             },
         )
 
@@ -1270,6 +1274,7 @@ def process_cik(
                     "table_count": table_count,
                     "comp_heading_found": comp_heading_found,
                     "comp_table_found": comp_table_found,
+                    "grant_table_found": grant_table_found,
                     "llm_confidence": llm_confidence,
                 },
             )
@@ -1304,6 +1309,7 @@ def process_cik(
                 "table_count": table_count,
                 "comp_heading_found": comp_heading_found,
                 "comp_table_found": comp_table_found,
+                "grant_table_found": grant_table_found,
             },
         )
 
@@ -1359,6 +1365,7 @@ def process_cik(
                 "table_count": table_count,
                 "comp_heading_found": comp_heading_found,
                 "comp_table_found": comp_table_found,
+                "grant_table_found": grant_table_found,
                 "llm_confidence": llm_confidence,
             },
         )
@@ -1373,6 +1380,7 @@ def process_cik(
         "table_count": table_count,
         "comp_heading_found": comp_heading_found,
         "comp_table_found": comp_table_found,
+        "grant_table_found": grant_table_found,
         "det_rows": len(det_rows),
         "llm_confidence": llm_confidence,
         "cda_token_count": cda_token_count,
