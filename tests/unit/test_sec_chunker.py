@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from datetime import date
+from pathlib import Path
 
 from ingestion.metadata_model import DocumentMetadata, ProseBlock, TableBlock
 from ingestion.sec_chunker import SECChunker
+from ingestion.sec_html_parser import SECHTMLParser
 
 
 def _metadata() -> DocumentMetadata:
@@ -153,3 +156,35 @@ def test_chunk_toc_page_range_none_when_not_in_toc() -> None:
         f"{chunk.section_id} | chunk {chunk.chunk_index}"
     )
     assert chunk.citation_string == expected
+
+
+def test_real_filing_chunks_preserve_compensation_and_cda_text() -> None:
+    filing_path = Path("data/raw/0000320193_000130817926000008.html")
+    assert filing_path.exists()
+
+    raw_html = filing_path.read_text(encoding="utf-8", errors="replace")
+    metadata = DocumentMetadata(
+        document_id="320193_000130817926000008",
+        cik="320193",
+        company_name="Apple Inc.",
+        form_type="DEF 14A",
+        filing_date=date(2026, 1, 10),
+        accession_number="0001308179-26-000008",
+        source_url="https://www.sec.gov/Archives/edgar/data/320193/000130817926000008/aapl-20260108.htm",
+        fiscal_year_end=None,
+        raw_html_path=str(filing_path),
+    )
+
+    blocks = SECHTMLParser().parse(raw_html, metadata)
+    chunks = SECChunker().chunk_blocks(blocks, metadata)
+
+    assert any(
+        "Tim Cook" in chunk.text
+        and "Chief Executive Officer" in chunk.text
+        and "74294811" in re.sub(r"\D", "", chunk.text)
+        for chunk in chunks
+    )
+    assert any(
+        "pay for performance" in chunk.text.lower() or "pay-for-performance" in chunk.text.lower()
+        for chunk in chunks
+    )

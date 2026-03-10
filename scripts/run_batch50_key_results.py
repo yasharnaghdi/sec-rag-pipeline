@@ -472,6 +472,37 @@ def _as_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _as_digit_string(value: Any) -> str:
+    """Render numeric compensation values as plain digit strings where possible."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return format(value, "f").rstrip("0").rstrip(".")
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+", text):
+        return text
+    cleaned = re.sub(r"[$,\s]", "", text)
+    cleaned = cleaned.replace("—", "-").replace("–", "-")
+    cleaned = re.sub(r"\(\d+\)$", "", cleaned)
+    cleaned = re.sub(r"^\((.+)\)$", r"-\1", cleaned)
+    if cleaned.lower() in {"", "-", "n/a", "na"}:
+        return ""
+    if re.fullmatch(r"-?\d+(\.\d+)?", cleaned):
+        if cleaned.endswith(".0"):
+            return cleaned[:-2]
+        return cleaned
+    return text
+
+
 def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """
     Collapse deterministic extractor rows (one per exec per year)
@@ -516,8 +547,21 @@ def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, An
         if assigned_row:
             assigned_names.add(str(assigned_row.get("exec_name", "") or ""))
 
+    remaining_by_exec: dict[str, dict[str, Any]] = {}
+    for row in other_rows:
+        exec_name = str(row.get("exec_name", "") or "")
+        if exec_name in assigned_names:
+            continue
+        prior = remaining_by_exec.get(exec_name)
+        if prior is None:
+            remaining_by_exec[exec_name] = row
+            continue
+        chosen = _most_recent_row([prior, row])
+        if chosen is not None:
+            remaining_by_exec[exec_name] = chosen
+
     remaining = sorted(
-        [row for row in other_rows if str(row.get("exec_name", "") or "") not in assigned_names],
+        remaining_by_exec.values(),
         key=lambda row: _to_float(row.get("total")),
         reverse=True,
     )
@@ -740,15 +784,15 @@ def _row_from_det(role_dict: dict[str, Any], prefix: str) -> dict[str, Any]:
     base = {
         f"{prefix}_name": str(role_dict.get("exec_name", "") or ""),
         f"{prefix}_title": str(role_dict.get("exec_title", "") or ""),
-        f"{prefix}_salary": role_dict.get("salary", ""),
-        f"{prefix}_total": role_dict.get("total", ""),
+        f"{prefix}_salary": _as_digit_string(role_dict.get("salary")),
+        f"{prefix}_total": _as_digit_string(role_dict.get("total")),
     }
     if prefix == "ceo":
         base.update(
             {
-                "ceo_bonus": role_dict.get("bonus", ""),
-                "ceo_stock_awards": role_dict.get("stock_awards", ""),
-                "ceo_option_awards": role_dict.get("option_awards", ""),
+                "ceo_bonus": _as_digit_string(role_dict.get("bonus")),
+                "ceo_stock_awards": _as_digit_string(role_dict.get("stock_awards")),
+                "ceo_option_awards": _as_digit_string(role_dict.get("option_awards")),
             }
         )
     return base
@@ -1261,16 +1305,16 @@ def _compensation_row_from_det(
         "Name": str(row.get("exec_name", "") or "").strip(),
         "Title": str(row.get("exec_title", "") or "").strip(),
         "Year": resolved_year,
-        "Salary ($)": _as_text(row.get("salary", "")),
-        "Bonus Awards ($)": _as_text(row.get("bonus", "")),
-        "Stock Awards ($)": _as_text(row.get("stock_awards", "")),
-        "Option Awards ($)": _as_text(row.get("option_awards", "")),
-        "Non-Equity Incentive Plan Compensation ($)": _as_text(row.get("non_equity_incentive", "")),
-        "Change in pension value and nonqualified deferred compensation earnings ($)": _as_text(
-            row.get("pension_change", "")
+        "Salary ($)": _as_digit_string(row.get("salary")),
+        "Bonus Awards ($)": _as_digit_string(row.get("bonus")),
+        "Stock Awards ($)": _as_digit_string(row.get("stock_awards")),
+        "Option Awards ($)": _as_digit_string(row.get("option_awards")),
+        "Non-Equity Incentive Plan Compensation ($)": _as_digit_string(row.get("non_equity_incentive")),
+        "Change in pension value and nonqualified deferred compensation earnings ($)": _as_digit_string(
+            row.get("pension_change")
         ),
-        "All Other Compensation ($)": _as_text(row.get("other_comp", "")),
-        "Total ($)": _as_text(row.get("total", "")),
+        "All Other Compensation ($)": _as_digit_string(row.get("other_comp")),
+        "Total ($)": _as_digit_string(row.get("total")),
         "Extra information": _as_text(row.get("footnote_refs", "")).strip(),
         "__cik": cik,
         "__year": resolved_year,
@@ -1678,17 +1722,7 @@ def process_cik(
             },
         )
 
-    fiscal_year_val = ""
-    for role_key in ["ceo", "cfo", "coo", "other1", "other2"]:
-        candidate = roles.get(role_key, {})
-        year_val = (
-            candidate.get("year", "")
-            if isinstance(candidate, dict)
-            else getattr(candidate, "fiscal_year", "")
-        )
-        if year_val:
-            fiscal_year_val = str(year_val)
-            break
+    fiscal_year_val = _role_fiscal_year(extraction_method, roles)
 
     result_row: dict[str, Any] = {col: "" for col in KEY_RESULTS_COLUMNS}
     result_row.update(
@@ -1720,6 +1754,20 @@ def process_cik(
             continue
         if isinstance(role_data, dict):
             result_row.update(_row_from_det(role_data, prefix))
+
+    if not result_row.get("ceo_name", "").strip() and not result_row.get("ceo_total", "").strip():
+        return _failed(
+            "ceo_role_unresolved",
+            company_name,
+            {
+                "block_count": block_count,
+                "table_count": table_count,
+                "comp_heading_found": comp_heading_found,
+                "comp_table_found": comp_table_found,
+                "grant_table_found": grant_table_found,
+                "llm_confidence": llm_confidence,
+            },
+        )
 
     if not _result_row_has_comp_payload(result_row):
         return _failed(

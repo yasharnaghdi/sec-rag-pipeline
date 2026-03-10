@@ -7,6 +7,25 @@
 
 Production-grade SEC filing RAG pipeline for DEF 14A proxy statements and 10-K documents. The current release is optimized for proxy acquisition, compensation extraction, offline-safe local development, and auditable CSV outputs.
 
+## Stable Baseline
+
+`Separate-files` is the current stable integration branch for the compensation extraction workflow. The baseline this branch is meant to preserve is:
+
+1. CIK-only acquisition of the latest `DEF 14A`
+2. SEC HTML parsing into typed blocks
+3. Deterministic summary compensation extraction, with LLM fallback only when needed
+4. Role assignment keyed to the most recent fiscal year per executive
+5. CD&A extraction with token counts and pay-for-performance flagging
+6. Batch outputs validated by `scripts/validate_key_results.py`
+
+For the hardened 50-CIK reference run on this branch, the local acceptance result was:
+
+- `50/50` rows written
+- `42/50` rows with non-empty `ceo_total`
+- `42/50` rows with `cda_token_count > 0`
+- no empty key identifiers in `key_results.csv`
+- numeric compensation fields normalized to plain digit strings
+
 ## What This Does
 
 1. Acquire filings from SEC EDGAR and cache raw HTML locally.
@@ -83,6 +102,21 @@ comp_table_extractor.py   llm_comp_extractor.py
      --input output/smoke/key_results.csv --expected-rows 3
    ```
 
+## Branch Guide
+
+The repo has accumulated task-shaped branches during the last week of parser and extraction iterations. Use them as intent markers, not as equally current release lines.
+
+| Branch | Meaning |
+| --- | --- |
+| `Separate-files` | Current stable integration branch for the end-to-end batch extraction path and the branch to use for release validation. |
+| `main` | Conservative baseline branch. It may lag active extraction hardening until a merge is completed and CI is green. |
+| `fix/cik-only-acquisition` | Focused fix branch for latest-`DEF 14A` acquisition by CIK. |
+| `feat/task4-hardening` | Hardening branch for summary compensation parsing, validation checks, and edge-case tests. |
+| `feat/llm-comp-extractor-and-batch50` | LLM fallback and batch-runner development branch. |
+| `feat/ollama-fallback-and-docker-compose` | Local runtime and model fallback branch. |
+
+If you need the branch that best reflects the current extraction contract, start from `Separate-files` and then inspect the files listed in [End-State Review Pointers](#end-state-review-pointers).
+
 ## One-Command Full Stack
 
 Use the full Docker profile when you want PostgreSQL, Qdrant, Ollama, and the FastAPI app together:
@@ -136,6 +170,8 @@ Companion file: `output/<batch_label>/batch_log.csv`
 | `det_rows`, `llm_confidence`, `cda_token_count`, `pay_for_performance_flag` | Extraction diagnostics. |
 | `elapsed_seconds`, `error` | Runtime and failure detail. |
 
+Generated artifacts under `output/` are local run products. Do not commit them, do not treat them as source of truth, and do not upload `key_results.csv` or related batch artifacts to the repository. The repo intentionally ignores `output/` in `.gitignore`.
+
 ## LLM Strategy
 
 This release uses a two-tier extraction path:
@@ -179,6 +215,39 @@ output/                 generated batch artifacts
 | 3 | Done (schema) | PostgreSQL schema, chunk writer, and storage migration groundwork |
 | 4 | Planned | Hybrid retrieval over PostgreSQL + Qdrant |
 | 5 | Planned | API query layer and citation-grounded generation |
+
+## Merge Gate
+
+Before merging `Separate-files` into a release branch, the minimum gate is:
+
+```bash
+poetry install --no-interaction
+poetry run ruff check .
+poetry run mypy . --ignore-missing-imports
+poetry run pytest tests/ -v --tb=short
+poetry run python scripts/run_batch50_key_results.py \
+  --input fixtures/client_input.csv --batch-label b01 --limit 50
+poetry run python scripts/validate_key_results.py \
+  --input output/b01/key_results.csv --expected-rows 50
+```
+
+CI currently enforces the static and test portion of that gate. The batch run and validator remain the release-level smoke check to run before tagging or merging a stabilization branch.
+
+## End-State Review Pointers
+
+When reviewing the current extraction contract or validating the reasoning behind the latest iterations, start with these files:
+
+- `ingestion/comp_table_extractor.py` for deterministic summary compensation parsing, name/title split, year handling, and numeric normalization
+- `scripts/run_batch50_key_results.py` for orchestration, role collapsing, fiscal-year selection, and output serialization
+- `scripts/validate_key_results.py` for the safety checks that define acceptable `key_results.csv` outputs
+- `ingestion/cda_extractor.py` for CD&A section capture, token counts, and pay-for-performance signals
+- `ingestion/sec_chunker.py` for table-aware chunk preservation
+- `docs/PIPELINE_AGENT_HANDOFF.md` for the cross-iteration reasoning and operational handoff context
+
+For local inspection only, the most relevant generated evidence is:
+
+- `output/b01/key_results.csv`
+- `output/b01/batch_log.csv`
 
 ## Troubleshooting
 

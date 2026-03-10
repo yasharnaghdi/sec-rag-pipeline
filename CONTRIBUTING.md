@@ -79,6 +79,7 @@ Use this checklist before requesting review:
 6. Update docs if CLI flags, env vars, or outputs changed.
 7. Paste the verification commands and outcomes into the PR description.
 8. Call out any known risks, skipped tests, or network-dependent steps.
+9. Do not stage generated outputs from `output/`, especially `key_results.csv` and `batch_log.csv`.
 
 ## 7. Protected Files
 
@@ -132,7 +133,20 @@ If you want the full local stack, use:
 docker compose --profile full up --build -d
 ```
 
-## 10. Getting Help
+## 10. Stable Baseline And Review Files
+
+If you are trying to understand the current stable extraction contract before making changes, start on `Separate-files` and read these files first:
+
+- `ingestion/comp_table_extractor.py`
+- `scripts/run_batch50_key_results.py`
+- `scripts/validate_key_results.py`
+- `ingestion/cda_extractor.py`
+- `ingestion/sec_chunker.py`
+- `docs/PIPELINE_AGENT_HANDOFF.md`
+
+Treat those files as the shortest path to the current reasoning, constraints, and release metrics.
+
+## 11. Getting Help
 
 Start with these repo-local sources:
 
