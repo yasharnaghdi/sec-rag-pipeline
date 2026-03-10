@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch pipeline: CIK CSV -> CD&A markdown extraction outputs.
+"""Batch pipeline: CIK CSV -> multi-section markdown extraction outputs.
 
 Usage:
     poetry run python scripts/run_cda_markdown_batch.py \
@@ -31,7 +31,7 @@ else:
 load_dotenv(project_root / ".env", override=False)
 
 import ingestion.edgar_folder_fetcher as fetcher  # noqa: E402
-from ingestion.cda_markdown_extractor import extract_cda_markdown  # noqa: E402
+from ingestion.cda_markdown_extractor import SECTION_NAMES, extract_section_markdown  # noqa: E402
 from ingestion.metadata_model import DocumentMetadata  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,8 @@ CDA_OUTPUT_COLUMNS = [
     "ticker",
     "filing_date",
     "fiscal_year",
+    "section_name",
+    "section_key",
     "accession_number",
     "filing_url",
     "raw_html_path",
@@ -68,6 +70,8 @@ LOG_OUTPUT_COLUMNS = [
     "accession_number",
     "filing_date",
     "fiscal_year",
+    "section_name",
+    "section_key",
     "status",
     "strategy",
     "confidence",
@@ -291,7 +295,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Batch pipeline: CIK list -> cda_markdown.csv")
+    parser = argparse.ArgumentParser(description="Batch pipeline: CIK list -> section_markdown.csv")
     parser.add_argument(
         "--input",
         default="fixtures/client_input.csv",
@@ -450,6 +454,8 @@ def main() -> None:
                             "accession_number": "",
                             "filing_date": "",
                             "fiscal_year": "",
+                            "section_name": "",
+                            "section_key": "",
                             "status": "failed",
                             "strategy": "",
                             "confidence": "",
@@ -464,6 +470,8 @@ def main() -> None:
                             "ticker": "",
                             "filing_date": "",
                             "fiscal_year": "",
+                            "section_name": "",
+                            "section_key": "",
                             "accession_number": "",
                             "filing_url": "",
                             "raw_html_path": "",
@@ -492,6 +500,8 @@ def main() -> None:
                         "accession_number": "",
                         "filing_date": "",
                         "fiscal_year": "",
+                        "section_name": "",
+                        "section_key": "",
                         "status": "failed",
                         "strategy": "",
                         "confidence": "",
@@ -506,6 +516,8 @@ def main() -> None:
                         "ticker": "",
                         "filing_date": "",
                         "fiscal_year": "",
+                        "section_name": "",
+                        "section_key": "",
                         "accession_number": "",
                         "filing_url": "",
                         "raw_html_path": "",
@@ -532,97 +544,117 @@ def main() -> None:
                         allow_fetch_fallback=not args.no_fetch_fallback,
                     )
                     doc_meta = _build_doc_metadata(resolved_record)
-                    result = extract_cda_markdown(raw_html, doc_meta)
-
-                    markdown_path = ""
-                    if not args.no_markdown_files:
-                        markdown_filename = (
-                            f"{resolved_record.cik}_{resolved_record.accession_number.replace('-', '')}.md"
+                    for section_name in SECTION_NAMES:
+                        result = extract_section_markdown(
+                            raw_html=raw_html,
+                            metadata=doc_meta,
+                            section_name=section_name,
                         )
-                        file_path = markdown_dir / markdown_filename
-                        file_path.write_text(result.markdown, encoding="utf-8")
-                        markdown_path = str(file_path)
+                        section_key = (
+                            result.section_key
+                            or f"{resolved_record.cik}-{resolved_record.fiscal_year}-{section_name}"
+                        )
+                        status = "ok" if result.section_found else "missing"
 
-                    warnings_text = " | ".join(result.warnings)
-                    cda_writer.writerow(
-                        {
-                            "cik": resolved_record.cik,
-                            "company_name": resolved_record.company_name,
-                            "ticker": resolved_record.ticker,
-                            "filing_date": resolved_record.filing_date.isoformat(),
-                            "fiscal_year": str(resolved_record.fiscal_year),
-                            "accession_number": resolved_record.accession_number,
-                            "filing_url": resolved_record.filing_url,
-                            "raw_html_path": str(resolved_record.raw_html_path),
-                            "start_anchor": result.start_anchor or "",
-                            "end_anchor": result.end_anchor or "",
-                            "start_page": result.start_page if result.start_page is not None else "",
-                            "end_page": result.end_page if result.end_page is not None else "",
-                            "strategy": result.strategy,
-                            "warnings": warnings_text,
-                            "confidence": result.confidence,
-                            "markdown_path": markdown_path,
-                            "markdown": result.markdown,
-                            "status": "ok",
-                            "error": "",
-                        }
-                    )
+                        markdown_path = ""
+                        markdown_value = result.markdown if status == "ok" else ""
+                        if not args.no_markdown_files and status == "ok":
+                            markdown_filename = f"{section_key}.md"
+                            file_path = markdown_dir / markdown_filename
+                            file_path.write_text(result.markdown, encoding="utf-8")
+                            markdown_path = str(file_path)
 
-                    run_log_writer.writerow(
-                        {
-                            "cik": resolved_record.cik,
-                            "company_name": resolved_record.company_name,
-                            "accession_number": resolved_record.accession_number,
-                            "filing_date": resolved_record.filing_date.isoformat(),
-                            "fiscal_year": str(resolved_record.fiscal_year),
-                            "status": "ok",
-                            "strategy": result.strategy,
-                            "confidence": result.confidence,
-                            "warnings": warnings_text,
-                            "error": "",
-                        }
-                    )
-                    success_count += 1
+                        warnings_text = " | ".join(result.warnings)
+                        cda_writer.writerow(
+                            {
+                                "cik": resolved_record.cik,
+                                "company_name": resolved_record.company_name,
+                                "ticker": resolved_record.ticker,
+                                "filing_date": resolved_record.filing_date.isoformat(),
+                                "fiscal_year": str(resolved_record.fiscal_year),
+                                "section_name": section_name,
+                                "section_key": section_key,
+                                "accession_number": resolved_record.accession_number,
+                                "filing_url": resolved_record.filing_url,
+                                "raw_html_path": str(resolved_record.raw_html_path),
+                                "start_anchor": result.start_anchor or "",
+                                "end_anchor": result.end_anchor or "",
+                                "start_page": result.start_page if result.start_page is not None else "",
+                                "end_page": result.end_page if result.end_page is not None else "",
+                                "strategy": result.strategy,
+                                "warnings": warnings_text,
+                                "confidence": result.confidence,
+                                "markdown_path": markdown_path,
+                                "markdown": markdown_value,
+                                "status": status,
+                                "error": "",
+                            }
+                        )
+
+                        run_log_writer.writerow(
+                            {
+                                "cik": resolved_record.cik,
+                                "company_name": resolved_record.company_name,
+                                "accession_number": resolved_record.accession_number,
+                                "filing_date": resolved_record.filing_date.isoformat(),
+                                "fiscal_year": str(resolved_record.fiscal_year),
+                                "section_name": section_name,
+                                "section_key": section_key,
+                                "status": status,
+                                "strategy": result.strategy,
+                                "confidence": result.confidence,
+                                "warnings": warnings_text,
+                                "error": "",
+                            }
+                        )
+                        if status == "ok":
+                            success_count += 1
                 except Exception as exc:  # noqa: BLE001
                     error_message = str(exc)
-                    failure_count += 1
-                    run_log_writer.writerow(
-                        {
-                            "cik": filing_record.cik,
-                            "company_name": filing_record.company_name,
-                            "accession_number": filing_record.accession_number,
-                            "filing_date": filing_record.filing_date.isoformat(),
-                            "fiscal_year": str(filing_record.fiscal_year),
-                            "status": "failed",
-                            "strategy": "",
-                            "confidence": "",
-                            "warnings": "",
-                            "error": error_message,
-                        }
-                    )
-                    cda_writer.writerow(
-                        {
-                            "cik": filing_record.cik,
-                            "company_name": filing_record.company_name,
-                            "ticker": filing_record.ticker,
-                            "filing_date": filing_record.filing_date.isoformat(),
-                            "fiscal_year": str(filing_record.fiscal_year),
-                            "accession_number": filing_record.accession_number,
-                            "filing_url": filing_record.filing_url,
-                            "raw_html_path": str(filing_record.raw_html_path),
-                            "start_anchor": "",
-                            "end_anchor": "",
-                            "start_page": "",
-                            "end_page": "",
-                            "strategy": "",
-                            "warnings": "",
-                            "confidence": "",
-                            "markdown_path": "",
-                            "markdown": "",
-                            "status": "failed",
-                            "error": error_message,
-                        }
-                    )
+                    for section_name in SECTION_NAMES:
+                        section_key = f"{filing_record.cik}-{filing_record.fiscal_year}-{section_name}"
+                        run_log_writer.writerow(
+                            {
+                                "cik": filing_record.cik,
+                                "company_name": filing_record.company_name,
+                                "accession_number": filing_record.accession_number,
+                                "filing_date": filing_record.filing_date.isoformat(),
+                                "fiscal_year": str(filing_record.fiscal_year),
+                                "section_name": section_name,
+                                "section_key": section_key,
+                                "status": "failed",
+                                "strategy": "",
+                                "confidence": "",
+                                "warnings": "",
+                                "error": error_message,
+                            }
+                        )
+                        cda_writer.writerow(
+                            {
+                                "cik": filing_record.cik,
+                                "company_name": filing_record.company_name,
+                                "ticker": filing_record.ticker,
+                                "filing_date": filing_record.filing_date.isoformat(),
+                                "fiscal_year": str(filing_record.fiscal_year),
+                                "section_name": section_name,
+                                "section_key": section_key,
+                                "accession_number": filing_record.accession_number,
+                                "filing_url": filing_record.filing_url,
+                                "raw_html_path": str(filing_record.raw_html_path),
+                                "start_anchor": "",
+                                "end_anchor": "",
+                                "start_page": "",
+                                "end_page": "",
+                                "strategy": "",
+                                "warnings": "",
+                                "confidence": "",
+                                "markdown_path": "",
+                                "markdown": "",
+                                "status": "failed",
+                                "error": error_message,
+                            }
+                        )
+                        failure_count += 1
 
     log.info(
         "batch complete | success=%d failed=%d output=%s",

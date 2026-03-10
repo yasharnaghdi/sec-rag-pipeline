@@ -1,10 +1,10 @@
-# CD&A Markdown Extraction - Design Decisions
+# Section Markdown Extraction - Design Decisions
 
 Last updated: 2026-03-10
 
 ## Purpose
 
-This document records the architectural decisions behind the deterministic CD&A markdown extraction flow so future agents can extend it consistently without re-opening core design choices.
+This document records the architectural decisions behind the deterministic section markdown extraction flow so future agents can extend it consistently without re-opening core design choices.
 
 Primary implementation files:
 - `ingestion/cda_markdown_extractor.py`
@@ -21,6 +21,12 @@ This flow is intentionally independent from `ingestion/cda_extractor.py`.
 3. Keep extraction output auditable with trace metadata (`strategy`, anchors, pages, warnings, confidence).
 4. Batch CLI filtering is fiscal-year based (`--fiscal-year-start/--fiscal-year-end`) to match existing pipeline conventions.
 5. Preserve tables in output markdown by default.
+6. Extract five canonical sections:
+   - `compensation_discussion_and_analysis`
+   - `executive_compensation`
+   - `director_compensation`
+   - `pay_vs_performance`
+   - `equity_compensation_plans`
 
 ## Boundary Detection Decisions
 
@@ -28,7 +34,7 @@ This flow is intentionally independent from `ingestion/cda_extractor.py`.
 
 Priority order:
 1. Multi-table front-matter ToC parsing.
-2. Fuzzy match ToC entry for CD&A (typo-tolerant, e.g. "Compensatoon Discussion and Analysis").
+2. Fuzzy match ToC entry for the target section label (CD&A remains typo-tolerant, e.g. "Compensatoon Discussion and Analysis").
 3. Resolve ToC `href` anchor target (`id`/`name`) in body and use as start.
 4. Fallback to body heading-like node match.
 5. Last fallback to keyword window in body blocks.
@@ -37,13 +43,16 @@ Why:
 - SEC proxy filings often split ToC across multiple tables.
 - Anchor targets are more stable than heading-only detection in prose-heavy layouts.
 
-### End Boundary (Full Executive Compensation Scope)
+### End Boundary
 
 Priority order:
-1. First major non-executive-compensation ToC entry after CD&A (e.g., Item 4+, shareholder proposal blocks).
-2. First top-level heading outside exec-comp family.
-3. Page-hint cutoff when anchor/heading boundary is unavailable.
-4. Document-tail fallback if no reliable end boundary exists.
+1. For `compensation_discussion_and_analysis` and `executive_compensation`:
+   - First major non-executive-compensation ToC entry after section start.
+2. For `director_compensation`, `pay_vs_performance`, `equity_compensation_plans`:
+   - Next ToC entry after section start.
+3. Heading fallback with the same mode semantics.
+4. Page-hint cutoff when anchor/heading boundary is unavailable.
+5. Document-tail fallback if no reliable end boundary exists.
 
 Safety guard:
 - If extracted span is suspiciously short, auto-expand and record warning.
@@ -72,9 +81,13 @@ Why:
 ## Output Contract Decisions
 
 Extractor API:
-- `extract_cda_markdown(raw_html, metadata) -> CDAExtractionResult`
+- `extract_section_markdown(raw_html, metadata, section_name) -> CDAExtractionResult`
+- `extract_cda_markdown(raw_html, metadata) -> CDAExtractionResult` (compatibility wrapper)
 
 `CDAExtractionResult` includes:
+- `section_name`
+- `section_key` (`CIK-Year-Section_name`)
+- `section_found`
 - `markdown`
 - `start_anchor`
 - `end_anchor`
@@ -105,6 +118,13 @@ Key CLI decisions:
   - `output/<batch_label>/cda_markdown.csv`
   - `output/<batch_label>/cda_markdown_log.csv`
   - `output/<batch_label>/cda_markdown/*.md` (unless disabled)
+  - One output row per `(CIK, filing, section_name)`.
+  - `section_key` format is exactly `CIK-Year-Section_name`.
+
+Status policy:
+- `ok`: section found and markdown populated.
+- `missing`: section not found for filing, row still emitted.
+- `failed`: extraction runtime failure, row emitted.
 
 Failure behavior:
 - Per-filing failures are logged and do not crash the entire batch.

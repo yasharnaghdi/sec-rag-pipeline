@@ -1,4 +1,4 @@
-"""Deterministic CD&A markdown extraction with ToC and heading fallbacks.
+"""Deterministic SEC section markdown extraction with ToC and heading fallbacks.
 
 This module is intentionally independent from ``ingestion.cda_extractor``.
 """
@@ -10,8 +10,9 @@ import re
 import tempfile
 import warnings
 from dataclasses import dataclass
+from datetime import date
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Literal
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from bs4.element import Tag
@@ -29,7 +30,6 @@ _LIST_TAGS: tuple[str, ...] = ("ul", "ol")
 _HEADING_TAGS: tuple[str, ...] = ("h1", "h2", "h3", "h4", "h5", "h6")
 _MIN_WORDS_GUARD = 120
 _FRONT_MATTER_TABLE_LIMIT = 80
-_CDA_TARGET = "COMPENSATION DISCUSSION AND ANALYSIS"
 
 _EXEC_COMP_TERMS = (
     "EXECUTIVE COMPENSATION",
@@ -71,9 +71,99 @@ class _TocEntry:
     row_order: int
 
 
-class CDAExtractionResult(BaseModel):
-    """Structured CD&A extraction output."""
+@dataclass(frozen=True)
+class SectionSpec:
+    section_name: str
+    aliases: tuple[str, ...]
+    end_mode: Literal["major_non_exec", "next_boundary"]
+    min_start_score: float = 0.62
+    min_heading_score: float = 0.60
+    min_keyword_score: float = 0.70
+    required_tokens: tuple[str, ...] = ()
+    min_required_token_hits: int = 0
+    short_word_guard: int = _MIN_WORDS_GUARD
 
+
+_SECTION_SPECS: tuple[SectionSpec, ...] = (
+    SectionSpec(
+        section_name="compensation_discussion_and_analysis",
+        aliases=(
+            "COMPENSATION DISCUSSION AND ANALYSIS",
+            "COMPENSATION DISCUSSION",
+            "CD&A",
+            "CDA",
+        ),
+        end_mode="major_non_exec",
+        min_start_score=0.62,
+        min_heading_score=0.60,
+        min_keyword_score=0.70,
+        required_tokens=("COMPENSATION", "DISCUSSION", "ANALYSIS", "CD&A", "CDA"),
+        min_required_token_hits=2,
+    ),
+    SectionSpec(
+        section_name="executive_compensation",
+        aliases=(
+            "EXECUTIVE COMPENSATION",
+            "EXECUTIVE COMPENSATION DISCUSSION",
+        ),
+        end_mode="major_non_exec",
+        min_start_score=0.64,
+        min_heading_score=0.62,
+        min_keyword_score=0.74,
+        required_tokens=("EXECUTIVE", "COMPENSATION"),
+        min_required_token_hits=2,
+    ),
+    SectionSpec(
+        section_name="director_compensation",
+        aliases=(
+            "DIRECTOR COMPENSATION",
+            "COMPENSATION OF DIRECTORS",
+        ),
+        end_mode="next_boundary",
+        min_start_score=0.64,
+        min_heading_score=0.62,
+        min_keyword_score=0.74,
+        required_tokens=("DIRECTOR", "COMPENSATION"),
+        min_required_token_hits=2,
+    ),
+    SectionSpec(
+        section_name="pay_vs_performance",
+        aliases=(
+            "PAY VERSUS PERFORMANCE",
+            "PAY VS PERFORMANCE",
+        ),
+        end_mode="next_boundary",
+        min_start_score=0.62,
+        min_heading_score=0.60,
+        min_keyword_score=0.72,
+        required_tokens=("PAY", "PERFORMANCE"),
+        min_required_token_hits=2,
+    ),
+    SectionSpec(
+        section_name="equity_compensation_plans",
+        aliases=(
+            "EQUITY COMPENSATION PLANS",
+            "EQUITY COMPENSATION PLAN",
+        ),
+        end_mode="next_boundary",
+        min_start_score=0.62,
+        min_heading_score=0.60,
+        min_keyword_score=0.72,
+        required_tokens=("EQUITY", "COMPENSATION", "PLAN", "PLANS"),
+        min_required_token_hits=2,
+    ),
+)
+
+SECTION_SPECS: dict[str, SectionSpec] = {spec.section_name: spec for spec in _SECTION_SPECS}
+SECTION_NAMES: tuple[str, ...] = tuple(spec.section_name for spec in _SECTION_SPECS)
+
+
+class CDAExtractionResult(BaseModel):
+    """Structured section extraction output."""
+
+    section_name: str
+    section_key: str | None = None
+    section_found: bool = False
     markdown: str
     start_anchor: str | None = None
     end_anchor: str | None = None
@@ -84,12 +174,15 @@ class CDAExtractionResult(BaseModel):
     confidence: float
 
 
-def extract_cda_markdown(
+def extract_section_markdown(
     raw_html: str,
     metadata: DocumentMetadata | None = None,
+    section_name: str = "compensation_discussion_and_analysis",
 ) -> CDAExtractionResult:
-    """Extract CD&A markdown from filing HTML with deterministic fallbacks."""
-    _ = metadata
+    """Extract a target SEC section as markdown with deterministic fallbacks."""
+    spec = _get_section_spec(section_name)
+    section_key = _build_section_key(metadata, section_name)
+
     warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
     soup = BeautifulSoup(raw_html, "lxml")
 
@@ -98,7 +191,7 @@ def extract_cda_markdown(
     confidence = 0.4
 
     toc_entries, toc_table_ids = _build_front_matter_toc(soup)
-    start_entry = _resolve_cda_toc_entry(toc_entries)
+    start_entry = _resolve_section_toc_entry(toc_entries, spec)
     start_node: Tag | None = None
     start_anchor: str | None = None
     start_page: int | None = None
@@ -114,7 +207,7 @@ def extract_cda_markdown(
     if start_node is None:
         start_node = _find_body_heading_node(
             soup=soup,
-            candidate_text=_CDA_TARGET,
+            spec=spec,
             excluded_table_ids=toc_table_ids,
         )
         if start_node is not None:
@@ -126,6 +219,9 @@ def extract_cda_markdown(
     content_blocks = _collect_content_blocks(soup, excluded_table_ids=toc_table_ids)
     if not content_blocks:
         return CDAExtractionResult(
+            section_name=section_name,
+            section_key=section_key,
+            section_found=False,
             markdown="",
             start_anchor=start_anchor,
             end_anchor=None,
@@ -138,22 +234,27 @@ def extract_cda_markdown(
 
     start_index = _find_block_index_for_node(content_blocks, start_node)
     if start_index is None:
-        start_index = _find_first_cda_block(content_blocks)
+        start_index = _find_first_section_block(content_blocks, spec)
         strategy_steps.append("keyword_window_start")
         confidence = max(confidence, 0.6)
+        if start_index is not None and start_anchor is None:
+            start_anchor = _node_anchor(content_blocks[start_index])
     if start_index is None:
         return CDAExtractionResult(
+            section_name=section_name,
+            section_key=section_key,
+            section_found=False,
             markdown="",
             start_anchor=start_anchor,
             end_anchor=None,
             start_page=start_page,
             end_page=None,
             strategy="start_not_found",
-            warnings=["CD&A start boundary could not be resolved."],
+            warnings=[f"Start boundary for '{section_name}' could not be resolved."],
             confidence=0.0,
         )
 
-    end_entry = _resolve_end_toc_entry(toc_entries, start_entry)
+    end_entry = _resolve_end_toc_entry(toc_entries, start_entry, spec)
     end_anchor = end_entry.href.lstrip("#") if (end_entry and end_entry.href) else None
     end_page = end_entry.page if end_entry is not None else None
     end_node = _resolve_anchor_node(soup, end_entry.href) if end_entry is not None else None
@@ -162,15 +263,23 @@ def extract_cda_markdown(
     if end_node is not None:
         end_index = _find_block_index_for_node(content_blocks, end_node)
         if end_index is not None and end_index > start_index:
-            strategy_steps.append("toc_major_item_end")
+            if spec.end_mode == "major_non_exec":
+                strategy_steps.append("toc_major_item_end")
+            else:
+                strategy_steps.append("toc_next_entry_end")
             confidence = max(confidence, 0.92)
         else:
             end_index = None
 
     if end_index is None:
-        end_index = _find_heading_end_index(content_blocks, start_index)
+        end_index = _find_heading_end_index(content_blocks, start_index, spec)
         if end_index is not None:
-            strategy_steps.append("heading_outside_exec_end")
+            if end_anchor is None:
+                end_anchor = _node_anchor(content_blocks[end_index])
+            if spec.end_mode == "major_non_exec":
+                strategy_steps.append("heading_outside_exec_end")
+            else:
+                strategy_steps.append("heading_next_boundary_end")
             confidence = max(confidence, 0.84)
 
     if end_index is None and end_page is not None:
@@ -182,19 +291,21 @@ def extract_cda_markdown(
     if end_index is None or end_index <= start_index:
         end_index = len(content_blocks)
         strategy_steps.append("open_end_to_document_tail")
-        extraction_warnings.append("Unable to resolve explicit CD&A end boundary; using document tail.")
+        extraction_warnings.append(
+            f"Unable to resolve explicit end boundary for '{section_name}'; using document tail."
+        )
         confidence = min(confidence, 0.65)
 
     selected_blocks = content_blocks[start_index:end_index]
     word_count = _word_count_from_blocks(selected_blocks)
-    if word_count < _MIN_WORDS_GUARD:
+    if word_count < spec.short_word_guard:
         expanded_index = _expand_short_selection(content_blocks, start_index, end_index, end_page)
         if expanded_index > end_index:
             end_index = expanded_index
             selected_blocks = content_blocks[start_index:end_index]
             strategy_steps.append("short_text_auto_expand")
             extraction_warnings.append(
-                f"CD&A selection was short ({word_count} words); expanded boundary automatically."
+                f"Section '{section_name}' was short ({word_count} words); expanded boundary automatically."
             )
             confidence = max(0.45, confidence - 0.1)
 
@@ -221,6 +332,9 @@ def extract_cda_markdown(
 
     strategy = " -> ".join(strategy_steps) if strategy_steps else "unknown_strategy"
     return CDAExtractionResult(
+        section_name=section_name,
+        section_key=section_key,
+        section_found=bool(normalized_markdown),
         markdown=normalized_markdown,
         start_anchor=start_anchor,
         end_anchor=end_anchor,
@@ -230,6 +344,38 @@ def extract_cda_markdown(
         warnings=extraction_warnings,
         confidence=round(confidence, 3),
     )
+
+
+def extract_cda_markdown(
+    raw_html: str,
+    metadata: DocumentMetadata | None = None,
+) -> CDAExtractionResult:
+    """Backward-compatible wrapper for CD&A extraction."""
+    return extract_section_markdown(
+        raw_html=raw_html,
+        metadata=metadata,
+        section_name="compensation_discussion_and_analysis",
+    )
+
+
+def _get_section_spec(section_name: str) -> SectionSpec:
+    spec = SECTION_SPECS.get(section_name)
+    if spec is None:
+        supported = ", ".join(SECTION_NAMES)
+        msg = f"Unsupported section_name '{section_name}'. Supported values: {supported}"
+        raise ValueError(msg)
+    return spec
+
+
+def _build_section_key(metadata: DocumentMetadata | None, section_name: str) -> str | None:
+    if metadata is None:
+        return None
+    fiscal_year = _infer_fiscal_year_from_filing_date(metadata.filing_date)
+    return f"{metadata.cik}-{fiscal_year}-{section_name}"
+
+
+def _infer_fiscal_year_from_filing_date(filing_date: date) -> int:
+    return filing_date.year - 1 if filing_date.month <= 8 else filing_date.year
 
 
 def _build_front_matter_toc(soup: BeautifulSoup) -> tuple[list[_TocEntry], set[int]]:
@@ -306,58 +452,92 @@ def _is_toc_like(rows: list[_TocEntry]) -> bool:
     return href_count >= 3 or keyword_count >= 4
 
 
-def _resolve_cda_toc_entry(entries: list[_TocEntry]) -> _TocEntry | None:
+def _resolve_section_toc_entry(entries: list[_TocEntry], spec: SectionSpec) -> _TocEntry | None:
     best_score = 0.0
     best_entry: _TocEntry | None = None
     for entry in entries:
-        score = _cda_label_score(entry.normalized_label)
+        score = _section_label_score(entry.normalized_label, spec)
         if score > best_score:
             best_score = score
             best_entry = entry
-    if best_score < 0.62:
+    if best_score < spec.min_start_score:
         return None
     return best_entry
 
 
-def _cda_label_score(normalized_label: str) -> float:
+def _section_label_score(normalized_label: str, spec: SectionSpec) -> float:
     if not normalized_label:
         return 0.0
-    canonical = _normalize_label(_CDA_TARGET)
-    ratio = SequenceMatcher(None, normalized_label, canonical).ratio()
+
+    normalized_aliases = [_normalize_label(alias) for alias in spec.aliases]
     tokens = set(normalized_label.split())
-    overlap = len(tokens.intersection({"COMPENSATION", "DISCUSSION", "ANALYSIS"}))
-    has_discussion_analysis = "DISCUSSION" in tokens and "ANALYSIS" in tokens
-    has_cda_abbrev = "CD&A" in normalized_label or "CDA" in tokens
-    compact_ratio = SequenceMatcher(
-        None,
-        normalized_label.replace(" ", ""),
-        canonical.replace(" ", ""),
-    ).ratio()
-    score = max(ratio, compact_ratio)
-    score += 0.12 * overlap
-    if has_discussion_analysis:
-        score += 0.16
-    if has_cda_abbrev:
-        score += 0.12
-    # Guard against overmatching generic "compensation" labels.
-    if not has_discussion_analysis and not has_cda_abbrev:
-        score *= 0.45
+    score = 0.0
+
+    for normalized_alias in normalized_aliases:
+        if not normalized_alias:
+            continue
+        ratio = SequenceMatcher(None, normalized_label, normalized_alias).ratio()
+        compact_ratio = SequenceMatcher(
+            None,
+            normalized_label.replace(" ", ""),
+            normalized_alias.replace(" ", ""),
+        ).ratio()
+        alias_tokens = set(normalized_alias.split())
+        overlap = len(tokens.intersection(alias_tokens))
+        local_score = max(ratio, compact_ratio)
+        if normalized_alias in normalized_label:
+            local_score = max(local_score, 0.93)
+        local_score += 0.05 * min(overlap, 4)
+        score = max(score, min(local_score, 1.0))
+
+    required_hits = 0
+    for token in spec.required_tokens:
+        token_upper = token.upper()
+        if token_upper in tokens or token_upper in normalized_label:
+            required_hits += 1
+
+    if spec.section_name == "compensation_discussion_and_analysis":
+        has_discussion_analysis = "DISCUSSION" in tokens and "ANALYSIS" in tokens
+        has_cda_abbrev = "CD&A" in normalized_label or "CDA" in tokens
+        overlap = len(tokens.intersection({"COMPENSATION", "DISCUSSION", "ANALYSIS"}))
+        score += 0.12 * overlap
+        if has_discussion_analysis:
+            score += 0.16
+        if has_cda_abbrev:
+            score += 0.12
+        if not has_discussion_analysis and not has_cda_abbrev:
+            score *= 0.45
+
+    if required_hits < spec.min_required_token_hits:
+        score *= 0.4
+
     return min(score, 1.0)
 
 
 def _resolve_end_toc_entry(
     entries: list[_TocEntry],
     start_entry: _TocEntry | None,
+    spec: SectionSpec,
 ) -> _TocEntry | None:
     if start_entry is None:
         return None
     start_key = (start_entry.table_order, start_entry.row_order)
-    candidates = [
-        entry
-        for entry in entries
-        if (entry.table_order, entry.row_order) > start_key and _is_major_non_exec_label(entry)
-    ]
-    return candidates[0] if candidates else None
+
+    if spec.end_mode == "major_non_exec":
+        candidates = [
+            entry
+            for entry in entries
+            if (entry.table_order, entry.row_order) > start_key and _is_major_non_exec_label(entry)
+        ]
+        return candidates[0] if candidates else None
+
+    for entry in entries:
+        if (entry.table_order, entry.row_order) <= start_key:
+            continue
+        if entry.normalized_label == start_entry.normalized_label:
+            continue
+        return entry
+    return None
 
 
 def _is_major_non_exec_label(entry: _TocEntry) -> bool:
@@ -403,23 +583,22 @@ def _resolve_anchor_node(soup: BeautifulSoup, href: str | None) -> Tag | None:
 
 def _find_body_heading_node(
     soup: BeautifulSoup,
-    candidate_text: str,
+    spec: SectionSpec,
     excluded_table_ids: set[int],
 ) -> Tag | None:
-    target = _normalize_label(candidate_text)
     best: tuple[float, Tag] | None = None
     for tag in soup.find_all(_SEARCH_TAGS):
         if _is_in_excluded_table(tag, excluded_table_ids):
             continue
+        if tag.name == "table":
+            continue
         text = _normalize_label(tag.get_text(" ", strip=True))
-        if not text:
+        if not text or text == "TABLE OF CONTENTS":
             continue
         if len(text) > 220:
             continue
-        score = SequenceMatcher(None, text, target).ratio()
-        if "COMPENSATION" in text and "DISCUSSION" in text and "ANALYSIS" in text:
-            score += 0.2
-        if score < 0.6:
+        score = _section_label_score(text, spec)
+        if score < spec.min_heading_score:
             continue
         if best is None or score > best[0]:
             best = (score, tag)
@@ -457,21 +636,18 @@ def _find_block_index_for_node(blocks: list[Tag], node: Tag | None) -> int | Non
     return None
 
 
-def _find_first_cda_block(blocks: list[Tag]) -> int | None:
-    target = _normalize_label(_CDA_TARGET)
+def _find_first_section_block(blocks: list[Tag], spec: SectionSpec) -> int | None:
     for index, block in enumerate(blocks):
         text = _normalize_label(block.get_text(" ", strip=True))
-        if not text:
+        if not text or text == "TABLE OF CONTENTS":
             continue
-        score = SequenceMatcher(None, text[: max(len(target), 1)], target).ratio()
-        if "COMPENSATION" in text and "DISCUSSION" in text and "ANALYSIS" in text:
-            return index
-        if score >= 0.7:
+        score = _section_label_score(text, spec)
+        if score >= spec.min_keyword_score:
             return index
     return None
 
 
-def _find_heading_end_index(blocks: list[Tag], start_index: int) -> int | None:
+def _find_heading_end_index(blocks: list[Tag], start_index: int, spec: SectionSpec) -> int | None:
     for index in range(start_index + 1, len(blocks)):
         block = blocks[index]
         text = _normalize_label(block.get_text(" ", strip=True))
@@ -479,10 +655,19 @@ def _find_heading_end_index(blocks: list[Tag], start_index: int) -> int | None:
             continue
         if not _looks_like_heading(block, text):
             continue
-        if _is_exec_comp_heading(text):
+
+        if spec.end_mode == "major_non_exec":
+            if _is_exec_comp_heading(text):
+                continue
+            if _is_major_heading_boundary(text):
+                return index
             continue
-        if _is_major_heading_boundary(text):
-            return index
+
+        if text == "TABLE OF CONTENTS":
+            continue
+        if _section_label_score(text, spec) >= max(0.72, spec.min_heading_score):
+            continue
+        return index
     return None
 
 
@@ -581,7 +766,7 @@ def _render_with_docling(fragment_html: str) -> tuple[str | None, str | None]:
             result = converter.convert_string(
                 fragment_html,
                 format=InputFormat.HTML,
-                name="cda_fragment",
+                name="section_fragment",
             )
         except Exception:  # noqa: BLE001
             result = None
