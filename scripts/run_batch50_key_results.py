@@ -139,7 +139,7 @@ from ingestion.llm_comp_extractor import (  # noqa: E402
     extract_company_comp_from_summary_table,
     extract_grants_from_plan_based_table,
 )
-from ingestion.metadata_model import BaseBlock, DocumentMetadata, HeadingBlock, TableBlock  # noqa: E402
+from ingestion.metadata_model import BaseBlock, DocumentMetadata, HeadingBlock, ProseBlock, TableBlock  # noqa: E402
 from ingestion.sec_chunker import SECChunker  # noqa: E402
 from ingestion.sec_html_parser import SECHTMLParser  # noqa: E402
 
@@ -963,21 +963,41 @@ def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, He
 
     def _grants_schema_fit(header_text: str, prefix_text: str) -> bool:
         combined = f"{header_text} | {prefix_text}"
-        has_grant_date = "grant date" in combined
-        has_payout_structure = (
+        tokens = set(re.findall(r"[a-z0-9]+", combined))
+
+        def _has_all(*required: str) -> bool:
+            return all(token in tokens for token in required)
+
+        has_grant_date = ("grant date" in combined) or _has_all("grant", "date")
+
+        has_non_equity_triplet = (
             ("non-equity incentive plan award" in combined)
             or ("non equity incentive plan award" in combined)
-            or ("equity incentive plan award" in combined)
-            or ("threshold" in combined and "target" in combined)
+            or (
+                _has_all("non", "equity", "incentive", "plan")
+                and ("award" in tokens or "awards" in tokens)
+            )
         )
+        has_equity_triplet = (
+            ("equity incentive plan award" in combined)
+            or (
+                _has_all("equity", "incentive", "plan")
+                and ("award" in tokens or "awards" in tokens)
+            )
+        )
+        has_threshold_target = _has_all("threshold", "target")
+        has_payout_structure = has_non_equity_triplet or has_equity_triplet or has_threshold_target
+
         has_grants_columns = any(
-            token in combined
-            for token in (
-                "award type",
-                "all other stock awards",
-                "all other option awards",
-                "exercise or base price",
-                "grant date fair value",
+            (
+                ("award type" in combined) or _has_all("award", "type") or _has_all("awards", "type"),
+                ("all other stock awards" in combined)
+                or (_has_all("all", "other", "stock") and ("award" in tokens or "awards" in tokens)),
+                ("all other option awards" in combined)
+                or (_has_all("all", "other", "option") and ("award" in tokens or "awards" in tokens)),
+                ("exercise or base price" in combined)
+                or (_has_all("exercise", "price") and ("base" in tokens or "option" in tokens)),
+                ("grant date fair value" in combined) or (_has_all("fair", "value") and "grant" in tokens),
             )
         )
         return has_grant_date and has_payout_structure and has_grants_columns
@@ -1033,26 +1053,44 @@ def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, He
         if isinstance(block, HeadingBlock)
         and any(signature in block.text.lower() for signature in _GRANTS_SIGNATURES)
     ]
+    grants_contexts: list[tuple[int, str, HeadingBlock | None]] = [
+        (index, heading.text, heading) for index, heading in grants_headings
+    ]
+    for index, block in enumerate(blocks):
+        if not isinstance(block, ProseBlock):
+            continue
+        prose_text = block.text.strip()
+        prose_lc = prose_text.lower()
+        if not prose_text:
+            continue
+        if "table of contents" in prose_lc:
+            continue
+        if len(prose_text) > 180:
+            continue
+        if any(signature in prose_lc for signature in _GRANTS_SIGNATURES):
+            grants_contexts.append((index, prose_text, None))
 
     scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
-    for heading_index, heading in grants_headings:
-        for block in blocks:
-            if not isinstance(block, TableBlock) or block.section_id != heading.id:
-                continue
-            score = _score_grants_table_candidate(block, heading.text)
-            if score >= 8:
-                scored_candidates.append((score, 1, 0, block, heading))
+    for context_index, context_text, context_heading in grants_contexts:
+        if context_heading is not None:
+            for block in blocks:
+                if not isinstance(block, TableBlock) or block.section_id != context_heading.id:
+                    continue
+                score = _score_grants_table_candidate(block, context_text)
+                if score >= 8:
+                    scored_candidates.append((score, 1, 0, block, context_heading))
 
         for offset in range(1, 16):
-            candidate_index = heading_index + offset
+            candidate_index = context_index + offset
             if candidate_index >= len(blocks):
                 break
             candidate = blocks[candidate_index]
             if not isinstance(candidate, TableBlock):
                 continue
-            score = _score_grants_table_candidate(candidate, heading.text)
+            score = _score_grants_table_candidate(candidate, context_text)
             if score >= 8:
-                scored_candidates.append((score, 0, -offset, candidate, heading))
+                proximity_boost = 1 if context_heading is not None else 0
+                scored_candidates.append((score, proximity_boost, -offset, candidate, context_heading))
 
     if scored_candidates:
         best = max(scored_candidates, key=lambda item: (item[0], item[1], item[2]))
