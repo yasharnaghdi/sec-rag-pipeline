@@ -196,7 +196,9 @@ a proxy statement. Extract compensation data for named executive officers
 and return ONLY a valid JSON object matching the schema below.
 
 EXTRACTION RULES:
-1. Extract values for the MOST RECENT fiscal year present in the table.
+1. If a target fiscal year is provided in the user message, extract values
+   for that fiscal year only. Otherwise use the most recent fiscal year
+   present in the table.
 2. Map executives to roles using title keywords:
    - ceo: title contains "Chief Executive Officer" or "CEO"
    - cfo: title contains "Chief Financial Officer" or "CFO"
@@ -214,6 +216,8 @@ EXTRACTION RULES:
 6. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
 7. Do NOT invent values. If data is absent, use empty string or null.
 8. Return ONLY the JSON object. No prose, no markdown code fences.
+9. Do NOT infer fiscal year from filing date. Use explicit year values from
+   the table rows.
 
 REQUIRED JSON SCHEMA:
 {
@@ -300,16 +304,23 @@ def _build_user_message(
     filing_date: str,
     table_text: str,
     table_label: str = "Summary Compensation Table",
+    target_fiscal_year: int | None = None,
 ) -> str:
     """Build the user turn message for the extraction prompt.
 
     Includes minimal filing metadata as context to help the LLM
     identify the correct fiscal year and company context.
     """
+    target_year_line = (
+        f"Target fiscal year: {target_fiscal_year} (extract this year only)\n"
+        if target_fiscal_year is not None
+        else "Target fiscal year: none (use most recent year in table)\n"
+    )
     return (
         f"Company: {company_name}\n"
         f"CIK: {cik}\n"
         f"Filing date: {filing_date}\n\n"
+        f"{target_year_line}\n"
         f"{table_label} (linearized):\n"
         f"{table_text}"
     )
@@ -445,6 +456,7 @@ def extract_company_comp_from_summary_table(
     filing_date: str,
     accession_number: str,
     table_text: str,
+    target_fiscal_year: int | None = None,
     model: str = "gpt-4o-mini",
     client: OpenAI | None = None,
 ) -> CompanyCompResult:
@@ -467,6 +479,8 @@ def extract_company_comp_from_summary_table(
         accession_number: Accession number for provenance logging only.
         table_text: TableBlock.linearized_text from the located Summary
                     Compensation Table. Must be non-empty.
+        target_fiscal_year: Optional target fiscal year to extract from the
+                            table (e.g. 2024). If None, extract most recent.
         model: OpenAI model identifier. Defaults to "gpt-4o-mini".
         client: Optional pre-initialised OpenAI client. If None, a new
                 client is created using OPENAI_API_KEY from environment.
@@ -494,7 +508,13 @@ def extract_company_comp_from_summary_table(
     if client is None and not use_ollama:
         client = OpenAI(api_key=api_key)
 
-    user_message = _build_user_message(company_name, cik, filing_date, table_text)
+    user_message = _build_user_message(
+        company_name,
+        cik,
+        filing_date,
+        table_text,
+        target_fiscal_year=target_fiscal_year,
+    )
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": _SYSTEM_PROMPT},

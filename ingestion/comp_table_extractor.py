@@ -119,6 +119,8 @@ _SUMMARY_COMP_REQUIRED_NUMERIC_COLS = {
     "total",
 }
 
+_NUMERIC_EMPTY_MARKERS = {"", "—", "-", "$", "n/a", "na"}
+
 _EQUITY_AWARDS_COLS: dict[str, list[str]] = {
     "exec_name": ["name", "executive"],
     "option_grant_date": ["grant date", "option grant"],
@@ -262,7 +264,11 @@ def _resolve_source_heading(
     return None
 
 
-def _build_column_map(table_block: TableBlock, schema: dict[str, list[str]]) -> list[str | None]:
+def _build_column_map(
+    table_block: TableBlock,
+    schema: dict[str, list[str]],
+    allow_duplicates: set[str] | None = None,
+) -> list[str | None]:
     if not table_block.rows:
         return []
 
@@ -283,7 +289,7 @@ def _build_column_map(table_block: TableBlock, schema: dict[str, list[str]]) -> 
                 parts.append(cell)
         header_text = " ".join(parts)
         canonical = _match_col(header_text, schema) if header_text else None
-        if canonical in seen:
+        if canonical in seen and (allow_duplicates is None or canonical not in allow_duplicates):
             canonical = None
         if canonical is not None:
             seen.add(canonical)
@@ -554,10 +560,20 @@ def _map_row(
         if canonical is None:
             continue
         value = cell.strip()
-        output[canonical] = value
         if canonical in NUMERIC_COLUMNS:
             numeric_val = clean_numeric(value)
-            output[canonical] = numeric_val if numeric_val is not None else value
+            existing = output.get(canonical)
+            existing_text = str(existing or "").strip().lower()
+
+            if numeric_val is not None:
+                output[canonical] = numeric_val
+            elif value.strip().lower() in _NUMERIC_EMPTY_MARKERS:
+                if existing is None or existing_text in _NUMERIC_EMPTY_MARKERS:
+                    output[canonical] = ""
+            elif existing is None or existing_text in _NUMERIC_EMPTY_MARKERS:
+                output[canonical] = value
+        else:
+            output[canonical] = value
         mapped_values += 1
 
     if mapped_values == 0 and row:
@@ -595,6 +611,60 @@ def _map_row(
     output["source_section"] = source_section
     output["table_block_id"] = table_block_id
     return output
+
+
+def _is_title_only_exec_name(value: str) -> bool:
+    normalized = _normalise(value)
+    if not normalized or any(char.isdigit() for char in normalized):
+        return False
+    title_keywords = {
+        "officer",
+        "president",
+        "director",
+        "chairman",
+        "executive",
+        "ceo",
+        "cfo",
+        "coo",
+        "svp",
+        "evp",
+        "vp",
+    }
+    return any(keyword in normalized for keyword in title_keywords) and len(normalized.split()) <= 10
+
+
+def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    current_name_by_table: dict[str, str] = {}
+    last_person_row_by_table: dict[str, dict[str, Any]] = {}
+    normalized_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        out = dict(row)
+        table_id = str(out.get("table_block_id", "") or "")
+        exec_name = str(out.get("exec_name", "") or "").strip()
+        exec_title = str(out.get("exec_title", "") or "").strip()
+
+        is_title_only = bool(exec_name) and not exec_title and _is_title_only_exec_name(exec_name)
+        if is_title_only:
+            prior_name = current_name_by_table.get(table_id, "")
+            if prior_name:
+                inferred_title = exec_name
+                out["exec_name"] = prior_name
+                out["exec_title"] = inferred_title
+
+                prior_row = last_person_row_by_table.get(table_id)
+                if prior_row is not None and not str(prior_row.get("exec_title", "") or "").strip():
+                    prior_row["exec_title"] = inferred_title
+        elif exec_name:
+            current_name_by_table[table_id] = exec_name
+            last_person_row_by_table[table_id] = out
+
+        normalized_rows.append(out)
+
+    return normalized_rows
 
 
 def _extract_table(
@@ -653,9 +723,16 @@ def extract_summary_compensation(
         _TABLE_SIGNATURES["summary_compensation"],
         _SUMMARY_COMP_COLS,
         meta,
+        column_mapper=lambda block, schema: _build_column_map(
+            block,
+            schema,
+            allow_duplicates=_SUMMARY_COMP_REQUIRED_NUMERIC_COLS,
+        ),
     )
     if not raw_rows:
         return []
+
+    raw_rows = _normalize_summary_comp_rows(raw_rows)
 
     valid_rows: list[dict[str, Any]] = []
     by_table: dict[str, list[dict[str, Any]]] = {}
@@ -674,7 +751,11 @@ def extract_summary_compensation(
         table = table_by_id.get(table_id)
         if table is None:
             continue
-        column_map = _build_column_map(table, _SUMMARY_COMP_COLS)
+        column_map = _build_column_map(
+            table,
+            _SUMMARY_COMP_COLS,
+            allow_duplicates=_SUMMARY_COMP_REQUIRED_NUMERIC_COLS,
+        )
         if not _summary_table_has_comp_columns(column_map):
             continue
         valid_rows.extend(table_rows)

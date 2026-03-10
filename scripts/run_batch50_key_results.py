@@ -61,7 +61,9 @@ Output columns - key_results.csv
 
 Output columns - batch_log.csv
 -------------------------------
-  cik, company_name, status, extraction_method,
+  cik, company_name, run_scope, target_fiscal_year,
+  source_filing_date, source_accession_number, source_filing_url,
+  status, extraction_method,
   block_count, table_count, comp_heading_found,
   comp_table_found, grant_table_found, det_rows, llm_confidence,
   elapsed_seconds, error
@@ -105,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import logging
 import os
 import re
@@ -313,6 +316,11 @@ KEY_RESULTS_COLUMNS = [
 BATCH_LOG_COLUMNS = [
     "cik",
     "company_name",
+    "run_scope",
+    "target_fiscal_year",
+    "source_filing_date",
+    "source_accession_number",
+    "source_filing_url",
     "status",
     "extraction_method",
     "block_count",
@@ -327,6 +335,83 @@ BATCH_LOG_COLUMNS = [
     "elapsed_seconds",
     "error",
 ]
+
+
+def _call_process_cik(
+    cik: str,
+    model: str,
+    skip_db: bool,
+    fiscal_year_start: int | None = None,
+    fiscal_year_end: int | None = None,
+    filing_override: fetcher.FetchedFiling | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
+    """
+    Call process_cik with backward-compatible argument handling.
+
+    Some tests monkeypatch process_cik with legacy signatures.
+    """
+    process_fn = cast(Any, process_cik)
+    has_filing_override = False
+    param_count = 0
+    try:
+        params = inspect.signature(process_fn).parameters
+        has_filing_override = "filing_override" in params
+        param_count = len(params)
+    except (TypeError, ValueError):
+        pass
+
+    if has_filing_override or param_count >= 6:
+        return cast(
+            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+            process_fn(cik, model, skip_db, fiscal_year_start, fiscal_year_end, filing_override),
+        )
+    if param_count >= 5:
+        return cast(
+            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+            process_fn(cik, model, skip_db, fiscal_year_start, fiscal_year_end),
+        )
+    return cast(
+        tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+        process_fn(cik, model, skip_db),
+    )
+
+
+def _enrich_log_row(
+    raw_log_row: dict[str, Any],
+    *,
+    run_scope: str,
+    target_fiscal_year: int | None = None,
+    filing: fetcher.FetchedFiling | None = None,
+    override_status: str | None = None,
+    override_error: str | None = None,
+    cik: str | None = None,
+    company_name: str | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {column: "" for column in BATCH_LOG_COLUMNS}
+    for key, value in raw_log_row.items():
+        if key in row:
+            row[key] = value
+
+    if cik is not None:
+        row["cik"] = cik
+    if company_name is not None:
+        row["company_name"] = company_name
+    row["run_scope"] = run_scope
+    row["target_fiscal_year"] = str(target_fiscal_year) if target_fiscal_year is not None else ""
+
+    if filing is not None:
+        row["source_filing_date"] = str(filing.filing_date or "")
+        row["source_accession_number"] = filing.accession_number
+        row["source_filing_url"] = filing.filing_url
+
+    if override_status is not None:
+        row["status"] = override_status
+    if override_error is not None:
+        row["error"] = override_error
+    if override_status == "failed" and not row.get("extraction_method"):
+        row["extraction_method"] = "failed"
+
+    return row
 
 
 def _fetch_latest_def14a(cik: str) -> fetcher.FetchedFiling:
@@ -437,6 +522,27 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
 
     Returns (TableBlock, HeadingBlock) or (None, None).
     """
+    def _heading_is_comp_signature(text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not any(signature in normalized for signature in _COMP_SIGNATURES):
+            return False
+
+        # Keep concise heading-like rows and drop long prose sentences
+        # that merely mention "Summary Compensation Table".
+        if len(normalized) <= 120:
+            return True
+        if any(normalized.startswith(signature) for signature in _COMP_SIGNATURES):
+            return True
+        return len(normalized.split()) <= 16
+
+    def _table_prefix_text(table: TableBlock, max_rows: int = 12) -> str:
+        if not table.rows:
+            return ""
+        parts: list[str] = []
+        for row in table.rows[: min(max_rows, len(table.rows))]:
+            parts.extend(cell.strip() for cell in row if cell.strip())
+        return " | ".join(parts).lower()
+
     def _table_header_text(table: TableBlock) -> str:
         if not table.rows:
             return ""
@@ -472,10 +578,49 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
             parts.extend(cells)
         return " | ".join(parts).lower()
 
+    def _comp_schema_fit(header_text: str, prefix_text: str) -> bool:
+        combined = f"{header_text} | {prefix_text}"
+        has_name_axis = (
+            "name and principal position" in combined
+            or ("name" in combined and "principal position" in combined)
+            or ("name" in combined and "salary" in combined)
+        )
+        has_comp_columns = any(
+            token in combined
+            for token in (
+                "salary",
+                "bonus",
+                "stock awards",
+                "option awards",
+                "non-equity incentive plan compensation",
+                "non equity incentive plan compensation",
+                "all other compensation",
+            )
+        )
+        has_total = "total" in combined
+
+        reject_tokens = set(_COMP_REJECT_HEADER_HINTS) | {
+            "election of directors",
+            "ratification of the appointment",
+            "plan category",
+            "beneficial owner",
+            "beneficial owners",
+            "shares purchased",
+            "percent of common stock",
+            "shareholder proposal",
+        }
+        if any(token in combined for token in reject_tokens):
+            return False
+
+        return has_name_axis and has_comp_columns and has_total
+
     def _score_comp_table_candidate(table: TableBlock, heading_text: str) -> int:
         header_text = _table_header_text(table)
-        if not header_text:
+        prefix_text = _table_prefix_text(table)
+        if not header_text and not prefix_text:
             return -10
+        if not _comp_schema_fit(header_text, prefix_text):
+            return -12
 
         row_count = len(table.rows)
         col_count = max((len(row) for row in table.rows), default=0)
@@ -519,7 +664,7 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
         (index, block)
         for index, block in enumerate(blocks)
         if isinstance(block, HeadingBlock)
-        and any(signature in block.text.lower() for signature in _COMP_SIGNATURES)
+        and _heading_is_comp_signature(block.text)
     ]
 
     scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
@@ -558,7 +703,9 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
         if not isinstance(block, TableBlock):
             continue
         score = _score_comp_table_candidate(block, "")
-        if score >= 6:
+        header_text = _table_header_text(block)
+        prefix_text = _table_prefix_text(block)
+        if score >= 6 and _comp_schema_fit(header_text, prefix_text):
             global_candidates.append((score, block))
     if global_candidates:
         best_global = max(global_candidates, key=lambda item: item[0])
@@ -712,6 +859,42 @@ def _infer_fiscal_year_from_filing_date(filing_date: date | None) -> str:
     if filing_date is None:
         return ""
     return str(filing_date.year - 1 if filing_date.month <= 8 else filing_date.year)
+
+
+def _parse_fiscal_year(value: str) -> int | None:
+    text = value.strip()
+    if not re.fullmatch(r"\d{4}", text):
+        return None
+    return int(text)
+
+
+def _is_within_fiscal_year_range(
+    fiscal_year: str,
+    fiscal_year_start: int | None,
+    fiscal_year_end: int | None,
+) -> bool:
+    if fiscal_year_start is None or fiscal_year_end is None:
+        return True
+    parsed_year = _parse_fiscal_year(fiscal_year)
+    if parsed_year is None:
+        return False
+    return fiscal_year_start <= parsed_year <= fiscal_year_end
+
+
+def _filter_det_rows_by_fiscal_year(
+    det_rows: list[dict[str, Any]],
+    fallback_year: str,
+    fiscal_year_start: int | None,
+    fiscal_year_end: int | None,
+) -> list[dict[str, Any]]:
+    if fiscal_year_start is None or fiscal_year_end is None:
+        return det_rows
+    filtered_rows: list[dict[str, Any]] = []
+    for row in det_rows:
+        resolved_year = _normalize_compensation_year(str(row.get("year", "") or ""), fallback_year)
+        if _is_within_fiscal_year_range(resolved_year, fiscal_year_start, fiscal_year_end):
+            filtered_rows.append(row)
+    return filtered_rows
 
 
 def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, HeadingBlock | None]:
@@ -1065,6 +1248,9 @@ def process_cik(
     cik: str,
     model: str,
     skip_db: bool,
+    fiscal_year_start: int | None = None,
+    fiscal_year_end: int | None = None,
+    filing_override: fetcher.FetchedFiling | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
     """
     Full pipeline for one CIK.
@@ -1124,10 +1310,13 @@ def process_cik(
                     log_row[key] = value
         return base, log_row, grants_rows_out, compensation_rows_out
 
-    try:
-        filing = _fetch_latest_def14a(cik)
-    except Exception as exc:  # noqa: BLE001
-        return _failed(f"acquisition_failed: {exc}")
+    if filing_override is not None:
+        filing = filing_override
+    else:
+        try:
+            filing = _fetch_latest_def14a(cik)
+        except Exception as exc:  # noqa: BLE001
+            return _failed(f"acquisition_failed: {exc}")
 
     company_name = str(getattr(filing, "company_name", "") or "")
     ticker = str(getattr(filing, "ticker", "") or "")
@@ -1184,33 +1373,39 @@ def process_cik(
         log.warning("grants_det_extract_failed | cik=%s error=%s", cik, grants_exc)
 
     grants_fiscal_year = _infer_fiscal_year_from_filing_date(filing.filing_date)
-    if grants_det_rows and _det_rows_have_grants_payload(grants_det_rows):
-        for det_row in grants_det_rows:
-            output_row = _grant_row_from_det(det_row)
-            output_row["CIK"] = cik
-            output_row["Company Name"] = company_name
-            output_row["Filing URL"] = filing.filing_url
-            output_row["__cik"] = cik
-            output_row["__fiscal_year"] = grants_fiscal_year
-            grants_rows_out.append(output_row)
-    elif grants_table is not None:
-        llm_grants_result = extract_grants_from_plan_based_table(
-            company_name=company_name,
-            cik=cik,
-            filing_date=str(filing.filing_date or ""),
-            accession_number=filing.accession_number,
-            table_text=grants_table.linearized_text,
-            model=model,
-        )
-        if _llm_result_has_grants_payload(llm_grants_result):
-            for llm_row in llm_grants_result.rows:
-                output_row = _grant_row_from_llm(llm_row)
+    include_grants = _is_within_fiscal_year_range(
+        grants_fiscal_year,
+        fiscal_year_start,
+        fiscal_year_end,
+    )
+    if include_grants:
+        if grants_det_rows and _det_rows_have_grants_payload(grants_det_rows):
+            for det_row in grants_det_rows:
+                output_row = _grant_row_from_det(det_row)
                 output_row["CIK"] = cik
                 output_row["Company Name"] = company_name
                 output_row["Filing URL"] = filing.filing_url
                 output_row["__cik"] = cik
                 output_row["__fiscal_year"] = grants_fiscal_year
                 grants_rows_out.append(output_row)
+        elif grants_table is not None:
+            llm_grants_result = extract_grants_from_plan_based_table(
+                company_name=company_name,
+                cik=cik,
+                filing_date=str(filing.filing_date or ""),
+                accession_number=filing.accession_number,
+                table_text=grants_table.linearized_text,
+                model=model,
+            )
+            if _llm_result_has_grants_payload(llm_grants_result):
+                for llm_row in llm_grants_result.rows:
+                    output_row = _grant_row_from_llm(llm_row)
+                    output_row["CIK"] = cik
+                    output_row["Company Name"] = company_name
+                    output_row["Filing URL"] = filing.filing_url
+                    output_row["__cik"] = cik
+                    output_row["__fiscal_year"] = grants_fiscal_year
+                    grants_rows_out.append(output_row)
 
     comp_table, comp_heading = _locate_comp_table(blocks)
     comp_heading_found = comp_heading is not None
@@ -1239,7 +1434,32 @@ def process_cik(
         )
 
     inferred_comp_year = _infer_fiscal_year_from_filing_date(filing.filing_date)
+    target_comp_year: int | None = None
+    if (
+        fiscal_year_start is not None
+        and fiscal_year_end is not None
+        and fiscal_year_start == fiscal_year_end
+    ):
+        target_comp_year = fiscal_year_start
     if det_rows and _det_rows_have_comp_payload(det_rows):
+        det_rows = _filter_det_rows_by_fiscal_year(
+            det_rows,
+            inferred_comp_year,
+            fiscal_year_start,
+            fiscal_year_end,
+        )
+        if not det_rows:
+            return _failed(
+                "no_comp_rows_in_fiscal_year_range",
+                company_name,
+                {
+                    "block_count": block_count,
+                    "table_count": table_count,
+                    "comp_heading_found": comp_heading_found,
+                    "comp_table_found": comp_table_found,
+                    "grant_table_found": grant_table_found,
+                },
+            )
         extraction_method = "deterministic"
         for det_row in det_rows:
             output_row = _compensation_row_from_det(
@@ -1254,13 +1474,18 @@ def process_cik(
                 compensation_rows_out.append(output_row)
         roles = _collapse_to_roles(det_rows)
     elif comp_table is not None:
-        log.info("llm_fallback triggered | cik=%s", cik)
+        log.info(
+            "llm_fallback triggered | cik=%s target_fiscal_year=%s",
+            cik,
+            target_comp_year if target_comp_year is not None else "most_recent",
+        )
         llm_result = extract_company_comp_from_summary_table(
             company_name=company_name,
             cik=cik,
             filing_date=str(filing.filing_date or ""),
             accession_number=filing.accession_number,
             table_text=comp_table.linearized_text,
+            target_fiscal_year=target_comp_year,
             model=model,
         )
         llm_confidence = llm_result.confidence
@@ -1286,9 +1511,14 @@ def process_cik(
             "other1": llm_result.other1,
             "other2": llm_result.other2,
         }
+        llm_rows_in_range = 0
         for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
             role_record = roles[role_key]
             if not isinstance(role_record, ExecCompRecord):
+                continue
+            resolved_year = _normalize_compensation_year(role_record.fiscal_year, inferred_comp_year)
+            if not _is_within_fiscal_year_range(resolved_year, fiscal_year_start, fiscal_year_end):
+                roles[role_key] = ExecCompRecord()
                 continue
             output_row = _compensation_row_from_llm(
                 record=role_record,
@@ -1300,6 +1530,20 @@ def process_cik(
             )
             if _compensation_row_has_payload(output_row):
                 compensation_rows_out.append(output_row)
+                llm_rows_in_range += 1
+        if llm_rows_in_range == 0:
+            return _failed(
+                "no_comp_rows_in_fiscal_year_range",
+                company_name,
+                {
+                    "block_count": block_count,
+                    "table_count": table_count,
+                    "comp_heading_found": comp_heading_found,
+                    "comp_table_found": comp_table_found,
+                    "grant_table_found": grant_table_found,
+                    "llm_confidence": llm_confidence,
+                },
+            )
     else:
         return _failed(
             "no_comp_table_located",
@@ -1436,7 +1680,43 @@ def main() -> None:
         action="store_true",
         help="Skip Postgres chunk writes even if DB_URL is set",
     )
+    parser.add_argument(
+        "--fiscal-year-start",
+        type=int,
+        default=None,
+        help=(
+            "Inclusive start fiscal year for supplemental table outputs "
+            "(must be paired with --fiscal-year-end; key_results.csv remains unchanged)"
+        ),
+    )
+    parser.add_argument(
+        "--fiscal-year-end",
+        type=int,
+        default=None,
+        help=(
+            "Inclusive end fiscal year for supplemental table outputs "
+            "(must be paired with --fiscal-year-start; key_results.csv remains unchanged)"
+        ),
+    )
     args = parser.parse_args()
+
+    has_start = args.fiscal_year_start is not None
+    has_end = args.fiscal_year_end is not None
+    if has_start != has_end:
+        parser.error("Both --fiscal-year-start and --fiscal-year-end are required to enable year-range filtering.")
+    fiscal_year_start: int | None = None
+    fiscal_year_end: int | None = None
+    if has_start and has_end:
+        assert args.fiscal_year_start is not None
+        assert args.fiscal_year_end is not None
+        if args.fiscal_year_start < 1000 or args.fiscal_year_start > 9999:
+            parser.error("--fiscal-year-start must be a 4-digit year.")
+        if args.fiscal_year_end < 1000 or args.fiscal_year_end > 9999:
+            parser.error("--fiscal-year-end must be a 4-digit year.")
+        if args.fiscal_year_start > args.fiscal_year_end:
+            parser.error("--fiscal-year-start cannot be greater than --fiscal-year-end.")
+        fiscal_year_start = args.fiscal_year_start
+        fiscal_year_end = args.fiscal_year_end
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -1455,12 +1735,24 @@ def main() -> None:
     ciks = [row[cik_col].strip() for row in cik_rows if row.get(cik_col, "").strip()]
     ciks = ciks[: args.limit]
 
-    log.info("batch start | label=%s ciks=%d model=%s", args.batch_label, len(ciks), args.model)
+    year_range_label = (
+        f"{fiscal_year_start}-{fiscal_year_end}"
+        if fiscal_year_start is not None and fiscal_year_end is not None
+        else "all"
+    )
+    log.info(
+        "batch start | label=%s ciks=%d model=%s fiscal_year_range=%s",
+        args.batch_label,
+        len(ciks),
+        args.model,
+        year_range_label,
+    )
 
     out_dir = BATCH_OUTPUT_BASE / args.batch_label
     out_dir.mkdir(parents=True, exist_ok=True)
     key_results_path = out_dir / "key_results.csv"
     batch_log_path = out_dir / "batch_log.csv"
+    batch_log_failed_path = out_dir / "batch_log_failed.csv"
     grants_master_path = out_dir / "grants_plan_based_master.csv"
     compensation_master_path = out_dir / "compensation_table_master.csv"
     grants_by_cik_year_dir = out_dir / "grants_plan_based_by_cik_year"
@@ -1471,8 +1763,13 @@ def main() -> None:
     success_count = 0
     failed_count = 0
     ceo_total_populated = 0
+    supplemental_total_runs = 0
+    supplemental_ok_runs = 0
+    supplemental_failed_runs = 0
+    supplemental_fetch_failed_runs = 0
     all_grants_rows: list[dict[str, Any]] = []
     all_compensation_rows: list[dict[str, str]] = []
+    all_log_rows: list[dict[str, Any]] = []
 
     with (
         key_results_path.open("w", newline="", encoding="utf-8") as key_results_file,
@@ -1499,18 +1796,116 @@ def main() -> None:
 
         for index, cik in enumerate(ciks, start=1):
             log.info("[%d/%d] processing | cik=%s", index, len(ciks), cik)
-            process_result = cast(Any, process_cik(cik, args.model, args.no_db))
+            process_result = _call_process_cik(
+                cik=cik,
+                model=args.model,
+                skip_db=args.no_db,
+                fiscal_year_start=None,
+                fiscal_year_end=None,
+                filing_override=None,
+            )
             if isinstance(process_result, tuple) and len(process_result) == 3:
-                result_row, log_row, grants_rows = process_result
+                result_row, base_log_row_raw, grants_rows = process_result
                 compensation_rows: list[dict[str, str]] = []
             else:
-                result_row, log_row, grants_rows, compensation_rows = process_result
+                result_row, base_log_row_raw, grants_rows, compensation_rows = process_result
+
+            base_log_row = _enrich_log_row(
+                base_log_row_raw,
+                run_scope="base",
+                filing=None,
+                cik=cik,
+                company_name=str(result_row.get("company_name", "") or ""),
+            )
+
+            grants_rows_to_write: list[dict[str, Any]] = []
+            compensation_rows_to_write: list[dict[str, str]] = []
+            supplemental_log_rows: list[dict[str, Any]] = []
+            if fiscal_year_start is not None and fiscal_year_end is not None:
+                for target_year in range(fiscal_year_start, fiscal_year_end + 1):
+                    supplemental_total_runs += 1
+                    log.info(
+                        "[%d/%d] supplemental year extract | cik=%s fiscal_year=%d",
+                        index,
+                        len(ciks),
+                        cik,
+                        target_year,
+                    )
+                    try:
+                        year_filing = fetcher.fetch_def14a_for_fiscal_year(cik, target_year)
+                    except Exception as year_fetch_exc:  # noqa: BLE001
+                        supplemental_fetch_failed_runs += 1
+                        supplemental_failed_runs += 1
+                        supplemental_log_rows.append(
+                            _enrich_log_row(
+                                raw_log_row={},
+                                run_scope="supplemental",
+                                target_fiscal_year=target_year,
+                                filing=None,
+                                override_status="failed",
+                                override_error=f"supplemental_filing_fetch_failed: {year_fetch_exc}",
+                                cik=cik,
+                                company_name=str(result_row.get("company_name", "") or ""),
+                            )
+                        )
+                        log.warning(
+                            "supplemental_filing_fetch_failed | cik=%s fiscal_year=%d error=%s",
+                            cik,
+                            target_year,
+                            year_fetch_exc,
+                        )
+                        continue
+                    year_process_result = _call_process_cik(
+                        cik=cik,
+                        model=args.model,
+                        skip_db=True,  # Avoid repeated DB writes while sweeping year-specific table outputs.
+                        fiscal_year_start=target_year,
+                        fiscal_year_end=target_year,
+                        filing_override=year_filing,
+                    )
+                    if isinstance(year_process_result, tuple) and len(year_process_result) == 3:
+                        _, year_log_row_raw, year_grants_rows = year_process_result
+                        year_compensation_rows: list[dict[str, str]] = []
+                    else:
+                        _, year_log_row_raw, year_grants_rows, year_compensation_rows = year_process_result
+                    year_log_row = _enrich_log_row(
+                        raw_log_row=year_log_row_raw,
+                        run_scope="supplemental",
+                        target_fiscal_year=target_year,
+                        filing=year_filing,
+                        cik=cik,
+                    )
+                    supplemental_log_rows.append(year_log_row)
+                    log.info(
+                        "supplemental year result | cik=%s fiscal_year=%d status=%s method=%s grants_rows=%d compensation_rows=%d error=%s",
+                        cik,
+                        target_year,
+                        str(year_log_row.get("status", "") or ""),
+                        str(year_log_row.get("extraction_method", "") or ""),
+                        len(year_grants_rows),
+                        len(year_compensation_rows),
+                        str(year_log_row.get("error", "") or ""),
+                    )
+                    if str(year_log_row.get("status", "")).lower() == "ok":
+                        supplemental_ok_runs += 1
+                    else:
+                        supplemental_failed_runs += 1
+                    grants_rows_to_write.extend(year_grants_rows)
+                    compensation_rows_to_write.extend(year_compensation_rows)
+            else:
+                grants_rows_to_write = grants_rows
+                compensation_rows_to_write = compensation_rows
+
             kr_writer.writerow(result_row)
-            log_writer.writerow(log_row)
-            for grants_row in grants_rows:
+            log_writer.writerow(base_log_row)
+            all_log_rows.append(dict(base_log_row))
+            for supplemental_log_row in supplemental_log_rows:
+                log_writer.writerow(supplemental_log_row)
+                all_log_rows.append(dict(supplemental_log_row))
+            for grants_row in grants_rows_to_write:
                 grants_writer.writerow(grants_row)
                 all_grants_rows.append(grants_row)
-            for compensation_row in compensation_rows:
+            for compensation_row in compensation_rows_to_write:
                 compensation_writer.writerow(compensation_row)
                 all_compensation_rows.append(compensation_row)
             key_results_file.flush()
@@ -1561,15 +1956,28 @@ def main() -> None:
             for row in rows:
                 writer.writerow(row)
 
+    failed_log_rows = [row for row in all_log_rows if str(row.get("status", "")).lower() != "ok"]
+    with batch_log_failed_path.open("w", newline="", encoding="utf-8") as failed_log_file:
+        failed_writer = csv.DictWriter(failed_log_file, fieldnames=BATCH_LOG_COLUMNS)
+        failed_writer.writeheader()
+        for row in failed_log_rows:
+            failed_writer.writerow(row)
+
     log.info(
-        "batch complete | success=%d failed=%d ceo_total_populated=%d/%d",
+        "batch complete | base_success=%d base_failed=%d ceo_total_populated=%d/%d "
+        "supplemental_total=%d supplemental_ok=%d supplemental_failed=%d fetch_failed=%d",
         success_count,
         failed_count,
         ceo_total_populated,
         len(ciks),
+        supplemental_total_runs,
+        supplemental_ok_runs,
+        supplemental_failed_runs,
+        supplemental_fetch_failed_runs,
     )
     log.info("key_results -> %s", key_results_path)
     log.info("batch_log   -> %s", batch_log_path)
+    log.info("batch_log_failed -> %s (rows=%d)", batch_log_failed_path, len(failed_log_rows))
     log.info("grants master -> %s", grants_master_path)
     log.info("grants by cik/year -> %s", grants_by_cik_year_dir)
     log.info("compensation master -> %s", compensation_master_path)

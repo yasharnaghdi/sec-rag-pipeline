@@ -264,6 +264,36 @@ def _select_latest_form_entry(entries: list[_FilingIndexEntry], form_type: str) 
     return sorted(candidates, key=_sort_key, reverse=True)[0]
 
 
+def _infer_fiscal_year_from_filing_date(filing_date: date | None) -> int | None:
+    if filing_date is None:
+        return None
+    if filing_date.month <= 8:
+        return filing_date.year - 1
+    return filing_date.year
+
+
+def _select_form_entry_for_fiscal_year(
+    entries: list[_FilingIndexEntry],
+    form_type: str,
+    fiscal_year: int,
+) -> _FilingIndexEntry | None:
+    """Pick the most recent filing entry mapped to a target fiscal year."""
+    target_form = _normalize_form_type(form_type)
+    candidates = [
+        entry
+        for entry in entries
+        if _normalize_form_type(entry.form) == target_form
+        and _infer_fiscal_year_from_filing_date(entry.filing_date) == fiscal_year
+    ]
+    if not candidates:
+        return None
+
+    def _sort_key(entry: _FilingIndexEntry) -> tuple[date, str]:
+        return (entry.filing_date or date.min, entry.accession_number)
+
+    return sorted(candidates, key=_sort_key, reverse=True)[0]
+
+
 def _fetch_entry_filing(
     cik_digits: str,
     cik_padded: str,
@@ -393,6 +423,50 @@ def fetch_latest_def14a(
         matched_entry = _select_latest_form_entry(entries, "DEF 14A")
         if matched_entry is None:
             msg = f"No DEF 14A found for CIK={cik_digits}"
+            raise ValueError(msg)
+
+        return _fetch_entry_filing(
+            cik_digits,
+            cik_padded,
+            matched_entry,
+            http,
+            company_name=company_name,
+            ticker=ticker,
+        )
+    finally:
+        if owns_session:
+            http.close()
+
+
+def fetch_def14a_for_fiscal_year(
+    cik: str,
+    fiscal_year: int,
+    *,
+    session: requests.Session | None = None,
+) -> FetchedFiling:
+    """Fetch the most recent DEF 14A whose filing date maps to the target fiscal year."""
+    if fiscal_year < 1000 or fiscal_year > 9999:
+        raise ValueError("fiscal_year must be a 4-digit year")
+
+    cik_digits = _extract_digits(cik)
+    if not cik_digits:
+        raise ValueError("cik must include at least one digit")
+
+    cik_padded = cik_digits.zfill(10)
+    submissions_url = f"{_SEC_DATA_BASE}/submissions/CIK{cik_padded}.json"
+
+    owns_session = session is None
+    http = session or requests.Session()
+    try:
+        log.info("Fetching submissions index: %s", submissions_url)
+        submissions_payload = _get_json(submissions_url, http)
+        company_name, ticker = _extract_company_identity(submissions_payload)
+        entries = _extract_entries(submissions_payload)
+        entries.extend(_fetch_historical_submission_entries(submissions_payload, http))
+
+        matched_entry = _select_form_entry_for_fiscal_year(entries, "DEF 14A", fiscal_year)
+        if matched_entry is None:
+            msg = f"No DEF 14A found for CIK={cik_digits} fiscal_year={fiscal_year}"
             raise ValueError(msg)
 
         return _fetch_entry_filing(

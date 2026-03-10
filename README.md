@@ -175,7 +175,7 @@ output/                 generated batch artifacts
 | --- | --- | --- |
 | 0 | Done | HTML parsing, SEC block modeling, fixture-based ingestion |
 | 1 | Done | Batch extraction, compensation outputs, Ollama fallback, S&P 500 manifest workflow |
-| 2 | In progress | SEC-aware chunking and Voyage Finance-2 embedding pipeline |
+| 2 | In progress | SEC-aware chunking and OpenAI embedding pipeline |
 | 3 | Done (schema) | PostgreSQL schema, chunk writer, and storage migration groundwork |
 | 4 | Planned | Hybrid retrieval over PostgreSQL + Qdrant |
 | 5 | Planned | API query layer and citation-grounded generation |
