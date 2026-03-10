@@ -167,10 +167,16 @@ _GRANTS_EQUITY_HINTS = {
 _GRANTS_TYPE_ROW_HINTS = {
     "incentive plan",
     "annual incentive award",
+    "annual stip bonus",
+    "stip bonus",
     "performance restricted stock unit",
     "performance-based rsu",
     "performance based rsu",
     "prsu",
+    "annual psu grant",
+    "psu grant",
+    "annual rsu grant",
+    "rsu grant",
     "time-based rsu",
     "time based rsu",
     "time-lapse rsu",
@@ -309,28 +315,73 @@ def _row_text(row: list[str]) -> str:
     return _normalise(" ".join(_non_empty_cells(row)))
 
 
+def _header_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text))
+
+
+def _has_tokens(text: str, *required: str) -> bool:
+    tokens = _header_tokens(text)
+    return all(token in tokens for token in required)
+
+
+def _is_non_equity_grants_context(text: str) -> bool:
+    tokens = _header_tokens(text)
+    return (
+        all(token in tokens for token in ("non", "equity", "incentive", "plan"))
+        and ("award" in tokens or "awards" in tokens)
+    )
+
+
+def _is_equity_grants_context(text: str) -> bool:
+    tokens = _header_tokens(text)
+    return (
+        "non" not in tokens
+        and all(token in tokens for token in ("equity", "incentive", "plan"))
+        and ("award" in tokens or "awards" in tokens)
+    )
+
+
 def _infer_grants_header_rows(table_block: TableBlock) -> int:
     """Infer grants header depth even when parser reports header_row_count=0."""
     if not table_block.rows:
         return 0
 
-    max_scan = min(6, len(table_block.rows))
+    max_scan = min(12, len(table_block.rows))
     subheader_index: int | None = None
+    triplet_row_index: int | None = None
+    name_date_row_index: int | None = None
     for index in range(max_scan):
         text = _row_text(table_block.rows[index])
         if not text:
             continue
-        if "name" in text and "grant date" in text and ("threshold" in text or "target" in text or "maximum" in text):
+        row_tokens = _header_tokens(text)
+        has_name = ("name" in text) or ("named executive officer" in text)
+        has_grant_date = ("grant date" in text) or _has_tokens(text, "grant", "date")
+        has_date_signal = has_grant_date or ("date" in row_tokens)
+        has_triplet = any(token in row_tokens for token in ("threshold", "target", "maximum"))
+        if has_name and has_grant_date and has_triplet:
             subheader_index = index
             break
+        if has_triplet and triplet_row_index is None:
+            triplet_row_index = index
+        if has_name and has_date_signal and name_date_row_index is None:
+            name_date_row_index = index
+
+    if (
+        subheader_index is None
+        and triplet_row_index is not None
+        and name_date_row_index is not None
+        and abs(triplet_row_index - name_date_row_index) <= 4
+    ):
+        subheader_index = max(triplet_row_index, name_date_row_index)
 
     if subheader_index is not None:
         return max(1, subheader_index + 1)
 
     # Fallback when no clear subheader row is detected.
     if table_block.header_row_count > 0:
-        return min(table_block.header_row_count, len(table_block.rows))
-    return min(2, len(table_block.rows))
+        return min(max(1, table_block.header_row_count), len(table_block.rows))
+    return min(4, len(table_block.rows))
 
 
 def _grants_data_rows_with_index(table_block: TableBlock) -> list[tuple[int, list[str]]]:
@@ -351,7 +402,7 @@ def _build_grants_column_map(
         return []
 
     resolved_header_rows = header_rows if header_rows is not None else _infer_grants_header_rows(table_block)
-    resolved_header_rows = min(max(1, resolved_header_rows), len(table_block.rows), 6)
+    resolved_header_rows = min(max(1, resolved_header_rows), len(table_block.rows), 12)
     header_slice = table_block.rows[:resolved_header_rows]
     column_count = max((len(row) for row in header_slice), default=0)
 
@@ -360,11 +411,13 @@ def _build_grants_column_map(
         last_group: str | None = None
         for column_index in range(column_count):
             cell = _normalise(row[column_index]) if column_index < len(row) else ""
-            if _contains_any(cell, _GRANTS_NON_EQUITY_HINTS):
+            if _contains_any(cell, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(cell):
                 last_group = "non_equity"
                 group_context[column_index] = "non_equity"
                 continue
-            if _contains_any(cell, _GRANTS_EQUITY_HINTS) and "non-equity" not in cell and "non equity" not in cell:
+            if (_contains_any(cell, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(cell)) and (
+                "non-equity" not in cell and "non equity" not in cell
+            ):
                 last_group = "equity"
                 group_context[column_index] = "equity"
                 continue
@@ -393,10 +446,10 @@ def _build_grants_column_map(
         elif _contains_any(combined_header, _GRANTS_GRANT_TYPE_HINTS):
             canonical = "grant_type"
         elif "grant date fair value" in combined_header or (
-            "fair value" in combined_header and "grant date" in combined_header
+            "fair value" in combined_header and ("grant date" in combined_header or _has_tokens(combined_header, "grant", "date"))
         ):
             canonical = "grant_date_fair_value"
-        elif "grant date" in combined_header:
+        elif "grant date" in combined_header or _has_tokens(combined_header, "grant", "date"):
             canonical = "grant_date"
         elif "all other stock awards" in combined_header or (
             "stock awards" in combined_header and "number of shares" in combined_header
@@ -407,27 +460,27 @@ def _build_grants_column_map(
         elif "exercise or base price" in combined_header or "exercise price" in combined_header:
             canonical = "exercise_or_base_price"
         elif "threshold" in combined_header:
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS):
+            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_threshold"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS):
+            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
                 canonical = "equity_threshold"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_threshold"
             elif group_context[column_index] == "equity":
                 canonical = "equity_threshold"
         elif "target" in combined_header:
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS):
+            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_target"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS):
+            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
                 canonical = "equity_target"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_target"
             elif group_context[column_index] == "equity":
                 canonical = "equity_target"
         elif "maximum" in combined_header or " max " in f" {combined_header} ":
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS):
+            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_maximum"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS):
+            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
                 canonical = "equity_maximum"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_maximum"

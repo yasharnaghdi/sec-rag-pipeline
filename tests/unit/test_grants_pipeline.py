@@ -283,6 +283,46 @@ def test_extract_grants_selected_table_without_heading_handles_header_row_count_
     assert extracted[1]["equity_target"] == pytest.approx(600.0)
 
 
+def test_extract_grants_handles_deep_split_header_and_stip_psu_rows() -> None:
+    rows = [
+        ["", "", "", "", "", "", "", "", "", "", "", ""],
+        ["GRANT", "", "", "", "", "", "", "", "", "", "", ""],
+        ["ALL OTHER", "", "", "", "", "", "DATE", "", "", "", "", ""],
+        ["ESTIMATED FUTURE PAYOUTS", "", "", "", "", "", "", "", "", "", "", ""],
+        ["UNDER NON-EQUITY", "", "", "", "", "", "", "", "", "", "", ""],
+        ["INCENTIVE", "", "", "", "", "", "", "", "", "", "", ""],
+        ["PLAN AWARDS", "", "", "", "", "", "", "", "", "", "", ""],
+        ["THRESHOLD", "TARGET", "MAXIMUM", "THRESHOLD", "TARGET", "MAXIMUM", "", "", "", "", "", ""],
+        [
+            "NAMED EXECUTIVE OFFICER",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "GRANT DATE",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+        ["Jane Doe", "", "", "", "", "", "", "", "", "", "", ""],
+        ["Annual STIP Bonus", "100", "200", "300", "", "", "2024-01-01", "", "", "", "", ""],
+        ["Annual PSU Grant", "", "", "", "400", "500", "2024-02-01", "", "", "", "", ""],
+    ]
+    table = _table(rows, section_id="prose-sec", order_index=1, header_row_count=0)
+    extracted = extract_grants_plan_based([table], {"cik": "0000001"}, selected_table=table)
+
+    assert len(extracted) == 2
+    assert extracted[0]["exec_name"] == "Jane Doe"
+    assert extracted[0]["grant_type"] == "Annual STIP Bonus"
+    assert extracted[0]["grant_date"] == "2024-01-01"
+    assert extracted[1]["exec_name"] == "Jane Doe"
+    assert extracted[1]["grant_type"] == "Annual PSU Grant"
+    assert extracted[1]["grant_date"] == "2024-02-01"
+
+
 def test_main_writes_grants_master_and_per_cik_year_csvs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     input_path = tmp_path / "input.csv"
     with input_path.open("w", newline="", encoding="utf-8") as handle:
