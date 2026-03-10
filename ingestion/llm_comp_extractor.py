@@ -199,36 +199,44 @@ EXTRACTION RULES:
 1. If a target fiscal year is provided in the user message, extract values
    for that fiscal year only. Otherwise use the most recent fiscal year
    present in the table.
-2. Map executives to roles using title keywords:
-   - ceo: title contains "Chief Executive Officer" or "CEO"
-   - cfo: title contains "Chief Financial Officer" or "CFO"
-   - coo: title contains "Chief Operating Officer" or "COO"
-   - If a role has multiple candidates, select the one with the highest total.
-   - If no CEO but a "President" exists with no CEO, map President -> ceo.
-   - Remaining executives (up to 2) -> other1, other2 (highest total first).
-3. salary, bonus, stock_awards, option_awards, non_equity_incentive,
-   pension_change, other_comp, total must be plain digit
-   strings without currency symbols or commas (e.g. "1250000").
-   Use null if the value is missing, zero, or a dash.
-4. footnotes should contain row-level footnote refs/text when available;
-   otherwise use null.
-5. fiscal_year should be a 4-digit year string (e.g. "2023").
+2. Field-to-column mapping is strict. Extract each JSON field from the exact
+   Summary Compensation Table column with the same meaning:
+   - salary -> "Salary ($)"
+   - bonus -> "Bonus Awards ($)" (bonus column only)
+   - stock_awards -> "Stock Awards ($)"
+   - option_awards -> "Option Awards ($)"
+   - non_equity_incentive -> "Non-Equity Incentive Plan Compensation ($)"
+   - pension_change -> "Change in pension value and nonqualified deferred compensation earnings ($)"
+   - other_comp -> "All Other Compensation ($)" only
+   - total -> "Total ($)"
+   - footnotes -> row-specific footnote refs/text only ("Extra information")
+3. NEVER swap columns:
+   - Do not put non-equity incentive amounts into bonus.
+   - Do not put bonus amounts into non_equity_incentive.
+   - Do not put stock awards into option_awards.
+   - Do not put option awards into stock_awards.
+   - Do not copy total into any component field.
+   - Do not set other_comp from total.
+   - Do not calculate other_comp as a residual (e.g. total minus other fields).
+   - If the "All Other Compensation" cell is blank/missing/dash, set other_comp = null.
+   - other_comp can equal total only when the source row explicitly shows the same
+     number in both "All Other Compensation" and "Total" columns.
+4. salary, bonus, stock_awards, option_awards, non_equity_incentive,
+   pension_change, other_comp, total must be plain digit strings without
+   currency symbols or commas (e.g. "1250000"). Use null if the value is
+   missing, zero, a dash, or the table cell is blank.
+5. fiscal_year should be a 4-digit year string (e.g. "2023") and must come
+   from the table row/year header, not from filing metadata.
 6. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
 7. Do NOT invent values. If data is absent, use empty string or null.
-8. Return ONLY the JSON object. No prose, no markdown code fences.
-9. Do NOT infer fiscal year from filing date. Use explicit year values from
+8. Keep compatibility keys exactly:
+   - Top-level keys: ceo, cfo, coo, other1, other2, confidence, notes
+   - Each role key must contain: name, title, salary, bonus, stock_awards,
+     option_awards, non_equity_incentive, pension_change, other_comp, total,
+     footnotes, fiscal_year
+9. Return ONLY the JSON object. No prose, no markdown code fences.
+10. Do NOT infer fiscal year from filing date. Use explicit year values from
    the table rows.
-
-REQUIRED JSON SCHEMA:
-{
-  "ceo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
-  "cfo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
-  "coo":   {"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
-  "other1":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
-  "other2":{"name":"","title":"","salary":null,"bonus":null,"stock_awards":null,"option_awards":null,"non_equity_incentive":null,"pension_change":null,"other_comp":null,"total":null,"footnotes":null,"fiscal_year":""},
-  "confidence": 0.0,
-  "notes": ""
-}
 """
 
 _RETRY_SYSTEM_PROMPT = """\
