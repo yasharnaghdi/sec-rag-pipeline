@@ -376,6 +376,27 @@ def _call_process_cik(
     )
 
 
+def _extract_summary_compensation_rows(
+    blocks: list[BaseBlock],
+    meta: dict[str, Any],
+    selected_table: TableBlock | None,
+) -> list[dict[str, Any]]:
+    """Call deterministic summary comp extractor with signature compatibility."""
+    extract_fn = cast(Any, det_extractor.extract_summary_compensation)
+    has_selected_table_param = False
+    try:
+        has_selected_table_param = "selected_table" in inspect.signature(extract_fn).parameters
+    except (TypeError, ValueError):
+        has_selected_table_param = False
+
+    if selected_table is not None and has_selected_table_param:
+        return cast(
+            list[dict[str, Any]],
+            extract_fn(blocks, meta, selected_table=selected_table),
+        )
+    return cast(list[dict[str, Any]], extract_fn(blocks, meta))
+
+
 def _enrich_log_row(
     raw_log_row: dict[str, Any],
     *,
@@ -770,29 +791,30 @@ def _role_fiscal_year(
 
 
 def _det_rows_have_comp_payload(det_rows: list[dict[str, Any]]) -> bool:
-    """Return True when deterministic rows contain at least one real comp value."""
-    comp_fields = (
-        "salary",
-        "bonus",
-        "stock_awards",
-        "option_awards",
-        "non_equity_incentive",
-        "pension_change",
-        "other_comp",
-        "total",
-    )
+    """Return True only for rows that look like real named-exec compensation."""
     empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
 
+    def _has_numeric_amount(value: Any) -> bool:
+        if isinstance(value, (int, float)):
+            return True
+        text = str(value or "").strip().lower()
+        if not text or text in empty_markers:
+            return False
+        return any(char.isdigit() for char in text)
+
+    has_year_signal = any(
+        bool(re.fullmatch(r"\d{4}", str(row.get("year", "") or "").strip()))
+        for row in det_rows
+    )
+    if not has_year_signal:
+        return False
+
     for row in det_rows:
-        for field in comp_fields:
-            value = row.get(field)
-            if isinstance(value, (int, float)):
-                return True
-            text = str(value or "").strip().lower()
-            if not text or text in empty_markers:
-                continue
-            if any(char.isdigit() for char in text):
-                return True
+        exec_name = str(row.get("exec_name", "") or "").strip()
+        if not exec_name:
+            continue
+        if _has_numeric_amount(row.get("salary")) or _has_numeric_amount(row.get("total")):
+            return True
     return False
 
 
@@ -1265,6 +1287,10 @@ def process_cik(
     t0 = time.monotonic()
     grants_rows_out: list[dict[str, Any]] = []
     compensation_rows_out: list[dict[str, str]] = []
+    source_filing_date = ""
+    source_accession_number = ""
+    source_filing_url = ""
+    source_ticker = ""
 
     def _failed(
         reason: str,
@@ -1277,6 +1303,10 @@ def process_cik(
             {
                 "cik": cik,
                 "company_name": company_name,
+                "ticker": source_ticker,
+                "filing_date": source_filing_date,
+                "accession_number": source_accession_number,
+                "filing_url": source_filing_url,
                 "extraction_method": "failed",
                 "cda_token_count": 0,
                 "pay_for_performance_flag": False,
@@ -1288,6 +1318,9 @@ def process_cik(
         log_row: dict[str, Any] = {
             "cik": cik,
             "company_name": company_name,
+            "source_filing_date": source_filing_date,
+            "source_accession_number": source_accession_number,
+            "source_filing_url": source_filing_url,
             "status": "failed",
             "extraction_method": "failed",
             "block_count": 0,
@@ -1320,6 +1353,10 @@ def process_cik(
 
     company_name = str(getattr(filing, "company_name", "") or "")
     ticker = str(getattr(filing, "ticker", "") or "")
+    source_filing_date = str(getattr(filing, "filing_date", "") or "")
+    source_accession_number = str(getattr(filing, "accession_number", "") or "")
+    source_filing_url = str(getattr(filing, "filing_url", "") or "")
+    source_ticker = ticker
 
     try:
         doc_meta = DocumentMetadata(
@@ -1419,7 +1456,7 @@ def process_cik(
     roles: dict[str, Any] = {}
 
     try:
-        det_rows = det_extractor.extract_summary_compensation(blocks, meta_dict)
+        det_rows = _extract_summary_compensation_rows(blocks, meta_dict, comp_table)
     except Exception as exc:  # noqa: BLE001
         return _failed(
             f"deterministic_extract_failed: {exc}",
@@ -1618,6 +1655,9 @@ def process_cik(
     log_row: dict[str, Any] = {
         "cik": cik,
         "company_name": company_name,
+        "source_filing_date": str(filing.filing_date or ""),
+        "source_accession_number": filing.accession_number,
+        "source_filing_url": filing.filing_url,
         "status": "ok",
         "extraction_method": extraction_method,
         "block_count": block_count,
@@ -1767,6 +1807,7 @@ def main() -> None:
     supplemental_ok_runs = 0
     supplemental_failed_runs = 0
     supplemental_fetch_failed_runs = 0
+    supplemental_skipped_runs = 0
     all_grants_rows: list[dict[str, Any]] = []
     all_compensation_rows: list[dict[str, str]] = []
     all_log_rows: list[dict[str, Any]] = []
@@ -1835,15 +1876,23 @@ def main() -> None:
                         year_filing = fetcher.fetch_def14a_for_fiscal_year(cik, target_year)
                     except Exception as year_fetch_exc:  # noqa: BLE001
                         supplemental_fetch_failed_runs += 1
-                        supplemental_failed_runs += 1
+                        year_fetch_error = str(year_fetch_exc)
+                        missing_year_filing = "No DEF 14A found" in year_fetch_error
+                        status = "skipped" if missing_year_filing else "failed"
+                        if missing_year_filing:
+                            supplemental_skipped_runs += 1
+                            error_msg = f"supplemental_filing_not_found_for_year: {year_fetch_exc}"
+                        else:
+                            supplemental_failed_runs += 1
+                            error_msg = f"supplemental_filing_fetch_failed: {year_fetch_exc}"
                         supplemental_log_rows.append(
                             _enrich_log_row(
                                 raw_log_row={},
                                 run_scope="supplemental",
                                 target_fiscal_year=target_year,
                                 filing=None,
-                                override_status="failed",
-                                override_error=f"supplemental_filing_fetch_failed: {year_fetch_exc}",
+                                override_status=status,
+                                override_error=error_msg,
                                 cik=cik,
                                 company_name=str(result_row.get("company_name", "") or ""),
                             )
@@ -1888,6 +1937,8 @@ def main() -> None:
                     )
                     if str(year_log_row.get("status", "")).lower() == "ok":
                         supplemental_ok_runs += 1
+                    elif str(year_log_row.get("status", "")).lower() == "skipped":
+                        supplemental_skipped_runs += 1
                     else:
                         supplemental_failed_runs += 1
                     grants_rows_to_write.extend(year_grants_rows)
@@ -1956,7 +2007,7 @@ def main() -> None:
             for row in rows:
                 writer.writerow(row)
 
-    failed_log_rows = [row for row in all_log_rows if str(row.get("status", "")).lower() != "ok"]
+    failed_log_rows = [row for row in all_log_rows if str(row.get("status", "")).lower() == "failed"]
     with batch_log_failed_path.open("w", newline="", encoding="utf-8") as failed_log_file:
         failed_writer = csv.DictWriter(failed_log_file, fieldnames=BATCH_LOG_COLUMNS)
         failed_writer.writeheader()
@@ -1965,7 +2016,7 @@ def main() -> None:
 
     log.info(
         "batch complete | base_success=%d base_failed=%d ceo_total_populated=%d/%d "
-        "supplemental_total=%d supplemental_ok=%d supplemental_failed=%d fetch_failed=%d",
+        "supplemental_total=%d supplemental_ok=%d supplemental_failed=%d supplemental_skipped=%d fetch_failed=%d",
         success_count,
         failed_count,
         ceo_total_populated,
@@ -1973,6 +2024,7 @@ def main() -> None:
         supplemental_total_runs,
         supplemental_ok_runs,
         supplemental_failed_runs,
+        supplemental_skipped_runs,
         supplemental_fetch_failed_runs,
     )
     log.info("key_results -> %s", key_results_path)

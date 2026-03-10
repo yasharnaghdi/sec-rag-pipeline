@@ -716,8 +716,14 @@ def _extract_table(
 def extract_summary_compensation(
     blocks: list[BaseBlock],
     meta: Mapping[str, Any],
+    *,
+    selected_table: TableBlock | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract Summary Compensation Table rows."""
+    """Extract Summary Compensation Table rows.
+
+    When ``selected_table`` is provided, only rows originating from that
+    specific table block are returned.
+    """
     raw_rows = _extract_table(
         blocks,
         _TABLE_SIGNATURES["summary_compensation"],
@@ -760,7 +766,11 @@ def extract_summary_compensation(
             continue
         valid_rows.extend(table_rows)
 
-    return valid_rows
+    if selected_table is None:
+        return valid_rows
+
+    selected_id = selected_table.id
+    return [row for row in valid_rows if str(row.get("table_block_id", "") or "") == selected_id]
 
 
 def extract_equity_awards(
