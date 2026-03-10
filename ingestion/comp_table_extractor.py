@@ -100,7 +100,9 @@ _SUMMARY_COMP_COLS: dict[str, list[str]] = {
     "non_equity_incentive": [
         "non-equity incentive",
         "non equity incentive",
+        "nonequity incentive",
         "non-equity incentive plan compensation",
+        "nonequity incentive plan compensation",
         "annual incentive",
     ],
     "pension_change": ["change in pension", "pension value", "nonqualified deferred"],
@@ -202,7 +204,10 @@ _PENSION_COLS: dict[str, list[str]] = {
 
 
 def _normalise(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip().lower())
+    # Normalize wrapped header tokens like "Compensa-tion" -> "compensation".
+    compact = value.replace("\u00ad", "")
+    compact = re.sub(r"(?<=\w)-\s*(?=\w)", "", compact)
+    return re.sub(r"\s+", " ", compact.strip().lower())
 
 
 def clean_numeric(val: str) -> float | None:
@@ -274,13 +279,18 @@ def _build_column_map(
     table_block: TableBlock,
     schema: dict[str, list[str]],
     allow_duplicates: set[str] | None = None,
+    header_rows: int | None = None,
 ) -> list[str | None]:
     if not table_block.rows:
         return []
 
-    header_rows = table_block.header_row_count if table_block.header_row_count > 0 else 1
-    header_rows = min(header_rows, len(table_block.rows))
-    header_slice = table_block.rows[:header_rows]
+    resolved_header_rows = (
+        header_rows
+        if header_rows is not None
+        else (table_block.header_row_count if table_block.header_row_count > 0 else 1)
+    )
+    resolved_header_rows = min(max(1, resolved_header_rows), len(table_block.rows))
+    header_slice = table_block.rows[:resolved_header_rows]
     column_count = max((len(row) for row in header_slice), default=0)
 
     column_map: list[str | None] = []
@@ -382,6 +392,24 @@ def _infer_grants_header_rows(table_block: TableBlock) -> int:
     if table_block.header_row_count > 0:
         return min(max(1, table_block.header_row_count), len(table_block.rows))
     return min(4, len(table_block.rows))
+
+
+def _infer_summary_header_rows(table_block: TableBlock) -> int:
+    """Infer summary compensation header depth when parser reports 0."""
+    if not table_block.rows:
+        return 0
+
+    max_scan = min(8, len(table_block.rows))
+    for index in range(max_scan):
+        text = _row_text(table_block.rows[index])
+        if not text:
+            continue
+        if "name" in text and "year" in text and ("salary" in text or "total" in text):
+            return max(1, index + 1)
+
+    if table_block.header_row_count > 0:
+        return min(max(1, table_block.header_row_count), len(table_block.rows))
+    return min(2, len(table_block.rows))
 
 
 def _grants_data_rows_with_index(table_block: TableBlock) -> list[tuple[int, list[str]]]:
@@ -766,6 +794,61 @@ def _extract_table(
     return results
 
 
+def _resolve_summary_source_section(blocks: list[BaseBlock], table_block: TableBlock) -> str:
+    heading_by_id = _index_headings(blocks)
+    for index, block in enumerate(blocks):
+        if not isinstance(block, TableBlock) or block.id != table_block.id:
+            continue
+        source_heading = _resolve_source_heading(
+            blocks,
+            index,
+            table_block,
+            _TABLE_SIGNATURES["summary_compensation"],
+            heading_by_id,
+        )
+        if source_heading is not None:
+            return source_heading
+        break
+    return "summary compensation table"
+
+
+def _extract_summary_from_table_block(
+    blocks: list[BaseBlock],
+    table_block: TableBlock,
+    meta: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    header_rows = _infer_summary_header_rows(table_block)
+    column_map = _build_column_map(
+        table_block,
+        _SUMMARY_COMP_COLS,
+        allow_duplicates=_SUMMARY_COMP_REQUIRED_NUMERIC_COLS,
+        header_rows=header_rows,
+    )
+    if not column_map or not _summary_table_has_comp_columns(column_map):
+        return []
+
+    footnotes_by_table = _index_footnotes(blocks)
+    footnotes = _collect_table_footnotes(table_block, footnotes_by_table)
+    source_section = _resolve_summary_source_section(blocks, table_block)
+
+    rows_out: list[dict[str, Any]] = []
+    data_start = min(max(1, header_rows), len(table_block.rows))
+    for row in table_block.rows[data_start:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        rows_out.append(
+            _map_row(
+                row=row,
+                column_map=column_map,
+                metadata=meta,
+                footnotes=footnotes,
+                source_section=source_section,
+                table_block_id=table_block.id,
+            )
+        )
+    return rows_out
+
+
 def extract_summary_compensation(
     blocks: list[BaseBlock],
     meta: Mapping[str, Any],
@@ -788,6 +871,12 @@ def extract_summary_compensation(
             allow_duplicates=_SUMMARY_COMP_REQUIRED_NUMERIC_COLS,
         ),
     )
+    if selected_table is not None:
+        selected_id = selected_table.id
+        has_selected_rows = any(str(row.get("table_block_id", "") or "") == selected_id for row in raw_rows)
+        if not has_selected_rows:
+            raw_rows.extend(_extract_summary_from_table_block(blocks, selected_table, meta))
+
     if not raw_rows:
         return []
 
@@ -810,10 +899,12 @@ def extract_summary_compensation(
         table = table_by_id.get(table_id)
         if table is None:
             continue
+        header_rows = _infer_summary_header_rows(table)
         column_map = _build_column_map(
             table,
             _SUMMARY_COMP_COLS,
             allow_duplicates=_SUMMARY_COMP_REQUIRED_NUMERIC_COLS,
+            header_rows=header_rows,
         )
         if not _summary_table_has_comp_columns(column_map):
             continue

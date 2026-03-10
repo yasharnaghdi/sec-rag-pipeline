@@ -820,6 +820,28 @@ def _det_rows_have_comp_payload(det_rows: list[dict[str, Any]]) -> bool:
 
 def _llm_result_has_comp_payload(result: Any) -> bool:
     """Return True if LLM result contains at least one populated role value."""
+    llm_rows = getattr(result, "rows", None)
+    if isinstance(llm_rows, list):
+        for row in llm_rows:
+            if not isinstance(row, ExecCompRecord):
+                continue
+            values = [
+                str(row.name or "").strip(),
+                str(row.title or "").strip(),
+                str(row.salary or "").strip(),
+                str(row.bonus or "").strip(),
+                str(row.stock_awards or "").strip(),
+                str(row.option_awards or "").strip(),
+                str(row.non_equity_incentive or "").strip(),
+                str(row.pension_change or "").strip(),
+                str(row.other_comp or "").strip(),
+                str(row.total or "").strip(),
+                str(row.footnotes or "").strip(),
+                str(row.fiscal_year or "").strip(),
+            ]
+            if any(values):
+                return True
+
     roles = [
         getattr(result, "ceo", None),
         getattr(result, "cfo", None),
@@ -1287,6 +1309,24 @@ def _compensation_row_from_llm(
     }
 
 
+def _llm_record_to_det_row(record: ExecCompRecord, fallback_year: str) -> dict[str, Any]:
+    """Convert an LLM compensation record to deterministic row-like shape."""
+    return {
+        "exec_name": record.name.strip(),
+        "exec_title": record.title.strip(),
+        "year": _normalize_compensation_year(record.fiscal_year, fallback_year),
+        "salary": record.salary or "",
+        "bonus": record.bonus or "",
+        "stock_awards": record.stock_awards or "",
+        "option_awards": record.option_awards or "",
+        "non_equity_incentive": record.non_equity_incentive or "",
+        "pension_change": record.pension_change or "",
+        "other_comp": record.other_comp or "",
+        "total": record.total or "",
+        "footnote_refs": (record.footnotes or "").strip(),
+    }
+
+
 def _compensation_row_has_payload(row: dict[str, str]) -> bool:
     values = [
         row.get("Name", "").strip(),
@@ -1579,21 +1619,25 @@ def process_cik(
                 },
             )
         extraction_method = "llm"
-        roles = {
-            "ceo": llm_result.ceo,
-            "cfo": llm_result.cfo,
-            "coo": llm_result.coo,
-            "other1": llm_result.other1,
-            "other2": llm_result.other2,
-        }
+        llm_records: list[ExecCompRecord] = []
+        if isinstance(getattr(llm_result, "rows", None), list):
+            llm_records.extend(
+                row for row in llm_result.rows if isinstance(row, ExecCompRecord)
+            )
+        if not llm_records:
+            for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
+                role_record = getattr(llm_result, role_key, None)
+                if isinstance(role_record, ExecCompRecord):
+                    llm_records.append(role_record)
+
         llm_rows_in_range = 0
-        for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
-            role_record = roles[role_key]
-            if not isinstance(role_record, ExecCompRecord):
-                continue
-            resolved_year = _normalize_compensation_year(role_record.fiscal_year, inferred_comp_year)
+        llm_rows_for_roles: list[dict[str, Any]] = []
+        for role_record in llm_records:
+            resolved_year = _normalize_compensation_year(
+                role_record.fiscal_year,
+                inferred_comp_year,
+            )
             if not _is_within_fiscal_year_range(resolved_year, fiscal_year_start, fiscal_year_end):
-                roles[role_key] = ExecCompRecord()
                 continue
             output_row = _compensation_row_from_llm(
                 record=role_record,
@@ -1606,6 +1650,7 @@ def process_cik(
             if _compensation_row_has_payload(output_row):
                 compensation_rows_out.append(output_row)
                 llm_rows_in_range += 1
+                llm_rows_for_roles.append(_llm_record_to_det_row(role_record, inferred_comp_year))
         if llm_rows_in_range == 0:
             return _failed(
                 "no_comp_rows_in_fiscal_year_range",
@@ -1619,6 +1664,7 @@ def process_cik(
                     "llm_confidence": llm_confidence,
                 },
             )
+        roles = _collapse_to_roles(llm_rows_for_roles)
     else:
         return _failed(
             "no_comp_table_located",
@@ -1874,7 +1920,7 @@ def main() -> None:
         compensation_writer.writeheader()
 
         for index, cik in enumerate(ciks, start=1):
-            log.info("[%d/%d] processing | cik=%s", index, len(ciks), cik)
+            log.info("[%d/%d][Base] processing | cik=%s", index, len(ciks), cik)
             process_result = _call_process_cik(
                 cik=cik,
                 model=args.model,
@@ -1901,12 +1947,15 @@ def main() -> None:
             compensation_rows_to_write: list[dict[str, str]] = []
             supplemental_log_rows: list[dict[str, Any]] = []
             if fiscal_year_start is not None and fiscal_year_end is not None:
-                for target_year in range(fiscal_year_start, fiscal_year_end + 1):
+                total_years = fiscal_year_end - fiscal_year_start + 1
+                for year_index, target_year in enumerate(range(fiscal_year_start, fiscal_year_end + 1), start=1):
                     supplemental_total_runs += 1
                     log.info(
-                        "[%d/%d] supplemental year extract | cik=%s fiscal_year=%d",
+                        "[%d/%d][Year%d/%d] supplemental year extract | cik=%s fiscal_year=%d",
                         index,
                         len(ciks),
+                        year_index,
+                        total_years,
                         cik,
                         target_year,
                     )
@@ -1936,7 +1985,11 @@ def main() -> None:
                             )
                         )
                         log.warning(
-                            "supplemental_filing_fetch_failed | cik=%s fiscal_year=%d error=%s",
+                            "[%d/%d][Year%d/%d] supplemental_filing_fetch_failed | cik=%s fiscal_year=%d error=%s",
+                            index,
+                            len(ciks),
+                            year_index,
+                            total_years,
                             cik,
                             target_year,
                             year_fetch_exc,
@@ -1964,7 +2017,11 @@ def main() -> None:
                     )
                     supplemental_log_rows.append(year_log_row)
                     log.info(
-                        "supplemental year result | cik=%s fiscal_year=%d status=%s method=%s grants_rows=%d compensation_rows=%d error=%s",
+                        "[%d/%d][Year%d/%d] supplemental year result | cik=%s fiscal_year=%d status=%s method=%s grants_rows=%d compensation_rows=%d error=%s",
+                        index,
+                        len(ciks),
+                        year_index,
+                        total_years,
                         cik,
                         target_year,
                         str(year_log_row.get("status", "") or ""),

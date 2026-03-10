@@ -113,20 +113,49 @@ class ExecCompRecord(BaseModel):
     )
 
 
+def _exec_comp_record_has_payload(record: ExecCompRecord | None) -> bool:
+    """Return True when an executive compensation record has any payload."""
+    if record is None:
+        return False
+    values = [
+        record.name.strip(),
+        record.title.strip(),
+        str(record.salary or "").strip(),
+        str(record.bonus or "").strip(),
+        str(record.stock_awards or "").strip(),
+        str(record.option_awards or "").strip(),
+        str(record.non_equity_incentive or "").strip(),
+        str(record.pension_change or "").strip(),
+        str(record.other_comp or "").strip(),
+        str(record.total or "").strip(),
+        str(record.footnotes or "").strip(),
+        str(record.fiscal_year or "").strip(),
+    ]
+    return any(values)
+
+
 class CompanyCompResult(BaseModel):
     """
-    Role-keyed compensation result for one company, one filing year.
+    Row-level compensation result for one company filing.
 
-    All role fields are optional. If a role is not present in the
-    filing's Summary Compensation Table, its fields are left empty/null.
-    Confidence reflects the LLM's self-assessed extraction reliability.
+    Primary output is row-based and mirrors master compensation CSV columns
+    (excluding filing/company metadata added by the pipeline):
+      Name, Title, Year, Salary, Bonus, Stock Awards, Option Awards,
+      Non-Equity Incentive, Pension Change, All Other Compensation, Total,
+      Extra information (footnotes).
+
+    Role fields are retained for backward compatibility with legacy callers.
     """
 
-    ceo: ExecCompRecord = Field(default_factory=ExecCompRecord)
-    cfo: ExecCompRecord = Field(default_factory=ExecCompRecord)
-    coo: ExecCompRecord = Field(default_factory=ExecCompRecord)
-    other1: ExecCompRecord = Field(default_factory=ExecCompRecord)
-    other2: ExecCompRecord = Field(default_factory=ExecCompRecord)
+    rows: list[ExecCompRecord] = Field(
+        default_factory=list,
+        description="Row-level compensation records aligned to master compensation CSV output columns.",
+    )
+    ceo: ExecCompRecord | None = Field(default_factory=ExecCompRecord)
+    cfo: ExecCompRecord | None = Field(default_factory=ExecCompRecord)
+    coo: ExecCompRecord | None = Field(default_factory=ExecCompRecord)
+    other1: ExecCompRecord | None = Field(default_factory=ExecCompRecord)
+    other2: ExecCompRecord | None = Field(default_factory=ExecCompRecord)
     confidence: float = Field(
         default=0.0,
         ge=0.0,
@@ -139,9 +168,24 @@ class CompanyCompResult(BaseModel):
     )
 
     @model_validator(mode="after")
-    def clamp_confidence(self) -> CompanyCompResult:
-        """Ensure confidence is clamped to [0.0, 1.0] regardless of LLM output."""
+    def normalize_result(self) -> CompanyCompResult:
+        """Normalize confidence and role/rows compatibility after validation."""
         self.confidence = max(0.0, min(1.0, self.confidence))
+
+        # Accept role=null outputs from LLM by normalizing to empty records.
+        for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
+            if getattr(self, role_key) is None:
+                setattr(self, role_key, ExecCompRecord())
+
+        # Backfill rows from legacy role-shaped payloads when rows are absent.
+        if not self.rows:
+            role_records = [self.ceo, self.cfo, self.coo, self.other1, self.other2]
+            self.rows = [
+                record
+                for record in role_records
+                if isinstance(record, ExecCompRecord) and _exec_comp_record_has_payload(record)
+            ]
+
         return self
 
 
@@ -192,14 +236,27 @@ You are a financial data extraction assistant specialised in SEC DEF 14A
 proxy statement compensation tables.
 
 You will receive the linearized text of a Summary Compensation Table from
-a proxy statement. Extract compensation data for named executive officers
-and return ONLY a valid JSON object matching the schema below.
+a proxy statement. Extract row-level compensation data and return ONLY a
+valid JSON object matching the schema below.
 
 EXTRACTION RULES:
 1. If a target fiscal year is provided in the user message, extract values
    for that fiscal year only. Otherwise use the most recent fiscal year
    present in the table.
-2. Field-to-column mapping is strict. Extract each JSON field from the exact
+2. Output row schema must match master compensation CSV semantics:
+   - rows[].name -> Name
+   - rows[].title -> Title
+   - rows[].fiscal_year -> Year
+   - rows[].salary -> Salary ($)
+   - rows[].bonus -> Bonus Awards ($)
+   - rows[].stock_awards -> Stock Awards ($)
+   - rows[].option_awards -> Option Awards ($)
+   - rows[].non_equity_incentive -> Non-Equity Incentive Plan Compensation ($)
+   - rows[].pension_change -> Change in pension value and nonqualified deferred compensation earnings ($)
+   - rows[].other_comp -> All Other Compensation ($)
+   - rows[].total -> Total ($)
+   - rows[].footnotes -> Extra information
+3. Field-to-column mapping is strict. Extract each JSON field from the exact
    Summary Compensation Table column with the same meaning:
    - salary -> "Salary ($)"
    - bonus -> "Bonus Awards ($)" (bonus column only)
@@ -210,7 +267,7 @@ EXTRACTION RULES:
    - other_comp -> "All Other Compensation ($)" only
    - total -> "Total ($)"
    - footnotes -> row-specific footnote refs/text only ("Extra information")
-3. NEVER swap columns:
+4. NEVER swap columns:
    - Do not put non-equity incentive amounts into bonus.
    - Do not put bonus amounts into non_equity_incentive.
    - Do not put stock awards into option_awards.
@@ -221,21 +278,22 @@ EXTRACTION RULES:
    - If the "All Other Compensation" cell is blank/missing/dash, set other_comp = null.
    - other_comp can equal total only when the source row explicitly shows the same
      number in both "All Other Compensation" and "Total" columns.
-4. salary, bonus, stock_awards, option_awards, non_equity_incentive,
+5. salary, bonus, stock_awards, option_awards, non_equity_incentive,
    pension_change, other_comp, total must be plain digit strings without
    currency symbols or commas (e.g. "1250000"). Use null if the value is
    missing, zero, a dash, or the table cell is blank.
-5. fiscal_year should be a 4-digit year string (e.g. "2023") and must come
+6. fiscal_year should be a 4-digit year string (e.g. "2023") and must come
    from the table row/year header, not from filing metadata.
-6. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
-7. Do NOT invent values. If data is absent, use empty string or null.
-8. Keep compatibility keys exactly:
-   - Top-level keys: ceo, cfo, coo, other1, other2, confidence, notes
-   - Each role key must contain: name, title, salary, bonus, stock_awards,
-     option_awards, non_equity_incentive, pension_change, other_comp, total,
-     footnotes, fiscal_year
-9. Return ONLY the JSON object. No prose, no markdown code fences.
-10. Do NOT infer fiscal year from filing date. Use explicit year values from
+7. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
+8. Do NOT invent values. If data is absent, use empty string or null.
+9. Keep top-level JSON keys exactly: rows, confidence, notes.
+10. rows must be a JSON array (possibly empty) and each element must be an
+    object with keys:
+    name, title, salary, bonus, stock_awards, option_awards,
+    non_equity_incentive, pension_change, other_comp, total,
+    footnotes, fiscal_year
+11. Return ONLY the JSON object. No prose, no markdown code fences.
+12. Do NOT infer fiscal year from filing date. Use explicit year values from
    the table rows.
 """
 
@@ -243,6 +301,8 @@ _RETRY_SYSTEM_PROMPT = """\
 Your previous response was not valid JSON or did not match the required
 schema. Return ONLY the corrected JSON object using the schema provided.
 Do not include any explanation, markdown, or code fences.
+Required top-level keys: rows, confidence, notes.
+Do NOT output role keys (ceo/cfo/coo/other1/other2) in retry.
 """
 
 _GRANTS_SYSTEM_PROMPT = """\
