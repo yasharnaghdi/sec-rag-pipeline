@@ -569,6 +569,7 @@ def _word_count_from_blocks(blocks: list[Tag]) -> int:
 def _render_with_docling(fragment_html: str) -> tuple[str | None, str | None]:
     try:
         from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
     except Exception as exc:  # noqa: BLE001
         return None, f"Docling unavailable, used fallback renderer ({exc.__class__.__name__})."
 
@@ -577,12 +578,11 @@ def _render_with_docling(fragment_html: str) -> tuple[str | None, str | None]:
 
     if hasattr(converter, "convert_string"):
         try:
-            result = converter.convert_string(fragment_html, input_format="html")
-        except TypeError:
-            try:
-                result = converter.convert_string(fragment_html, format="html")
-            except Exception:  # noqa: BLE001
-                result = None
+            result = converter.convert_string(
+                fragment_html,
+                format=InputFormat.HTML,
+                name="cda_fragment",
+            )
         except Exception:  # noqa: BLE001
             result = None
 
