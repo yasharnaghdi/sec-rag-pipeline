@@ -19,13 +19,12 @@ import os
 import re
 import tempfile
 import warnings
-from dataclasses import dataclass, field
-from datetime import date
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Literal
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from bs4.element import NavigableString, Tag
+from bs4.element import Tag
 from pydantic import BaseModel, Field
 
 from ingestion.metadata_model import DocumentMetadata
@@ -35,6 +34,8 @@ log = logging.getLogger(__name__)
 # ── regex patterns ──────────────────────────────────────────────────────────
 
 _PAGE_TAIL_RE = re.compile(r"\b(\d{1,3})\s*$")
+_PAGE_LEAD_RE = re.compile(r"^\s*(\d{1,3})\s+")
+_PAGE_ONLY_RE = re.compile(r"^\s*(\d{1,3})\s*$")
 _ITEM_RE = re.compile(r"^ITEM\s+(\d+)\b", re.IGNORECASE)
 _FONT_SIZE_RE = re.compile(r"font-size\s*:\s*([\d.]+)\s*pt", re.IGNORECASE)
 _TOC_BACKLINK_RE = re.compile(r"^\s*table\s+of\s+contents\s*$", re.IGNORECASE)
@@ -219,6 +220,9 @@ def _extract_font_size_pt(style: str | None) -> float | None:
 def _parse_toc_tables(soup: BeautifulSoup) -> tuple[list[TocEntry], set[int]]:
     """Extract TOC entries from front-matter tables.
 
+    Handles both trailing page numbers (``Label  5``) and leading page
+    numbers (``5  Label``) by analyzing individual cells.
+
     Returns (ordered entries, python-id set of TOC table elements).
     """
     entries: list[TocEntry] = []
@@ -233,31 +237,9 @@ def _parse_toc_tables(soup: BeautifulSoup) -> tuple[list[TocEntry], set[int]]:
 
         parsed: list[TocEntry] = []
         for row_idx, row in enumerate(rows):
-            cells = row.find_all(["td", "th"])
-            if not cells:
-                continue
-            row_text = " ".join(c.get_text(" ", strip=True) for c in cells)
-            page_match = _PAGE_TAIL_RE.search(row_text)
-            if page_match is None:
-                continue
-            raw_label = row_text[: page_match.start()].strip()
-            if not raw_label:
-                continue
-            href: str | None = None
-            first_link = row.find("a", href=True)
-            if isinstance(first_link, Tag):
-                href_val = str(first_link.get("href", "")).strip()
-                href = href_val or None
-            parsed.append(
-                TocEntry(
-                    label=raw_label,
-                    normalized=_normalize_label(raw_label),
-                    page=int(page_match.group(1)),
-                    href=href,
-                    table_idx=table_idx,
-                    row_idx=row_idx,
-                )
-            )
+            entry = _parse_toc_row(row, table_idx, row_idx)
+            if entry is not None:
+                parsed.append(entry)
 
         if not _is_toc_like(parsed):
             continue
@@ -266,6 +248,64 @@ def _parse_toc_tables(soup: BeautifulSoup) -> tuple[list[TocEntry], set[int]]:
 
     entries.sort(key=lambda e: (e.table_idx, e.row_idx))
     return entries, toc_table_ids
+
+
+def _parse_toc_row(row: Tag, table_idx: int, row_idx: int) -> TocEntry | None:
+    """Parse a single TOC table row, handling both leading and trailing page numbers."""
+    cells = row.find_all(["td", "th"])
+    if not cells:
+        return None
+
+    # Extract cell texts
+    cell_texts = [c.get_text(" ", strip=True) for c in cells]
+
+    # Strategy 1: find a cell that is ONLY a page number (1-3 digits)
+    page_num: int | None = None
+    label_parts: list[str] = []
+    for ct in cell_texts:
+        if not ct:
+            continue
+        if _PAGE_ONLY_RE.match(ct) and page_num is None:
+            page_num = int(ct.strip())
+        else:
+            label_parts.append(ct)
+
+    raw_label = " ".join(label_parts).strip()
+
+    # Strategy 2: if no page-only cell, try trailing page number on joined text
+    if page_num is None:
+        row_text = " ".join(ct for ct in cell_texts if ct)
+        tail_m = _PAGE_TAIL_RE.search(row_text)
+        if tail_m:
+            page_num = int(tail_m.group(1))
+            raw_label = row_text[: tail_m.start()].strip()
+
+    # Strategy 3: try leading page number on joined text
+    if page_num is None:
+        row_text = " ".join(ct for ct in cell_texts if ct)
+        lead_m = _PAGE_LEAD_RE.match(row_text)
+        if lead_m:
+            page_num = int(lead_m.group(1))
+            raw_label = row_text[lead_m.end() :].strip()
+
+    if page_num is None or not raw_label:
+        return None
+
+    # Extract href from first link in the row
+    href: str | None = None
+    first_link = row.find("a", href=True)
+    if isinstance(first_link, Tag):
+        href_val = str(first_link.get("href", "")).strip()
+        href = href_val or None
+
+    return TocEntry(
+        label=raw_label,
+        normalized=_normalize_label(raw_label),
+        page=page_num,
+        href=href,
+        table_idx=table_idx,
+        row_idx=row_idx,
+    )
 
 
 def _is_toc_like(rows: list[TocEntry]) -> bool:
@@ -475,8 +515,20 @@ def _find_content_start_from_anchor(
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+_BLOCK_LEVEL_TAGS: tuple[str, ...] = (
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article",
+)
+
+
 def _is_visual_heading(tag: Tag) -> bool:
-    """Return True if *tag* looks like a section heading visually."""
+    """Return True if *tag* looks like a section heading visually.
+
+    Only considers block-level elements (``p``, ``div``, ``h1``–``h6``) to
+    avoid false positives from inline ``<font>``, ``<b>``, ``<td>`` etc.
+    """
+    if tag.name not in _BLOCK_LEVEL_TAGS and tag.name not in _HEADING_TAGS:
+        return False
+
     text = tag.get_text(" ", strip=True)
     if not text or len(text) > 180:
         return False
@@ -516,10 +568,6 @@ def _is_visual_heading(tag: Tag) -> bool:
     if has_bold and has_underline and len(text) < 100:
         return True
 
-    # bold text inside a table cell (Family C)
-    if tag.name == "td" and has_bold and len(text) < 100:
-        return True
-
     return False
 
 
@@ -528,13 +576,12 @@ def _find_heading_in_body(
     spec: SectionSpec,
     toc_table_ids: set[int],
 ) -> Tag | None:
-    """Fallback: scan entire body for a visual heading matching *spec*."""
+    """Fallback: scan body for a block-level visual heading matching *spec*."""
     best: tuple[float, Tag] | None = None
-    for tag in soup.find_all(True):
-        # skip elements inside TOC tables
+    # Only search block-level + heading tags to avoid <td>, <font>, <b> false positives
+    search_tags = list(_BLOCK_LEVEL_TAGS) + list(_HEADING_TAGS)
+    for tag in soup.find_all(search_tags):
         if _is_in_toc_table(tag, toc_table_ids):
-            continue
-        if tag.name == "table":
             continue
         text = tag.get_text(" ", strip=True)
         if not text or len(text) > 220:
@@ -615,6 +662,8 @@ def _is_end_boundary_heading(
         return False
     if not _is_visual_heading(tag):
         return False
+    if normalized_text == "TABLE OF CONTENTS":
+        return False
 
     if spec.end_mode == "major_non_exec":
         # stop at non-exec headings but skip exec-comp headings
@@ -628,13 +677,28 @@ def _is_end_boundary_heading(
                 return False
         return any(term in normalized_text for term in _NON_EXEC_TERMS)
 
-    # next_boundary: stop at any heading that is NOT this section's label
-    score = _section_label_score(normalized_text, spec)
-    if score >= max(0.72, spec.min_match_score):
+    # next_boundary: stop at any heading that matches a DIFFERENT known section
+    # or is clearly a different major section
+    same_section_score = _section_label_score(normalized_text, spec)
+    if same_section_score >= max(0.72, spec.min_match_score):
         return False  # same section label → skip
-    if normalized_text == "TABLE OF CONTENTS":
-        return False
-    return True
+
+    # check if it matches any other known section spec
+    for other_spec in _SECTION_SPECS:
+        if other_spec.section_name == spec.section_name:
+            continue
+        other_score = _section_label_score(normalized_text, other_spec)
+        if other_score >= other_spec.min_match_score:
+            return True
+
+    # check for generic boundary markers
+    item_m = _ITEM_RE.match(normalized_text)
+    if item_m:
+        return True
+    if any(term in normalized_text for term in _NON_EXEC_TERMS):
+        return True
+
+    return False
 
 
 def _collect_section_nodes(
@@ -665,9 +729,9 @@ def _collect_section_nodes(
             current = _next_element_sibling(current)
             continue
 
-        # heuristic end-boundary (when no resolved end node)
+        # heuristic end-boundary check (always, as safety)
         text = current.get_text(" ", strip=True)
-        if text and end_node is None:
+        if text:
             norm = _normalize_label(text)
             if _is_end_boundary_heading(current, norm, spec, toc_table_ids):
                 break

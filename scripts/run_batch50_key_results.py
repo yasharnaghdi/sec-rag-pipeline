@@ -134,10 +134,13 @@ import ingestion.comp_table_extractor as det_extractor  # noqa: E402
 import ingestion.edgar_folder_fetcher as fetcher  # noqa: E402
 from ingestion.llm_comp_extractor import (  # noqa: E402
     CompanyGrantsResult,
+    CompanyOutstandingEquityAwardsResult,
     ExecCompRecord,
     GrantPlanAwardRecord,
+    OutstandingEquityAwardRecord,
     extract_company_comp_from_summary_table,
     extract_grants_from_plan_based_table,
+    extract_outstanding_equity_awards_table,
 )
 from ingestion.metadata_model import BaseBlock, DocumentMetadata, HeadingBlock, ProseBlock, TableBlock  # noqa: E402
 from ingestion.sec_chunker import SECChunker  # noqa: E402
@@ -232,6 +235,34 @@ _GRANTS_GRANT_TYPE_HINTS = {
     "incentive plan",
 }
 
+_OUTSTANDING_EQUITY_SIGNATURES = [
+    "outstanding equity awards at fiscal year-end",
+    "outstanding equity awards at fiscal year end",
+    "outstanding equity awards at year-end",
+    "outstanding equity awards",
+    "equity awards outstanding",
+]
+_OUTSTANDING_EQUITY_REQUIRED_TERMS = {
+    "outstanding",
+    "equity",
+    "awards",
+}
+_OUTSTANDING_EQUITY_HEADER_HINTS = {
+    "grant date",
+    "unexercised options",
+    "exercisable",
+    "unexercisable",
+    "unearned options",
+    "option exercise price",
+    "option expiration date",
+    "have not vested",
+    "market value",
+    "payout value",
+    "stock awards",
+    "option awards",
+    "equity incentive plan awards",
+}
+
 GRANTS_OUTPUT_COLUMNS = [
     "CIK",
     "Company Name",
@@ -249,6 +280,23 @@ GRANTS_OUTPUT_COLUMNS = [
     "All other option awards: Number of securities underlying options",
     "Exercise or base price of option awards",
     "Grant date fair value of stock and option awards",
+]
+
+OUTSTANDING_EQUITY_AWARDS_OUTPUT_COLUMNS = [
+    "CIK",
+    "Company Name",
+    "Filing URL",
+    "Name",
+    "Grant Date",
+    "Number of Securities Underlying Unexercised Options Exercisable (#)",
+    "Number of Securities Underlying Unexercised Options Unexercisable (#)",
+    "Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)",
+    "Option Exercise Price ($)",
+    "Option Expiration Date",
+    "Number of Shares or Units of Stock that Have Not Vested (#)",
+    "Market Value of Shares or Units of Stock that Have Not Vested ($)",
+    "Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)",
+    "Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)",
 ]
 
 COMPENSATION_OUTPUT_COLUMNS = [
@@ -344,7 +392,7 @@ def _call_process_cik(
     fiscal_year_start: int | None = None,
     fiscal_year_end: int | None = None,
     filing_override: fetcher.FetchedFiling | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
     """
     Call process_cik with backward-compatible argument handling.
 
@@ -362,16 +410,16 @@ def _call_process_cik(
 
     if has_filing_override or param_count >= 6:
         return cast(
-            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]],
             process_fn(cik, model, skip_db, fiscal_year_start, fiscal_year_end, filing_override),
         )
     if param_count >= 5:
         return cast(
-            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+            tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]],
             process_fn(cik, model, skip_db, fiscal_year_start, fiscal_year_end),
         )
     return cast(
-        tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]],
+        tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]],
         process_fn(cik, model, skip_db),
     )
 
@@ -475,6 +523,12 @@ def _as_text(value: Any) -> str:
 def _normalize_llm_comp_cell(cell: str) -> str:
     text = str(cell or "").replace("\xa0", " ")
     return " ".join(text.split()).strip()
+
+
+def _is_standalone_footnote_marker(cell: str) -> bool:
+    """True when a cell only contains one or more parenthetical footnote markers."""
+    value = cell.strip()
+    return bool(re.fullmatch(r"(?:\(\d+\))+", value))
 
 
 def _extract_unique_year_tokens(cell: str) -> list[str]:
@@ -592,6 +646,10 @@ def _clean_llm_comp_row(raw_row: list[str]) -> list[str]:
                     merged.append(next_cell)
                     index += 2
                     continue
+            index += 1
+            continue
+        if _is_standalone_footnote_marker(cell) and merged:
+            merged[-1] = f"{merged[-1]} {cell}".strip()
             index += 1
             continue
         merged.append(cell)
@@ -1285,6 +1343,187 @@ def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, He
     return None, None
 
 
+def _locate_outstanding_equity_awards_table(
+    blocks: list[BaseBlock],
+) -> tuple[TableBlock | None, HeadingBlock | None]:
+    """Locate the Outstanding Equity Awards at Fiscal Year-End table and heading."""
+
+    def _table_prefix_text(table: TableBlock, max_rows: int = 12) -> str:
+        if not table.rows:
+            return ""
+        parts: list[str] = []
+        for row in table.rows[: min(max_rows, len(table.rows))]:
+            parts.extend(cell.strip() for cell in row if cell.strip())
+        return " | ".join(parts).lower()
+
+    def _table_header_text(table: TableBlock) -> str:
+        if not table.rows:
+            return ""
+        scan_rows = min(12, len(table.rows))
+        hint_terms = _OUTSTANDING_EQUITY_REQUIRED_TERMS | _OUTSTANDING_EQUITY_HEADER_HINTS | {"name"}
+        scored_rows: list[tuple[int, int, list[str]]] = []
+        for row_index in range(scan_rows):
+            cells = [cell.strip() for cell in table.rows[row_index] if cell.strip()]
+            if not cells:
+                continue
+            row_text = " | ".join(cells).lower()
+            alpha_cells = sum(1 for cell in cells if any(char.isalpha() for char in cell))
+            digit_cells = sum(1 for cell in cells if any(char.isdigit() for char in cell))
+            score = (alpha_cells * 2) - digit_cells
+            if len(cells) >= 5:
+                score += 2
+            if any(term in row_text for term in hint_terms):
+                score += 10
+            if "table of contents" in row_text:
+                score -= 4
+            if any(hint in row_text for hint in _COMP_REJECT_HEADER_HINTS):
+                score -= 6
+            scored_rows.append((score, row_index, cells))
+        if not scored_rows:
+            return ""
+        scored_rows.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        selected = sorted(scored_rows[:6], key=lambda item: item[1])
+        parts: list[str] = []
+        for _, _, cells in selected:
+            parts.extend(cells)
+        return " | ".join(parts).lower()
+
+    def _equity_schema_fit(header_text: str, prefix_text: str) -> bool:
+        combined = f"{header_text} | {prefix_text}"
+        tokens = set(re.findall(r"[a-z0-9]+", combined))
+
+        def _has_all(*required: str) -> bool:
+            return all(token in tokens for token in required)
+
+        has_name = "name" in tokens
+        has_grant_date = ("grant date" in combined) or _has_all("grant", "date")
+        has_option_axis = (
+            ("unexercised options" in combined)
+            or (
+                ("option" in tokens or "options" in tokens)
+                and ("exercisable" in tokens or "unexercisable" in tokens)
+            )
+        )
+        has_stock_axis = (
+            ("have not vested" in combined and ("shares" in tokens or "units" in tokens))
+            or (_has_all("stock", "not", "vested"))
+        )
+        has_pricing_or_expiry = (
+            ("option exercise price" in combined)
+            or _has_all("exercise", "price")
+            or ("option expiration date" in combined)
+            or _has_all("expiration", "date")
+        )
+        has_equity_incentive = (
+            "equity incentive plan awards" in combined
+            or _has_all("equity", "incentive", "plan")
+        )
+        return (
+            has_name
+            and has_option_axis
+            and has_stock_axis
+            and has_pricing_or_expiry
+            and (has_grant_date or has_equity_incentive)
+        )
+
+    def _score_equity_table_candidate(table: TableBlock, context_text: str) -> int:
+        header_text = _table_header_text(table)
+        prefix_text = _table_prefix_text(table)
+        body_text = table.linearized_text.lower()
+        if not header_text and not prefix_text:
+            return -10
+
+        row_count = len(table.rows)
+        col_count = max((len(row) for row in table.rows), default=0)
+        header_rows = table.header_row_count if table.header_row_count > 0 else min(6, row_count)
+        header_rows = min(max(1, header_rows), row_count) if row_count else 0
+        data_row_count = max(0, row_count - header_rows)
+        combined = f"{header_text} | {prefix_text}"
+
+        score = 0
+        if any(term in combined for term in _OUTSTANDING_EQUITY_REQUIRED_TERMS):
+            score += 4
+        if any(term in body_text for term in _OUTSTANDING_EQUITY_REQUIRED_TERMS):
+            score += 2
+        if any(hint in combined for hint in _OUTSTANDING_EQUITY_HEADER_HINTS):
+            score += 4
+        if any(hint in body_text for hint in _OUTSTANDING_EQUITY_HEADER_HINTS):
+            score += 2
+        if row_count >= 4:
+            score += 2
+        if col_count >= 9:
+            score += 2
+        if data_row_count <= 1:
+            score -= 4
+        if col_count <= 4:
+            score -= 6
+
+        context_lc = context_text.lower()
+        if any(signature in context_lc for signature in _OUTSTANDING_EQUITY_SIGNATURES):
+            score += 3
+        if any(hint in combined for hint in _COMP_REJECT_HEADER_HINTS):
+            score -= 6
+        if "beneficial ownership" in combined:
+            score -= 10
+        if not _equity_schema_fit(header_text, prefix_text):
+            score -= 12
+        return score
+
+    contexts: list[tuple[int, str, HeadingBlock | None]] = []
+    for index, block in enumerate(blocks):
+        if isinstance(block, HeadingBlock):
+            heading_lc = block.text.lower()
+            if any(signature in heading_lc for signature in _OUTSTANDING_EQUITY_SIGNATURES):
+                contexts.append((index, block.text, block))
+        elif isinstance(block, ProseBlock):
+            prose_text = block.text.strip()
+            prose_lc = prose_text.lower()
+            if not prose_text or "table of contents" in prose_lc:
+                continue
+            if len(prose_text) > 240:
+                continue
+            if any(signature in prose_lc for signature in _OUTSTANDING_EQUITY_SIGNATURES):
+                contexts.append((index, prose_text, None))
+
+    scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
+    for context_index, context_text, context_heading in contexts:
+        if context_heading is not None:
+            for block in blocks:
+                if not isinstance(block, TableBlock) or block.section_id != context_heading.id:
+                    continue
+                score = _score_equity_table_candidate(block, context_text)
+                if score >= 8:
+                    scored_candidates.append((score, 1, 0, block, context_heading))
+
+        for offset in range(1, 19):
+            candidate_index = context_index + offset
+            if candidate_index >= len(blocks):
+                break
+            candidate = blocks[candidate_index]
+            if not isinstance(candidate, TableBlock):
+                continue
+            score = _score_equity_table_candidate(candidate, context_text)
+            if score >= 8:
+                proximity_boost = 1 if context_heading is not None else 0
+                scored_candidates.append((score, proximity_boost, -offset, candidate, context_heading))
+
+    if scored_candidates:
+        best = max(scored_candidates, key=lambda item: (item[0], item[1], item[2]))
+        return best[3], best[4]
+
+    global_candidates: list[tuple[int, TableBlock]] = []
+    for block in blocks:
+        if not isinstance(block, TableBlock):
+            continue
+        score = _score_equity_table_candidate(block, "")
+        if score >= 10:
+            global_candidates.append((score, block))
+    if global_candidates:
+        best_global = max(global_candidates, key=lambda item: item[0])
+        return best_global[1], None
+    return None, None
+
+
 def _det_rows_have_grants_payload(det_rows: list[dict[str, Any]]) -> bool:
     """Return True when deterministic grant rows contain at least one usable value."""
     grant_fields = (
@@ -1386,6 +1625,102 @@ def _grant_row_from_llm(row: GrantPlanAwardRecord) -> dict[str, Any]:
         "All other option awards: Number of securities underlying options": row.all_other_option_awards_securities or "",
         "Exercise or base price of option awards": row.exercise_or_base_price or "",
         "Grant date fair value of stock and option awards": row.grant_date_fair_value or "",
+    }
+
+
+def _det_rows_have_outstanding_equity_payload(det_rows: list[dict[str, Any]]) -> bool:
+    """Return True when deterministic equity-awards rows contain usable values."""
+    equity_fields = (
+        "options_exercisable",
+        "options_unexercisable",
+        "equity_incentive_unearned_options",
+        "option_exercise_price",
+        "stock_unvested_shares",
+        "stock_unvested_value",
+        "equity_incentive_unearned_shares",
+        "equity_incentive_unearned_value",
+    )
+    empty_markers = {"", "-", "—", "$", "n/a", "na", "none"}
+
+    for row in det_rows:
+        for field in equity_fields:
+            value = row.get(field)
+            if isinstance(value, (int, float)):
+                return True
+            text = str(value or "").strip().lower()
+            if not text or text in empty_markers:
+                continue
+            if any(char.isdigit() for char in text):
+                return True
+    return False
+
+
+def _llm_result_has_outstanding_equity_payload(result: CompanyOutstandingEquityAwardsResult) -> bool:
+    for row in result.rows:
+        values = [
+            row.name.strip(),
+            row.grant_date or "",
+            row.options_exercisable or "",
+            row.options_unexercisable or "",
+            row.equity_incentive_unearned_options or "",
+            row.option_exercise_price or "",
+            row.option_expiration_date or "",
+            row.stock_unvested_shares or "",
+            row.stock_unvested_value or "",
+            row.equity_incentive_unearned_shares or "",
+            row.equity_incentive_unearned_value or "",
+        ]
+        if any(str(value).strip() for value in values):
+            return True
+    return False
+
+
+def _outstanding_equity_row_from_det(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "Name": str(row.get("exec_name", "") or "").strip(),
+        "Grant Date": _as_text(row.get("grant_date", row.get("option_grant_date", ""))),
+        "Number of Securities Underlying Unexercised Options Exercisable (#)": _as_text(
+            row.get("options_exercisable", "")
+        ),
+        "Number of Securities Underlying Unexercised Options Unexercisable (#)": _as_text(
+            row.get("options_unexercisable", "")
+        ),
+        "Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)": _as_text(
+            row.get("equity_incentive_unearned_options", "")
+        ),
+        "Option Exercise Price ($)": _as_text(row.get("option_exercise_price", row.get("exercise_price", ""))),
+        "Option Expiration Date": _as_text(row.get("option_expiration_date", row.get("expiration_date", ""))),
+        "Number of Shares or Units of Stock that Have Not Vested (#)": _as_text(
+            row.get("stock_unvested_shares", row.get("stock_awards_unvested_shares", ""))
+        ),
+        "Market Value of Shares or Units of Stock that Have Not Vested ($)": _as_text(
+            row.get("stock_unvested_value", row.get("stock_awards_unvested_value", ""))
+        ),
+        "Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)": _as_text(
+            row.get("equity_incentive_unearned_shares", "")
+        ),
+        "Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)": _as_text(
+            row.get("equity_incentive_unearned_value", "")
+        ),
+    }
+
+
+def _outstanding_equity_row_from_llm(row: OutstandingEquityAwardRecord) -> dict[str, Any]:
+    return {
+        "Name": row.name,
+        "Grant Date": row.grant_date or "",
+        "Number of Securities Underlying Unexercised Options Exercisable (#)": row.options_exercisable or "",
+        "Number of Securities Underlying Unexercised Options Unexercisable (#)": row.options_unexercisable or "",
+        "Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)": row.equity_incentive_unearned_options
+        or "",
+        "Option Exercise Price ($)": row.option_exercise_price or "",
+        "Option Expiration Date": row.option_expiration_date or "",
+        "Number of Shares or Units of Stock that Have Not Vested (#)": row.stock_unvested_shares or "",
+        "Market Value of Shares or Units of Stock that Have Not Vested ($)": row.stock_unvested_value or "",
+        "Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)": row.equity_incentive_unearned_shares
+        or "",
+        "Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)": row.equity_incentive_unearned_value
+        or "",
     }
 
 
@@ -1505,10 +1840,10 @@ def process_cik(
     fiscal_year_start: int | None = None,
     fiscal_year_end: int | None = None,
     filing_override: fetcher.FetchedFiling | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
     """
     Full pipeline for one CIK.
-    Returns (key_results_row, log_row, grants_rows, compensation_rows).
+    Returns (key_results_row, log_row, grants_rows, compensation_rows, outstanding_equity_rows).
 
     This function never raises. All errors are caught and returned
     as a failed row so the batch loop stays clean.
@@ -1519,6 +1854,7 @@ def process_cik(
     t0 = time.monotonic()
     grants_rows_out: list[dict[str, Any]] = []
     compensation_rows_out: list[dict[str, str]] = []
+    outstanding_equity_rows_out: list[dict[str, Any]] = []
     source_filing_date = ""
     source_accession_number = ""
     source_filing_url = ""
@@ -1528,7 +1864,7 @@ def process_cik(
         reason: str,
         company_name: str = "",
         extra: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]:
         elapsed = round(time.monotonic() - t0, 2)
         base: dict[str, Any] = {col: "" for col in KEY_RESULTS_COLUMNS}
         base.update(
@@ -1573,7 +1909,7 @@ def process_cik(
                     base[key] = value
                 if key in BATCH_LOG_COLUMNS:
                     log_row[key] = value
-        return base, log_row, grants_rows_out, compensation_rows_out
+        return base, log_row, grants_rows_out, compensation_rows_out, outstanding_equity_rows_out
 
     if filing_override is not None:
         filing = filing_override
@@ -1675,6 +2011,55 @@ def process_cik(
                     output_row["__cik"] = cik
                     output_row["__fiscal_year"] = grants_fiscal_year
                     grants_rows_out.append(output_row)
+
+    outstanding_equity_table, _ = _locate_outstanding_equity_awards_table(blocks)
+    outstanding_equity_det_rows: list[dict[str, Any]] = []
+    try:
+        if outstanding_equity_table is not None:
+            outstanding_equity_det_rows = det_extractor.extract_equity_awards(
+                blocks,
+                meta_dict,
+                selected_table=outstanding_equity_table,
+            )
+        else:
+            outstanding_equity_det_rows = det_extractor.extract_equity_awards(blocks, meta_dict)
+    except Exception as equity_exc:  # noqa: BLE001
+        log.warning("outstanding_equity_det_extract_failed | cik=%s error=%s", cik, equity_exc)
+
+    outstanding_equity_fiscal_year = _infer_fiscal_year_from_filing_date(filing.filing_date)
+    include_outstanding_equity = _is_within_fiscal_year_range(
+        outstanding_equity_fiscal_year,
+        fiscal_year_start,
+        fiscal_year_end,
+    )
+    if include_outstanding_equity:
+        if outstanding_equity_det_rows and _det_rows_have_outstanding_equity_payload(outstanding_equity_det_rows):
+            for det_row in outstanding_equity_det_rows:
+                output_row = _outstanding_equity_row_from_det(det_row)
+                output_row["CIK"] = cik
+                output_row["Company Name"] = company_name
+                output_row["Filing URL"] = filing.filing_url
+                output_row["__cik"] = cik
+                output_row["__fiscal_year"] = outstanding_equity_fiscal_year
+                outstanding_equity_rows_out.append(output_row)
+        elif outstanding_equity_table is not None:
+            llm_outstanding_equity_result = extract_outstanding_equity_awards_table(
+                company_name=company_name,
+                cik=cik,
+                filing_date=str(filing.filing_date or ""),
+                accession_number=filing.accession_number,
+                table_text=outstanding_equity_table.linearized_text,
+                model=model,
+            )
+            if _llm_result_has_outstanding_equity_payload(llm_outstanding_equity_result):
+                for llm_row in llm_outstanding_equity_result.rows:
+                    output_row = _outstanding_equity_row_from_llm(llm_row)
+                    output_row["CIK"] = cik
+                    output_row["Company Name"] = company_name
+                    output_row["Filing URL"] = filing.filing_url
+                    output_row["__cik"] = cik
+                    output_row["__fiscal_year"] = outstanding_equity_fiscal_year
+                    outstanding_equity_rows_out.append(output_row)
 
     comp_table, comp_heading = _locate_comp_table(blocks)
     comp_heading_found = comp_heading is not None
@@ -1922,7 +2307,7 @@ def process_cik(
         except Exception as db_exc:  # noqa: BLE001
             log.warning("db_write_failed | cik=%s error=%s", cik, db_exc)
 
-    return result_row, log_row, grants_rows_out, compensation_rows_out
+    return result_row, log_row, grants_rows_out, compensation_rows_out, outstanding_equity_rows_out
 
 
 def main() -> None:
@@ -2033,10 +2418,13 @@ def main() -> None:
     batch_log_path = out_dir / "batch_log.csv"
     batch_log_failed_path = out_dir / "batch_log_failed.csv"
     grants_master_path = out_dir / "grants_plan_based_master.csv"
+    outstanding_equity_master_path = out_dir / "outstanding_equity_awards_master.csv"
     compensation_master_path = out_dir / "compensation_table_master.csv"
     grants_by_cik_year_dir = out_dir / "grants_plan_based_by_cik_year"
+    outstanding_equity_by_cik_year_dir = out_dir / "outstanding_equity_awards_by_cik_year"
     compensation_by_cik_year_dir = out_dir / "compensation_by_cik_year"
     grants_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
+    outstanding_equity_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
     compensation_by_cik_year_dir.mkdir(parents=True, exist_ok=True)
 
     success_count = 0
@@ -2048,6 +2436,7 @@ def main() -> None:
     supplemental_fetch_failed_runs = 0
     supplemental_skipped_runs = 0
     all_grants_rows: list[dict[str, Any]] = []
+    all_outstanding_equity_rows: list[dict[str, Any]] = []
     all_compensation_rows: list[dict[str, str]] = []
     all_log_rows: list[dict[str, Any]] = []
 
@@ -2055,6 +2444,7 @@ def main() -> None:
         key_results_path.open("w", newline="", encoding="utf-8") as key_results_file,
         batch_log_path.open("w", newline="", encoding="utf-8") as batch_log_file,
         grants_master_path.open("w", newline="", encoding="utf-8") as grants_master_file,
+        outstanding_equity_master_path.open("w", newline="", encoding="utf-8") as outstanding_equity_master_file,
         compensation_master_path.open("w", newline="", encoding="utf-8") as compensation_master_file,
     ):
         kr_writer = csv.DictWriter(key_results_file, fieldnames=KEY_RESULTS_COLUMNS)
@@ -2062,6 +2452,11 @@ def main() -> None:
         grants_writer = csv.DictWriter(
             grants_master_file,
             fieldnames=GRANTS_OUTPUT_COLUMNS,
+            extrasaction="ignore",
+        )
+        outstanding_equity_writer = csv.DictWriter(
+            outstanding_equity_master_file,
+            fieldnames=OUTSTANDING_EQUITY_AWARDS_OUTPUT_COLUMNS,
             extrasaction="ignore",
         )
         compensation_writer = csv.DictWriter(
@@ -2072,6 +2467,7 @@ def main() -> None:
         kr_writer.writeheader()
         log_writer.writeheader()
         grants_writer.writeheader()
+        outstanding_equity_writer.writeheader()
         compensation_writer.writeheader()
 
         for index, cik in enumerate(ciks, start=1):
@@ -2087,8 +2483,13 @@ def main() -> None:
             if isinstance(process_result, tuple) and len(process_result) == 3:
                 result_row, base_log_row_raw, grants_rows = process_result
                 compensation_rows: list[dict[str, str]] = []
+                outstanding_equity_rows: list[dict[str, Any]] = []
             else:
-                result_row, base_log_row_raw, grants_rows, compensation_rows = process_result
+                if len(process_result) == 4:
+                    result_row, base_log_row_raw, grants_rows, compensation_rows = process_result
+                    outstanding_equity_rows = []
+                else:
+                    result_row, base_log_row_raw, grants_rows, compensation_rows, outstanding_equity_rows = process_result
 
             base_log_row = _enrich_log_row(
                 base_log_row_raw,
@@ -2099,6 +2500,7 @@ def main() -> None:
             )
 
             grants_rows_to_write: list[dict[str, Any]] = []
+            outstanding_equity_rows_to_write: list[dict[str, Any]] = []
             compensation_rows_to_write: list[dict[str, str]] = []
             supplemental_log_rows: list[dict[str, Any]] = []
             if fiscal_year_start is not None and fiscal_year_end is not None:
@@ -2161,8 +2563,19 @@ def main() -> None:
                     if isinstance(year_process_result, tuple) and len(year_process_result) == 3:
                         _, year_log_row_raw, year_grants_rows = year_process_result
                         year_compensation_rows: list[dict[str, str]] = []
+                        year_outstanding_equity_rows: list[dict[str, Any]] = []
                     else:
-                        _, year_log_row_raw, year_grants_rows, year_compensation_rows = year_process_result
+                        if len(year_process_result) == 4:
+                            _, year_log_row_raw, year_grants_rows, year_compensation_rows = year_process_result
+                            year_outstanding_equity_rows = []
+                        else:
+                            (
+                                _,
+                                year_log_row_raw,
+                                year_grants_rows,
+                                year_compensation_rows,
+                                year_outstanding_equity_rows,
+                            ) = year_process_result
                     year_log_row = _enrich_log_row(
                         raw_log_row=year_log_row_raw,
                         run_scope="supplemental",
@@ -2192,9 +2605,11 @@ def main() -> None:
                     else:
                         supplemental_failed_runs += 1
                     grants_rows_to_write.extend(year_grants_rows)
+                    outstanding_equity_rows_to_write.extend(year_outstanding_equity_rows)
                     compensation_rows_to_write.extend(year_compensation_rows)
             else:
                 grants_rows_to_write = grants_rows
+                outstanding_equity_rows_to_write = outstanding_equity_rows
                 compensation_rows_to_write = compensation_rows
 
             kr_writer.writerow(result_row)
@@ -2206,12 +2621,16 @@ def main() -> None:
             for grants_row in grants_rows_to_write:
                 grants_writer.writerow(grants_row)
                 all_grants_rows.append(grants_row)
+            for outstanding_equity_row in outstanding_equity_rows_to_write:
+                outstanding_equity_writer.writerow(outstanding_equity_row)
+                all_outstanding_equity_rows.append(outstanding_equity_row)
             for compensation_row in compensation_rows_to_write:
                 compensation_writer.writerow(compensation_row)
                 all_compensation_rows.append(compensation_row)
             key_results_file.flush()
             batch_log_file.flush()
             grants_master_file.flush()
+            outstanding_equity_master_file.flush()
             compensation_master_file.flush()
 
             if result_row.get("status") == "ok":
@@ -2240,6 +2659,28 @@ def main() -> None:
                 writer.writerow(row)
 
     grouped_compensation_rows: dict[tuple[str, str], list[dict[str, str]]] = {}
+    grouped_outstanding_equity_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in all_outstanding_equity_rows:
+        row_cik = str(row.get("__cik", "") or "").strip()
+        row_fiscal_year = str(row.get("__fiscal_year", "") or "").strip()
+        if not row_cik:
+            continue
+        if not re.fullmatch(r"\d{4}", row_fiscal_year):
+            row_fiscal_year = "unknown"
+        grouped_outstanding_equity_rows.setdefault((row_cik, row_fiscal_year), []).append(row)
+
+    for (row_cik, row_fiscal_year), rows in grouped_outstanding_equity_rows.items():
+        per_file_path = outstanding_equity_by_cik_year_dir / f"{row_cik}_{row_fiscal_year}.csv"
+        with per_file_path.open("w", newline="", encoding="utf-8") as per_file:
+            writer = csv.DictWriter(
+                per_file,
+                fieldnames=OUTSTANDING_EQUITY_AWARDS_OUTPUT_COLUMNS,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
     for row in all_compensation_rows:
         row_cik = str(row.get("__cik", "") or "").strip()
         row_year = str(row.get("__year", "") or "").strip()
@@ -2282,6 +2723,8 @@ def main() -> None:
     log.info("batch_log_failed -> %s (rows=%d)", batch_log_failed_path, len(failed_log_rows))
     log.info("grants master -> %s", grants_master_path)
     log.info("grants by cik/year -> %s", grants_by_cik_year_dir)
+    log.info("outstanding equity awards master -> %s", outstanding_equity_master_path)
+    log.info("outstanding equity awards by cik/year -> %s", outstanding_equity_by_cik_year_dir)
     log.info("compensation master -> %s", compensation_master_path)
     log.info("compensation by cik/year -> %s", compensation_by_cik_year_dir)
 

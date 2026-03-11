@@ -69,6 +69,14 @@ NUMERIC_COLUMNS = {
     "payments",
     "exercise_price",
     "stock_awards_unvested_value",
+    "options_exercisable",
+    "options_unexercisable",
+    "equity_incentive_unearned_options",
+    "option_exercise_price",
+    "stock_unvested_shares",
+    "stock_unvested_value",
+    "equity_incentive_unearned_shares",
+    "equity_incentive_unearned_value",
     "non_equity_threshold",
     "non_equity_target",
     "non_equity_maximum",
@@ -125,13 +133,40 @@ _NUMERIC_EMPTY_MARKERS = {"", "—", "-", "$", "n/a", "na"}
 
 _EQUITY_AWARDS_COLS: dict[str, list[str]] = {
     "exec_name": ["name", "executive"],
-    "option_grant_date": ["grant date", "option grant"],
-    "options_unexercisable": ["unexercisable", "unvested options"],
-    "options_exercisable": ["exercisable", "vested options"],
-    "exercise_price": ["exercise price", "option exercise price"],
-    "expiration_date": ["expiration", "option expiration"],
-    "stock_awards_unvested_shares": ["unvested shares", "number of shares", "shares not vested"],
-    "stock_awards_unvested_value": ["market value", "unvested value"],
+    "grant_date": ["grant date"],
+    "options_exercisable": [
+        "number of securities underlying unexercised options exercisable",
+        "unexercised options exercisable",
+        "options exercisable",
+    ],
+    "options_unexercisable": [
+        "number of securities underlying unexercised options unexercisable",
+        "unexercised options unexercisable",
+        "options unexercisable",
+    ],
+    "equity_incentive_unearned_options": [
+        "equity incentive plan awards number of securities underlying unexercised unearned options",
+        "unearned options",
+    ],
+    "option_exercise_price": ["option exercise price", "exercise price"],
+    "option_expiration_date": ["option expiration date", "expiration date"],
+    "stock_unvested_shares": [
+        "number of shares or units of stock that have not vested",
+        "shares not vested",
+        "units not vested",
+    ],
+    "stock_unvested_value": [
+        "market value of shares or units of stock that have not vested",
+        "market value not vested",
+    ],
+    "equity_incentive_unearned_shares": [
+        "equity incentive plan awards number of unearned shares units or other rights that have not vested",
+        "unearned shares that have not vested",
+    ],
+    "equity_incentive_unearned_value": [
+        "equity incentive plan awards market or payout value of unearned shares units or other rights that have not vested",
+        "market or payout value of unearned shares",
+    ],
 }
 
 _GRANTS_COLS: dict[str, list[str]] = {
@@ -184,6 +219,11 @@ _GRANTS_TYPE_ROW_HINTS = {
     "time-lapse rsu",
     "time lapse rsu",
     "stock option",
+}
+
+_EQUITY_NAME_HEADER_HINTS = {
+    "name",
+    "named executive officer",
 }
 
 _OPTION_EXERCISES_COLS: dict[str, list[str]] = {
@@ -917,17 +957,440 @@ def extract_summary_compensation(
     return [row for row in valid_rows if str(row.get("table_block_id", "") or "") == selected_id]
 
 
+def _resolve_equity_awards_source_section(blocks: list[BaseBlock], table_block: TableBlock) -> str:
+    heading_by_id = _index_headings(blocks)
+    for index, block in enumerate(blocks):
+        if not isinstance(block, TableBlock) or block.id != table_block.id:
+            continue
+        source_heading = _resolve_source_heading(
+            blocks,
+            index,
+            table_block,
+            _TABLE_SIGNATURES["equity_awards"],
+            heading_by_id,
+        )
+        if source_heading is not None:
+            return source_heading
+
+        start = max(0, index - 12)
+        for probe_index in range(index - 1, start - 1, -1):
+            probe = blocks[probe_index]
+            probe_text = ""
+            if isinstance(probe, HeadingBlock):
+                probe_text = probe.text
+            elif isinstance(probe, ProseBlock):
+                probe_text = probe.text
+            if probe_text and _heading_matches(probe_text, _TABLE_SIGNATURES["equity_awards"]):
+                return probe_text
+        break
+    return "outstanding equity awards at fiscal year-end"
+
+
+def _infer_equity_awards_header_rows(table_block: TableBlock) -> int:
+    """Infer header depth for outstanding equity awards tables."""
+    if not table_block.rows:
+        return 0
+
+    max_scan = min(12, len(table_block.rows))
+    subheader_index: int | None = None
+    for index in range(max_scan):
+        text = _row_text(table_block.rows[index])
+        if not text:
+            continue
+        tokens = _header_tokens(text)
+        has_name = "name" in tokens
+        has_grant_date = _has_tokens(text, "grant", "date")
+        has_option = "option" in tokens or "options" in tokens
+        has_exercise = "exercise" in tokens or "exercisable" in tokens or "unexercisable" in tokens
+        has_stock = "stock" in tokens and (
+            "shares" in tokens or "units" in tokens or ("not" in tokens and "vested" in tokens)
+        )
+        if has_name and has_option and has_exercise and (has_grant_date or has_stock):
+            subheader_index = index
+            break
+
+    if subheader_index is not None:
+        return max(1, subheader_index + 1)
+    if table_block.header_row_count > 0:
+        return min(max(1, table_block.header_row_count), len(table_block.rows))
+    return min(6, len(table_block.rows))
+
+
+def _equity_data_rows_with_index(table_block: TableBlock) -> list[tuple[int, list[str]]]:
+    if not table_block.rows:
+        return []
+    header_rows = _infer_equity_awards_header_rows(table_block)
+    start_index = min(header_rows, len(table_block.rows))
+    return list(enumerate(table_block.rows[start_index:], start=start_index))
+
+
+def _build_equity_awards_column_map(
+    table_block: TableBlock,
+    schema: dict[str, list[str]],
+    header_rows: int | None = None,
+) -> list[str | None]:
+    """Build robust column mapping for outstanding equity awards tables."""
+    if not table_block.rows:
+        return []
+
+    resolved_header_rows = (
+        header_rows if header_rows is not None else _infer_equity_awards_header_rows(table_block)
+    )
+    resolved_header_rows = min(max(1, resolved_header_rows), len(table_block.rows), 12)
+    header_slice = table_block.rows[:resolved_header_rows]
+    column_count = max((len(row) for row in header_slice), default=0)
+
+    group_context: list[str | None] = [None] * column_count
+    for row in header_slice:
+        last_group: str | None = None
+        for column_index in range(column_count):
+            cell = _normalise(row[column_index]) if column_index < len(row) else ""
+            if not cell:
+                if last_group is not None and group_context[column_index] is None:
+                    group_context[column_index] = last_group
+                continue
+            if "option awards" in cell or "unexercised options" in cell:
+                last_group = "option"
+                group_context[column_index] = "option"
+                continue
+            if "stock awards" in cell or ("stock" in cell and "not vested" in cell):
+                last_group = "stock"
+                group_context[column_index] = "stock"
+                continue
+            if "equity incentive plan awards" in cell:
+                last_group = "equity_incentive"
+                group_context[column_index] = "equity_incentive"
+                continue
+
+    column_map: list[str | None] = []
+    for column_index in range(column_count):
+        column_cells: list[str] = []
+        for row in header_slice:
+            if column_index >= len(row):
+                continue
+            cell = row[column_index].strip()
+            if cell:
+                column_cells.append(cell)
+        combined_header = _normalise(" ".join(column_cells))
+        if not combined_header:
+            column_map.append(None)
+            continue
+
+        tokens = _header_tokens(combined_header)
+        canonical: str | None = None
+        if _contains_any(combined_header, _EQUITY_NAME_HEADER_HINTS):
+            canonical = "exec_name"
+        elif _has_tokens(combined_header, "grant", "date") and "expiration" not in tokens:
+            canonical = "grant_date"
+        elif _has_tokens(combined_header, "expiration", "date"):
+            canonical = "option_expiration_date"
+        elif _has_tokens(combined_header, "exercise", "price"):
+            canonical = "option_exercise_price"
+        elif "unexercisable" in tokens:
+            canonical = "options_unexercisable"
+        elif "exercisable" in tokens and ("option" in tokens or "options" in tokens):
+            canonical = "options_exercisable"
+        elif "unearned" in tokens and "options" in tokens:
+            canonical = "equity_incentive_unearned_options"
+        elif (
+            ("shares" in tokens or "units" in tokens)
+            and "stock" in tokens
+            and "not" in tokens
+            and "vested" in tokens
+            and "market" not in tokens
+            and "payout" not in tokens
+        ):
+            canonical = "stock_unvested_shares"
+        elif (
+            ("market" in tokens and "value" in tokens) or "payout" in tokens
+        ) and "stock" in tokens and "not" in tokens and "vested" in tokens:
+            canonical = "stock_unvested_value"
+        elif (
+            "unearned" in tokens
+            and ("shares" in tokens or "units" in tokens or "rights" in tokens)
+            and "not" in tokens
+            and "vested" in tokens
+            and "market" not in tokens
+            and "payout" not in tokens
+        ):
+            canonical = "equity_incentive_unearned_shares"
+        elif (
+            "unearned" in tokens
+            and ("shares" in tokens or "units" in tokens or "rights" in tokens)
+            and "not" in tokens
+            and "vested" in tokens
+            and (("market" in tokens and "value" in tokens) or "payout" in tokens)
+        ):
+            canonical = "equity_incentive_unearned_value"
+        else:
+            canonical = _match_col(combined_header, schema)
+
+        if canonical is None:
+            if group_context[column_index] == "option" and "exercisable" in combined_header:
+                canonical = "options_exercisable"
+            elif group_context[column_index] == "option" and "unexercisable" in combined_header:
+                canonical = "options_unexercisable"
+            elif group_context[column_index] == "equity_incentive" and "unearned" in combined_header:
+                if "options" in combined_header:
+                    canonical = "equity_incentive_unearned_options"
+                elif "market" in combined_header or "payout" in combined_header:
+                    canonical = "equity_incentive_unearned_value"
+                else:
+                    canonical = "equity_incentive_unearned_shares"
+            elif group_context[column_index] == "stock" and "market" in combined_header:
+                canonical = "stock_unvested_value"
+            elif group_context[column_index] == "stock":
+                canonical = "stock_unvested_shares"
+
+        column_map.append(canonical)
+
+    return column_map
+
+
+def _normalize_currency_symbol_split_cells(row: list[str]) -> list[str]:
+    normalized = [cell.strip() for cell in row]
+    for idx in range(len(normalized) - 1):
+        left = normalized[idx]
+        right = normalized[idx + 1]
+        if left == "$" and right and any(char.isdigit() for char in right) and not right.startswith("$"):
+            normalized[idx] = ""
+            normalized[idx + 1] = f"${right}"
+    return normalized
+
+
+def _equity_candidate_indices(column_map: list[str | None]) -> dict[str, list[int]]:
+    candidates: dict[str, list[int]] = {}
+    for index, canonical in enumerate(column_map):
+        if canonical is None:
+            continue
+        candidates.setdefault(canonical, []).append(index)
+    return candidates
+
+
+def _is_date_like_value(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    return bool(
+        re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", text)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}", text)
+        or re.search(r"[A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4}", text)
+    )
+
+
+def _select_best_equity_cell(row: list[str], indices: list[int], canonical: str) -> str:
+    values: list[str] = []
+    for index in indices:
+        if index >= len(row):
+            continue
+        value = row[index].strip()
+        if value:
+            values.append(value)
+    if not values:
+        return ""
+
+    def _rank(value: str) -> tuple[int, int]:
+        if canonical in {"grant_date", "option_expiration_date"}:
+            if _is_date_like_value(value):
+                return (4, len(value))
+            if any(char.isdigit() for char in value):
+                return (2, len(value))
+            return (1, len(value))
+        if any(char.isdigit() for char in value):
+            return (4, len(value))
+        if value in {"$", "—", "-", "n/a", "na"}:
+            return (1, len(value))
+        return (2, len(value))
+
+    return max(values, key=_rank)
+
+
+def _map_equity_awards_row(
+    row: list[str],
+    column_map: list[str | None],
+    metadata: Mapping[str, Any],
+    footnotes: dict[str, str],
+    source_section: str,
+    table_block_id: str,
+) -> dict[str, Any]:
+    output: dict[str, Any] = dict(metadata)
+    normalized_row = _normalize_currency_symbol_split_cells(row)
+    candidates = _equity_candidate_indices(column_map)
+    mapped_values = 0
+    for canonical, indices in candidates.items():
+        value = _select_best_equity_cell(normalized_row, indices, canonical)
+        if not value:
+            continue
+        output[canonical] = value
+        if canonical in NUMERIC_COLUMNS:
+            numeric_val = clean_numeric(value)
+            output[canonical] = numeric_val if numeric_val is not None else value
+        mapped_values += 1
+
+    if mapped_values == 0 and normalized_row:
+        output["exec_name"] = normalized_row[0].strip()
+
+    # Backward-compatible aliases for existing callers.
+    if "grant_date" in output and "option_grant_date" not in output:
+        output["option_grant_date"] = output["grant_date"]
+    if "option_exercise_price" in output and "exercise_price" not in output:
+        output["exercise_price"] = output["option_exercise_price"]
+    if "option_expiration_date" in output and "expiration_date" not in output:
+        output["expiration_date"] = output["option_expiration_date"]
+    if "stock_unvested_shares" in output and "stock_awards_unvested_shares" not in output:
+        output["stock_awards_unvested_shares"] = output["stock_unvested_shares"]
+    if "stock_unvested_value" in output and "stock_awards_unvested_value" not in output:
+        output["stock_awards_unvested_value"] = output["stock_unvested_value"]
+
+    output["footnote_refs"] = _extract_row_footnote_refs(normalized_row, footnotes)
+    output["source_section"] = source_section
+    output["table_block_id"] = table_block_id
+    return output
+
+
+def _equity_awards_row_has_payload(row: Mapping[str, Any]) -> bool:
+    for field in (
+        "options_exercisable",
+        "options_unexercisable",
+        "equity_incentive_unearned_options",
+        "option_exercise_price",
+        "stock_unvested_shares",
+        "stock_unvested_value",
+        "equity_incentive_unearned_shares",
+        "equity_incentive_unearned_value",
+    ):
+        value = row.get(field)
+        if isinstance(value, (int, float)):
+            return True
+        text = str(value or "").strip()
+        if text and any(char.isdigit() for char in text):
+            return True
+    return False
+
+
+def _is_equity_name_only_row(row: Mapping[str, Any]) -> bool:
+    exec_name = str(row.get("exec_name", "") or "").strip()
+    if not exec_name:
+        return False
+    if str(row.get("grant_date", "") or "").strip():
+        return False
+    if str(row.get("option_expiration_date", "") or "").strip():
+        return False
+    return not _equity_awards_row_has_payload(row)
+
+
+def _normalize_equity_awards_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("table_block_id", "") or ""),
+            int(row.get("source_row_index", 0) or 0),
+        ),
+    )
+    current_name_by_table: dict[str, str] = {}
+    normalized_rows: list[dict[str, Any]] = []
+
+    for row in sorted_rows:
+        out = dict(row)
+        table_id = str(out.get("table_block_id", "") or "")
+        current_exec_name = current_name_by_table.get(table_id, "")
+        raw_exec_name = str(out.get("exec_name", "") or "").strip()
+
+        if _is_equity_name_only_row(out):
+            current_name_by_table[table_id] = raw_exec_name
+            continue
+
+        if raw_exec_name:
+            current_name_by_table[table_id] = raw_exec_name
+        elif current_exec_name:
+            out["exec_name"] = current_exec_name
+
+        if _equity_awards_row_has_payload(out):
+            normalized_rows.append(out)
+
+    return normalized_rows
+
+
+def _extract_equity_from_table_block(
+    table_block: TableBlock,
+    footnotes_by_table: dict[str, dict[str, str]],
+    meta: Mapping[str, Any],
+    source_section: str,
+) -> list[dict[str, Any]]:
+    header_rows = _infer_equity_awards_header_rows(table_block)
+    column_map = _build_equity_awards_column_map(table_block, _EQUITY_AWARDS_COLS, header_rows=header_rows)
+    if not column_map:
+        return []
+
+    footnotes = _collect_table_footnotes(table_block, footnotes_by_table)
+    rows_out: list[dict[str, Any]] = []
+    for source_row_index, row in _equity_data_rows_with_index(table_block):
+        if not any(cell.strip() for cell in row):
+            continue
+        mapped = _map_equity_awards_row(
+            row=row,
+            column_map=column_map,
+            metadata=meta,
+            footnotes=footnotes,
+            source_section=source_section,
+            table_block_id=table_block.id,
+        )
+        mapped["source_row_index"] = source_row_index
+        rows_out.append(mapped)
+    return rows_out
+
+
 def extract_equity_awards(
     blocks: list[BaseBlock],
     meta: Mapping[str, Any],
+    *,
+    selected_table: TableBlock | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract Outstanding Equity Awards table rows."""
-    return _extract_table(
-        blocks,
-        _TABLE_SIGNATURES["equity_awards"],
-        _EQUITY_AWARDS_COLS,
-        meta,
-    )
+    """
+    Extract Outstanding Equity Awards table rows.
+
+    If ``selected_table`` is provided, it is parsed explicitly even when no
+    matching heading block is present.
+    """
+    heading_by_id = _index_headings(blocks)
+    footnotes_by_table = _index_footnotes(blocks)
+
+    heading_rows: list[dict[str, Any]] = []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, TableBlock):
+            continue
+        source_heading = _resolve_source_heading(
+            blocks,
+            index,
+            block,
+            _TABLE_SIGNATURES["equity_awards"],
+            heading_by_id,
+        )
+        if source_heading is None:
+            continue
+        heading_rows.extend(_extract_equity_from_table_block(block, footnotes_by_table, meta, source_heading))
+
+    explicit_rows: list[dict[str, Any]] = []
+    if selected_table is not None:
+        source_section = _resolve_equity_awards_source_section(blocks, selected_table)
+        explicit_rows = _extract_equity_from_table_block(selected_table, footnotes_by_table, meta, source_section)
+
+    merged = explicit_rows + heading_rows
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in merged:
+        table_id = str(row.get("table_block_id", "") or "")
+        row_index = int(row.get("source_row_index", -1) or -1)
+        key = (table_id, row_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return _normalize_equity_awards_rows(deduped)
 
 
 def _resolve_grants_source_section(blocks: list[BaseBlock], table_block: TableBlock) -> str:

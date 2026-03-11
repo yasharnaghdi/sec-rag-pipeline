@@ -301,6 +301,77 @@ class CompanyGrantsResult(BaseModel):
         return self
 
 
+class OutstandingEquityAwardRecord(BaseModel):
+    """One row from Outstanding Equity Awards at Fiscal Year-End."""
+
+    name: str = Field(default="", description="Name column value as shown in filing.")
+    grant_date: str | None = Field(default=None, description="Grant date text.")
+    options_exercisable: str | None = Field(
+        default=None,
+        description="Number of securities underlying unexercised options exercisable.",
+    )
+    options_unexercisable: str | None = Field(
+        default=None,
+        description="Number of securities underlying unexercised options unexercisable.",
+    )
+    equity_incentive_unearned_options: str | None = Field(
+        default=None,
+        description="Equity incentive plan awards number of securities underlying unexercised unearned options.",
+    )
+    option_exercise_price: str | None = Field(default=None, description="Option exercise price.")
+    option_expiration_date: str | None = Field(default=None, description="Option expiration date text.")
+    stock_unvested_shares: str | None = Field(
+        default=None,
+        description="Number of shares or units of stock that have not vested.",
+    )
+    stock_unvested_value: str | None = Field(
+        default=None,
+        description="Market value of shares or units of stock that have not vested.",
+    )
+    equity_incentive_unearned_shares: str | None = Field(
+        default=None,
+        description="Equity incentive plan awards number of unearned shares/units/rights not vested.",
+    )
+    equity_incentive_unearned_value: str | None = Field(
+        default=None,
+        description="Equity incentive plan awards market or payout value of unearned shares/units/rights not vested.",
+    )
+
+    @model_validator(mode="after")
+    def normalize_fields(self) -> OutstandingEquityAwardRecord:
+        numeric_fields = (
+            "options_exercisable",
+            "options_unexercisable",
+            "equity_incentive_unearned_options",
+            "option_exercise_price",
+            "stock_unvested_shares",
+            "stock_unvested_value",
+            "equity_incentive_unearned_shares",
+            "equity_incentive_unearned_value",
+        )
+        for field_name in numeric_fields:
+            raw_value = cast(str | None, getattr(self, field_name))
+            setattr(self, field_name, _normalize_numeric_value(raw_value))
+
+        self.name = self.name.strip()
+        self.grant_date = _normalize_optional_text(self.grant_date)
+        self.option_expiration_date = _normalize_optional_text(self.option_expiration_date)
+        return self
+
+
+class CompanyOutstandingEquityAwardsResult(BaseModel):
+    """Structured outstanding-equity-awards extraction result for one filing."""
+
+    rows: list[OutstandingEquityAwardRecord] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    notes: str = Field(default="")
+
+    @model_validator(mode="after")
+    def clamp_confidence(self) -> CompanyOutstandingEquityAwardsResult:
+        self.confidence = max(0.0, min(1.0, self.confidence))
+        return self
+
+
 _SYSTEM_PROMPT = """\
 You are a financial data extraction assistant specialised in SEC DEF 14A
 proxy statement compensation tables.
@@ -412,6 +483,53 @@ REQUIRED JSON SCHEMA:
       "all_other_option_awards_securities": null,
       "exercise_or_base_price": null,
       "grant_date_fair_value": null
+    }
+  ],
+  "confidence": 0.0,
+  "notes": ""
+}
+"""
+
+_OUTSTANDING_EQUITY_SYSTEM_PROMPT = """\
+You are a financial data extraction assistant specialised in SEC DEF 14A
+proxy statement compensation tables.
+
+You will receive the linearized text of an Outstanding Equity Awards at Fiscal
+Year-End table. Extract each row and return ONLY valid JSON matching the
+schema below.
+
+EXTRACTION RULES:
+1. Preserve row granularity and keep one output row per source row.
+2. Field mapping is strict:
+   - options_exercisable <- Number of Securities Underlying Unexercised Options Exercisable (#)
+   - options_unexercisable <- Number of Securities Underlying Unexercised Options Unexercisable (#)
+   - equity_incentive_unearned_options <- Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)
+   - option_exercise_price <- Option Exercise Price ($)
+   - option_expiration_date <- Option Expiration Date
+   - stock_unvested_shares <- Number of Shares or Units of Stock that Have Not Vested (#)
+   - stock_unvested_value <- Market Value of Shares or Units of Stock that Have Not Vested ($)
+   - equity_incentive_unearned_shares <- Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)
+   - equity_incentive_unearned_value <- Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)
+3. Numeric values should be plain digit strings where possible. Use null for
+   missing/dash values. Keep dates as source text.
+4. Do NOT invent values. Return empty strings or null where data is absent.
+5. Return ONLY JSON. No prose and no markdown.
+
+REQUIRED JSON SCHEMA:
+{
+  "rows": [
+    {
+      "name": "",
+      "grant_date": null,
+      "options_exercisable": null,
+      "options_unexercisable": null,
+      "equity_incentive_unearned_options": null,
+      "option_exercise_price": null,
+      "option_expiration_date": null,
+      "stock_unvested_shares": null,
+      "stock_unvested_value": null,
+      "equity_incentive_unearned_shares": null,
+      "equity_incentive_unearned_value": null
     }
   ],
   "confidence": 0.0,
@@ -585,6 +703,22 @@ def _parse_and_validate_grants(raw: str) -> CompanyGrantsResult | None:
         return CompanyGrantsResult.model_validate(data)
     except Exception as exc:  # noqa: BLE001
         log.debug("LLM schema validation error (grants): %s", exc)
+        return None
+
+
+def _parse_and_validate_outstanding_equity_awards(
+    raw: str,
+) -> CompanyOutstandingEquityAwardsResult | None:
+    """Parse raw LLM JSON into CompanyOutstandingEquityAwardsResult."""
+    try:
+        data: dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.debug("LLM JSON parse error (outstanding equity): %s", exc)
+        return None
+    try:
+        return CompanyOutstandingEquityAwardsResult.model_validate(data)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("LLM schema validation error (outstanding equity): %s", exc)
         return None
 
 
@@ -944,3 +1078,163 @@ def extract_grants_from_plan_based_table(
         accession_number,
     )
     return CompanyGrantsResult()
+
+
+def extract_outstanding_equity_awards_table(
+    *,
+    company_name: str,
+    cik: str,
+    filing_date: str,
+    accession_number: str,
+    table_text: str,
+    model: str = "gpt-4o-mini",
+    client: OpenAI | None = None,
+) -> CompanyOutstandingEquityAwardsResult:
+    """Extract row-level Outstanding Equity Awards at Fiscal Year-End data from one table."""
+    if not table_text or not table_text.strip():
+        log.warning(
+            "llm_extractor_outstanding_equity | empty table_text | cik=%s accession=%s",
+            cik,
+            accession_number,
+        )
+        return CompanyOutstandingEquityAwardsResult()
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key.strip():
+        project_root = Path(__file__).resolve().parents[1]
+        load_dotenv(project_root / ".env", override=False)
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+    use_ollama = client is None and api_key.strip().lower() in _DUMMY_KEY_VALUES
+    if client is None and not use_ollama:
+        client = OpenAI(api_key=api_key)
+
+    user_message = _build_user_message(
+        company_name,
+        cik,
+        filing_date,
+        table_text,
+        table_label="Outstanding Equity Awards at Fiscal Year-End Table",
+    )
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _OUTSTANDING_EQUITY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    if use_ollama:
+        log.info(
+            "llm_extractor_outstanding_equity | routing to Ollama (no valid OpenAI key) | "
+            "cik=%s model=%s",
+            cik,
+            os.environ.get("OLLAMA_MODEL", _OLLAMA_MODEL_DEFAULT),
+        )
+    else:
+        log.info(
+            "llm_extractor_outstanding_equity | attempt 1 via OpenAI | cik=%s model=%s tokens_approx=%d",
+            cik,
+            model,
+            len(table_text.split()),
+        )
+
+    try:
+        if use_ollama:
+            raw = _call_ollama(messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw = _call_openai(client, messages, model)
+    except Exception as exc:  # noqa: BLE001
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor_outstanding_equity | OpenAI auth failed, falling back to Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw = _call_ollama(messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor_outstanding_equity | API error attempt 1 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyOutstandingEquityAwardsResult()
+        else:
+            log.error(
+                "llm_extractor_outstanding_equity | API error attempt 1 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyOutstandingEquityAwardsResult()
+
+    result = _parse_and_validate_outstanding_equity_awards(raw)
+    if result is not None:
+        log.info(
+            "llm_extractor_outstanding_equity | success attempt 1 | cik=%s confidence=%.2f rows=%d",
+            cik,
+            result.confidence,
+            len(result.rows),
+        )
+        return result
+
+    log.warning("llm_extractor_outstanding_equity | invalid response attempt 1 | cik=%s", cik)
+    retry_messages = messages + [
+        {"role": "assistant", "content": raw},
+        {"role": "user", "content": _RETRY_SYSTEM_PROMPT},
+    ]
+
+    log.info("llm_extractor_outstanding_equity | attempt 2 (retry) | cik=%s", cik)
+    try:
+        if use_ollama:
+            raw_retry = _call_ollama(retry_messages)
+        else:
+            if client is None:
+                client = OpenAI(api_key=api_key)
+            raw_retry = _call_openai(client, retry_messages, model)
+    except Exception as exc:  # noqa: BLE001
+        if not use_ollama and _is_openai_auth_error(exc):
+            log.warning(
+                "llm_extractor_outstanding_equity | OpenAI auth failed on retry, using Ollama | "
+                "cik=%s error=%s",
+                cik,
+                exc,
+            )
+            use_ollama = True
+            try:
+                raw_retry = _call_ollama(retry_messages)
+            except Exception as ollama_exc:  # noqa: BLE001
+                log.error(
+                    "llm_extractor_outstanding_equity | API error attempt 2 | cik=%s backend=%s error=%s",
+                    cik,
+                    "ollama",
+                    ollama_exc,
+                )
+                return CompanyOutstandingEquityAwardsResult()
+        else:
+            log.error(
+                "llm_extractor_outstanding_equity | API error attempt 2 | cik=%s backend=%s error=%s",
+                cik,
+                "ollama" if use_ollama else "openai",
+                exc,
+            )
+            return CompanyOutstandingEquityAwardsResult()
+
+    result_retry = _parse_and_validate_outstanding_equity_awards(raw_retry)
+    if result_retry is not None:
+        log.info(
+            "llm_extractor_outstanding_equity | success attempt 2 | cik=%s confidence=%.2f rows=%d",
+            cik,
+            result_retry.confidence,
+            len(result_retry.rows),
+        )
+        return result_retry
+
+    log.error(
+        "llm_extractor_outstanding_equity | failed both attempts | cik=%s accession=%s",
+        cik,
+        accession_number,
+    )
+    return CompanyOutstandingEquityAwardsResult()
