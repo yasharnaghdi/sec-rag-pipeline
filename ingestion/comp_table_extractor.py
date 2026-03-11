@@ -130,6 +130,44 @@ _SUMMARY_COMP_REQUIRED_NUMERIC_COLS = {
 }
 
 _NUMERIC_EMPTY_MARKERS = {"", "—", "-", "$", "n/a", "na"}
+_EXEC_TITLE_KEYWORDS = {
+    "officer",
+    "president",
+    "director",
+    "chair",
+    "chairman",
+    "chairwoman",
+    "executive",
+    "ceo",
+    "cfo",
+    "coo",
+    "chief",
+    "vice president",
+    "svp",
+    "evp",
+    "vp",
+    "general counsel",
+    "treasurer",
+    "secretary",
+}
+_EXEC_TITLE_LEAD_TOKENS = {
+    "chief",
+    "president",
+    "chair",
+    "chairman",
+    "chairwoman",
+    "director",
+    "executive",
+    "senior",
+    "vice",
+    "interim",
+    "acting",
+    "lead",
+    "principal",
+    "general",
+    "co-chief",
+    "co-president",
+}
 
 _EQUITY_AWARDS_COLS: dict[str, list[str]] = {
     "exec_name": ["name", "executive"],
@@ -265,7 +303,7 @@ def clean_numeric(val: str) -> float | None:
 
 def _heading_matches(heading_text: str, signatures: list[str]) -> bool:
     heading = _normalise(heading_text)
-    return any(signature in heading for signature in signatures)
+    return any(_normalise(signature) in heading for signature in signatures)
 
 
 def _match_col(header: str, mapping: dict[str, list[str]]) -> str | None:
@@ -366,7 +404,12 @@ def _row_text(row: list[str]) -> str:
 
 
 def _header_tokens(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", text))
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    if "nonequity" in tokens:
+        tokens.update({"non", "equity"})
+    if "planbased" in tokens:
+        tokens.update({"plan", "based"})
+    return tokens
 
 
 def _has_tokens(text: str, *required: str) -> bool:
@@ -377,7 +420,8 @@ def _has_tokens(text: str, *required: str) -> bool:
 def _is_non_equity_grants_context(text: str) -> bool:
     tokens = _header_tokens(text)
     return (
-        all(token in tokens for token in ("non", "equity", "incentive", "plan"))
+        ("nonequity" in tokens or "non" in tokens)
+        and all(token in tokens for token in ("equity", "incentive", "plan"))
         and ("award" in tokens or "awards" in tokens)
     )
 
@@ -385,7 +429,8 @@ def _is_non_equity_grants_context(text: str) -> bool:
 def _is_equity_grants_context(text: str) -> bool:
     tokens = _header_tokens(text)
     return (
-        "non" not in tokens
+        "nonequity" not in tokens
+        and "non" not in tokens
         and all(token in tokens for token in ("equity", "incentive", "plan"))
         and ("award" in tokens or "awards" in tokens)
     )
@@ -479,13 +524,11 @@ def _build_grants_column_map(
         last_group: str | None = None
         for column_index in range(column_count):
             cell = _normalise(row[column_index]) if column_index < len(row) else ""
-            if _contains_any(cell, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(cell):
+            if _is_non_equity_grants_context(cell):
                 last_group = "non_equity"
                 group_context[column_index] = "non_equity"
                 continue
-            if (_contains_any(cell, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(cell)) and (
-                "non-equity" not in cell and "non equity" not in cell
-            ):
+            if _is_equity_grants_context(cell):
                 last_group = "equity"
                 group_context[column_index] = "equity"
                 continue
@@ -528,27 +571,27 @@ def _build_grants_column_map(
         elif "exercise or base price" in combined_header or "exercise price" in combined_header:
             canonical = "exercise_or_base_price"
         elif "threshold" in combined_header:
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
+            if _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_threshold"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
+            elif _is_equity_grants_context(combined_header):
                 canonical = "equity_threshold"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_threshold"
             elif group_context[column_index] == "equity":
                 canonical = "equity_threshold"
         elif "target" in combined_header:
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
+            if _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_target"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
+            elif _is_equity_grants_context(combined_header):
                 canonical = "equity_target"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_target"
             elif group_context[column_index] == "equity":
                 canonical = "equity_target"
         elif "maximum" in combined_header or " max " in f" {combined_header} ":
-            if _contains_any(combined_header, _GRANTS_NON_EQUITY_HINTS) or _is_non_equity_grants_context(combined_header):
+            if _is_non_equity_grants_context(combined_header):
                 canonical = "non_equity_maximum"
-            elif _contains_any(combined_header, _GRANTS_EQUITY_HINTS) or _is_equity_grants_context(combined_header):
+            elif _is_equity_grants_context(combined_header):
                 canonical = "equity_maximum"
             elif group_context[column_index] == "non_equity":
                 canonical = "non_equity_maximum"
@@ -664,6 +707,74 @@ def _map_grants_row(
     return output
 
 
+def _looks_like_exec_title(value: str) -> bool:
+    lowered = value.lower()
+    return any(keyword in lowered for keyword in _EXEC_TITLE_KEYWORDS)
+
+
+def _split_exec_name_and_title(value: str) -> tuple[str, str]:
+    raw_value = value.strip()
+    if not raw_value:
+        return "", ""
+
+    line_parts = [part.strip(" ,") for part in re.split(r"[\r\n]+", raw_value) if part.strip(" ,")]
+    if len(line_parts) >= 2:
+        title_candidate = " ".join(line_parts[1:]).strip()
+        if _looks_like_exec_title(title_candidate):
+            return line_parts[0], title_candidate
+
+    normalized = re.sub(r"\s+", " ", raw_value).strip(" ,")
+    if "," in normalized:
+        name_part, _, title_part = normalized.partition(",")
+        title_candidate = title_part.strip()
+        if _looks_like_exec_title(title_candidate):
+            return name_part.strip(), title_candidate
+
+    tokens = normalized.split()
+    for index in range(2, len(tokens)):
+        token = re.sub(r"^[^A-Za-z]+|[^A-Za-z-]+$", "", tokens[index]).lower()
+        if token not in _EXEC_TITLE_LEAD_TOKENS:
+            continue
+        name_candidate = " ".join(tokens[:index]).strip(" ,")
+        title_candidate = " ".join(tokens[index:]).strip(" ,")
+        if name_candidate and _looks_like_exec_title(title_candidate):
+            return name_candidate, title_candidate
+
+    return normalized, ""
+
+
+def _normalize_summary_numeric_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return format(value, "f").rstrip("0").rstrip(".")
+        return str(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in _NUMERIC_EMPTY_MARKERS:
+        return None
+
+    cleaned = re.sub(r"[$,\s]", "", text)
+    cleaned = re.sub(r"^\((.+)\)$", r"-\1", cleaned)
+    if re.fullmatch(r"-?\d+(\.\d+)?", cleaned):
+        if cleaned.endswith(".0"):
+            return cleaned[:-2]
+        return cleaned
+    return text
+
+
+def _summary_row_has_payload(row: Mapping[str, Any]) -> bool:
+    if str(row.get("year", "") or "").strip():
+        return True
+    for field in _SUMMARY_COMP_REQUIRED_NUMERIC_COLS:
+        if _normalize_summary_numeric_value(row.get(field)) is not None:
+            return True
+    return False
+
+
 def _map_row(
     row: list[str],
     column_map: list[str | None],
@@ -703,30 +814,10 @@ def _map_row(
     # Split "Name and Principal Position" cells into name + title when possible.
     raw_exec = str(output.get("exec_name", "") or "")
     if raw_exec and not output.get("exec_title"):
-        if "\n" in raw_exec:
-            parts = [part.strip() for part in raw_exec.split("\n", 1) if part.strip()]
-            if len(parts) == 2:
-                output["exec_name"] = parts[0]
-                output["exec_title"] = parts[1]
-        elif "," in raw_exec:
-            name_part, _, title_part = raw_exec.partition(",")
-            title_candidate = title_part.strip()
-            title_keywords = {
-                "officer",
-                "president",
-                "director",
-                "chairman",
-                "executive",
-                "ceo",
-                "cfo",
-                "coo",
-                "svp",
-                "evp",
-                "vp",
-            }
-            if any(keyword in title_candidate.lower() for keyword in title_keywords):
-                output["exec_name"] = name_part.strip()
-                output["exec_title"] = title_candidate
+        exec_name, exec_title = _split_exec_name_and_title(raw_exec)
+        output["exec_name"] = exec_name
+        if exec_title:
+            output["exec_title"] = exec_title
 
     output["footnote_refs"] = _extract_row_footnote_refs(row, footnotes)
     output["source_section"] = source_section
@@ -738,20 +829,7 @@ def _is_title_only_exec_name(value: str) -> bool:
     normalized = _normalise(value)
     if not normalized or any(char.isdigit() for char in normalized):
         return False
-    title_keywords = {
-        "officer",
-        "president",
-        "director",
-        "chairman",
-        "executive",
-        "ceo",
-        "cfo",
-        "coo",
-        "svp",
-        "evp",
-        "vp",
-    }
-    return any(keyword in normalized for keyword in title_keywords) and len(normalized.split()) <= 10
+    return _looks_like_exec_title(normalized) and len(normalized.split()) <= 10
 
 
 def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -768,6 +846,24 @@ def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
         exec_name = str(out.get("exec_name", "") or "").strip()
         exec_title = str(out.get("exec_title", "") or "").strip()
 
+        if exec_name and not exec_title:
+            exec_name, exec_title = _split_exec_name_and_title(exec_name)
+            out["exec_name"] = exec_name
+            if exec_title:
+                out["exec_title"] = exec_title
+
+        if not exec_name and _summary_row_has_payload(out):
+            prior_row = last_person_row_by_table.get(table_id)
+            if prior_row is not None:
+                prior_name = str(prior_row.get("exec_name", "") or "").strip()
+                prior_title = str(prior_row.get("exec_title", "") or "").strip()
+                if prior_name:
+                    out["exec_name"] = prior_name
+                    if prior_title and not str(out.get("exec_title", "") or "").strip():
+                        out["exec_title"] = prior_title
+                    exec_name = prior_name
+                    exec_title = str(out.get("exec_title", "") or "").strip()
+
         is_title_only = bool(exec_name) and not exec_title and _is_title_only_exec_name(exec_name)
         if is_title_only:
             prior_name = current_name_by_table.get(table_id, "")
@@ -782,6 +878,9 @@ def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
         elif exec_name:
             current_name_by_table[table_id] = exec_name
             last_person_row_by_table[table_id] = out
+
+        for field in _SUMMARY_COMP_REQUIRED_NUMERIC_COLS:
+            out[field] = _normalize_summary_numeric_value(out.get(field))
 
         normalized_rows.append(out)
 
@@ -1424,7 +1523,18 @@ def _resolve_grants_source_section(blocks: list[BaseBlock], table_block: TableBl
 
 def _is_grant_type_label(text: str) -> bool:
     normalized = _normalise(text)
-    return bool(normalized) and any(hint in normalized for hint in _GRANTS_TYPE_ROW_HINTS)
+    if not normalized:
+        return False
+    if any(hint in normalized for hint in _GRANTS_TYPE_ROW_HINTS):
+        return True
+    token_set = _header_tokens(normalized)
+    if {"stock", "option"} <= token_set or "options" in token_set:
+        return True
+    if "rsu" in token_set or "rsus" in token_set or "restricted" in token_set:
+        return True
+    if "psu" in token_set or "psus" in token_set:
+        return True
+    return "bonus" in token_set and "annual" in token_set
 
 
 def _grant_row_has_numeric_payload(row: Mapping[str, Any]) -> bool:

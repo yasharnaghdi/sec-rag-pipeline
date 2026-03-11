@@ -1,178 +1,137 @@
 # SEC RAG Batch Pipeline Agent Handoff
 
-Last updated: 2026-03-09
-Primary script: `scripts/run_batch50_key_results.py`
+Last updated: 2026-03-11  
+Stable branch: `Separate-files`  
+Primary scripts: `scripts/run_batch50_key_results.py`, `scripts/validate_key_results.py`
 
-This document is a persistent context handoff for agents working on DEF 14A
-extraction paths (summary compensation + grants of plan-based awards).
+This document is the persistent handoff for agents working on the current DEF 14A batch extraction baseline. It records the behavior that the last week of iterations converged on so later branches do not reintroduce earlier regressions.
 
-## 1. Pipeline Purpose
+## 1. Stable extraction contract
 
-Per CIK, batch now writes:
+Per CIK, the stable branch should do all of the following:
 
-- `output/<batch_label>/key_results.csv` (one row per CIK, role-keyed comp)
-- `output/<batch_label>/batch_log.csv` (diagnostics)
-- `output/<batch_label>/grants_plan_based_master.csv` (all grants rows)
-- `output/<batch_label>/grants_plan_based_by_cik_year/<cik>_<fiscal_year>.csv`
+1. Fetch the latest `DEF 14A` using the CIK only
+2. Parse the SEC HTML into typed blocks, preserving tables and heading lineage
+3. Run deterministic Summary Compensation Table extraction first
+4. Use LLM fallback only when deterministic extraction cannot produce a usable payload
+5. Split executive name and title cleanly, even when they appear in one cell
+6. Collapse role rows by choosing the most recent fiscal year for each selected executive
+7. Extract CD&A narrative text, token counts, and pay-for-performance flag
+8. Validate `key_results.csv` so silent empty-column regressions fail fast
 
-## 2. End-to-End Flow
+## 2. Why this branch exists
 
-Per CIK, `process_cik(...)` does:
+`Separate-files` is the integration branch where the individual work streams from the recent IDE-agent cycle were reconciled into one release-quality path.
 
-1. Acquire filing via `_fetch_latest_def14a(cik)`
-2. Parse HTML into blocks with `SECHTMLParser().parse(...)`
-3. Grants path:
-   - locate grants table with `_locate_grants_table(...)`
-   - deterministic extract via `extract_grants_plan_based(...)`
-   - if deterministic has no payload and table exists, run grants LLM fallback
-4. Summary comp path:
-   - locate comp table with `_locate_comp_table(...)`
-   - deterministic summary extraction
-   - if deterministic has no payload and table exists, run LLM fallback
-5. Write key results + logs + grants outputs
+Those work streams were roughly:
 
-Important: grants and summary-comp are independent. Summary-comp failure can still
-produce grants CSV rows for the same CIK.
+- acquisition fixes for CIK-only latest-proxy fetches
+- parser and chunking fixes for SEC table preservation
+- deterministic extractor hardening for mixed years and combined name/title cells
+- LLM fallback work for filings that remain too noisy for the deterministic path
+- batch validation work to prevent "status=ok" rows with empty CEO outputs
+- CD&A extraction work so narrative evidence is carried alongside compensation results
 
-## 3. Grants Table Locator (Deterministic Scoring)
+Use this branch as the baseline when you need the most complete end-to-end extraction contract.
 
-File: `scripts/run_batch50_key_results.py`, function `_locate_grants_table(...)`.
+## 3. Most relevant source files
 
-Current grants locator behavior:
+When you need to understand or defend the current behavior, read these first:
 
-- Scores table candidates (heading-linked first, then nearby, then global fallback).
-- Uses required positive terms in scoring:
-  - `grant`
-  - `incentive plan award`
-- Uses grants structure/schema checks (grant date + payout triplets + grants-specific columns).
-- Includes additional grant-type cues in body text (`AIA`, `PRSU`, `Time-Lapse RSU`,
-  `Stock Option`, `Incentive Plan` variants).
-- Rejects likely non-grants tables using ownership/peer-return hints.
+- `ingestion/edgar_folder_fetcher.py`
+- `ingestion/sec_html_parser.py`
+- `ingestion/sec_chunker.py`
+- `ingestion/comp_table_extractor.py`
+- `ingestion/llm_comp_extractor.py`
+- `ingestion/cda_extractor.py`
+- `scripts/run_batch50_key_results.py`
+- `scripts/validate_key_results.py`
 
-Thresholds:
+These are the files that conclude the reasoning from acquisition through validation.
 
-- heading-linked / nearby candidates require score `>= 8`
-- global fallback candidates require score `>= 10`
+## 4. Key invariants that must not regress
 
-## 4. Grants Deterministic Extraction
+### Acquisition
 
-File: `ingestion/comp_table_extractor.py`, function `extract_grants_plan_based(...)`.
+- Fetch by CIK, not ticker or ad hoc folder naming
+- Choose the latest available `DEF 14A`
+- Always carry `cik`, `company_name`, `accession_number`, and `filing_url` into outputs
 
-Key details:
+### Deterministic summary compensation extraction
 
-- Supports explicit selected table extraction (`selected_table=...`) without requiring
-  heading resolution.
-- Merges heading-based rows and explicit-table rows, deduping by `(table_block_id, source_row_index)`.
-- Handles `header_row_count=0` with grants-specific header inference from first rows.
-- Preserves non-equity vs equity triplets via header group context propagation.
-- Keeps duplicate mapped columns and chooses best value per canonical field at row mapping time.
-- Normalizes split currency cells (`$` + adjacent numeric cell).
-- Preserves row granularity; same name may appear on multiple rows.
-- Row-shape normalization carries person name forward across grant-type-only rows.
-- `grant_type` is preserved as source wording (no canonical remap).
+- Prefer deterministic extraction over LLM fallback
+- Support XBRL-aware table parsing and wide-header detection
+- Preserve row-level fiscal year correctly on multi-year tables
+- When name cells are blank on continuation rows, carry forward the executive identity only when the table structure indicates the row belongs to the same person
+- Normalize currency values to digit-only strings
+- Fix extraction defects in `comp_table_extractor.py`, not in downstream CSV post-processing, unless the issue is purely output formatting
 
-## 5. Grants LLM Fallback
+### Role assignment
 
-File: `ingestion/llm_comp_extractor.py`, function `extract_grants_from_plan_based_table(...)`.
+- The CEO, CFO, COO, and "other" slots must come from the most recent fiscal year available for that executive
+- `fiscal_year` written to `key_results.csv` must reflect the row actually selected for the role
+- `ceo_title` must not just repeat `ceo_name`
 
-- Invoked only when grants table is found but deterministic grants payload is empty.
-- Uses same retry/validation routing pattern as summary-comp LLM extractor.
-- Output model: `CompanyGrantsResult` with `GrantPlanAwardRecord` rows.
-- Prompt explicitly requires preserving `grant_type` source wording and keeping non-equity/equity triplets separate.
+### Validation
 
-## 6. Grants Output Schema
+- A row with `status=ok` must not have both empty `ceo_name` and empty `ceo_total`
+- Numeric compensation fields must remain plain digits where present
+- `pay_for_performance_flag` must be explicitly present as a boolean-like field
 
-CSV columns are fixed in `GRANTS_OUTPUT_COLUMNS` and written in this exact order:
+### Chunking
 
-1. `Name`
-2. `Grant Type`
-3. `Grant Date`
-4. `Estimated future payouts under non-equity incentive plan awards (Threshold)`
-5. `Estimated future payouts under non-equity incentive plan awards (Target)`
-6. `Estimated future payouts under non-equity incentive plan awards (Maximum)`
-7. `Estimated future payouts under equity incentive plan awards (Threshold)`
-8. `Estimated future payouts under equity incentive plan awards (Target)`
-9. `Estimated future payouts under equity incentive plan awards (Maximum)`
-10. `All other stock awards: Number of shares of stock or units`
-11. `All other option awards: Number of securities underlying options`
-12. `Exercise or base price of option awards`
-13. `Grant date fair value of stock and option awards`
+- Do not split tables in a way that loses row semantics
+- There should be at least one chunk retaining CEO identity plus total compensation when that information exists in the filing
+- There should be at least one chunk retaining CD&A pay-for-performance language when it exists
 
-Notes:
+## 5. Current stable metrics
 
-- Missing values are blank.
-- Deterministic `0.0` values are preserved (not dropped as blank).
+For the current hardened 50-CIK reference run on `Separate-files`:
 
-## 7. Recent Grants Fixes (CIK 731802 + 4962)
+- expected rows: `50`
+- written rows: `50`
+- non-empty `ceo_total`: `42`
+- `cda_token_count > 0`: `42`
 
-1. Fixed 731802-style filings where parser reports `header_row_count=0` and heading gating
-   previously zeroed deterministic rows.
-2. Added robust explicit-table grants extraction path + multirow header inference.
-3. Fixed 4962-style split-cell rows where currency symbol and numeric value are split across
-   adjacent cells, which previously caused `$`/blank-heavy output.
-4. Updated grants deterministic row serialization to preserve numeric zero values.
+Treat those as branch-level acceptance metrics, not as a universal guarantee for all issuers.
 
-## 8. Current Known Issues
+## 6. Local release gate
 
-1. Summary compensation extraction still fails for some issuers even when grants extraction succeeds.
-2. Batch exit code may be non-zero due to `MIN_CEO_COVERAGE`, even with valid grants outputs.
-3. LLM paths can still return empty outputs on very noisy/large tables.
-
-## 9. Operational Notes
-
-Run command:
+The branch is considered ready to merge only when all of these succeed:
 
 ```bash
+poetry install --no-interaction
+poetry run ruff check .
+poetry run mypy . --ignore-missing-imports
+poetry run pytest tests/ -v --tb=short
 poetry run python scripts/run_batch50_key_results.py \
-  --input fixtures/client_input.csv \
-  --batch-label b01 \
-  --limit 50 \
-  --model gpt-4o-mini
+  --input fixtures/client_input.csv --batch-label b01 --limit 50
+poetry run python scripts/validate_key_results.py \
+  --input output/b01/key_results.csv --expected-rows 50
 ```
 
-Expected non-zero exit is common when CEO coverage threshold is unmet.
-Always inspect all CSV outputs.
+CI currently covers the static checks and tests. The batch run and CSV validator remain required release-level verification steps before merge.
 
-## 10. Quick Debug Commands
+## 7. Generated artifact policy
 
-Check grants table selection and extracted rows for one CIK:
+Never commit generated batch output. Specifically avoid staging:
 
-```bash
-PYTHONPATH=. poetry run python - <<'PY'
-from datetime import date
-from ingestion.edgar_folder_fetcher import fetch_latest_def14a
-from ingestion.metadata_model import DocumentMetadata
-from ingestion.sec_html_parser import SECHTMLParser
-from scripts.run_batch50_key_results import _locate_grants_table
-from ingestion.comp_table_extractor import extract_grants_plan_based
+- `output/<batch_label>/key_results.csv`
+- `output/<batch_label>/batch_log.csv`
+- any derived CSV exported from a local validation run
 
-cik='4962'
-filing=fetch_latest_def14a(cik)
-meta=DocumentMetadata(
-    document_id=f"{cik}_{filing.accession_number.replace('-','')}",
-    cik=cik,
-    company_name=filing.company_name,
-    form_type='DEF 14A',
-    filing_date=filing.filing_date or date.today(),
-    accession_number=filing.accession_number,
-    source_url=filing.filing_url,
-)
-blocks=SECHTMLParser().parse(filing.raw_html, meta)
-table, heading=_locate_grants_table(blocks)
-print('heading:', heading.text if heading else None)
-print('table found:', bool(table), 'header_row_count:', table.header_row_count if table else None)
-rows=extract_grants_plan_based(blocks, {"cik": cik}, selected_table=table)
-print('det rows:', len(rows))
-print(rows[0] if rows else {})
-PY
-```
+These files are evidence for review, not source-controlled inputs.
 
-## 11. Handoff Rule of Thumb
+## 8. Debug order when the branch regresses
 
-When grants output is empty/mostly blanks:
+If a batch result fails validation, inspect stages in this order:
 
-1. Confirm `_locate_grants_table(...)` selected the expected table.
-2. Inspect inferred header depth and column map quality on the selected table.
-3. Check for split symbol/number cells (`$` in one column, number in the next).
-4. Verify deterministic payload gate `_det_rows_have_grants_payload(...)`.
-5. If deterministic has no payload but table is correct, inspect grants LLM fallback input/output.
+1. acquisition in `ingestion/edgar_folder_fetcher.py`
+2. parsing in `ingestion/sec_html_parser.py`
+3. deterministic extraction in `ingestion/comp_table_extractor.py`
+4. role collapse and output serialization in `scripts/run_batch50_key_results.py`
+5. LLM fallback in `ingestion/llm_comp_extractor.py`
+6. CD&A extraction in `ingestion/cda_extractor.py`
+7. validator expectations in `scripts/validate_key_results.py`
+
+Check `output/<batch_label>/batch_log.csv` before changing extractor logic. It usually tells you whether the failure came from fetch, parse, deterministic extraction, or fallback.

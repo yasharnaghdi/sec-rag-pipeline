@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ingestion.metadata_model import DocumentMetadata
@@ -110,15 +111,19 @@ async def db_engine() -> AsyncGenerator[AsyncEngine, None]:
         encoding="utf-8"
     )
 
-    async with engine.begin() as conn:
-        for statement in _strip_sql_comments(schema_sql).split(";"):
-            cleaned = statement.strip()
-            if cleaned:
-                await conn.execute(text(cleaned))
-        for statement in _strip_sql_comments(migration_sql).split(";"):
-            cleaned = statement.strip()
-            if cleaned:
-                await conn.execute(text(cleaned))
+    try:
+        async with engine.begin() as conn:
+            for statement in _strip_sql_comments(schema_sql).split(";"):
+                cleaned = statement.strip()
+                if cleaned:
+                    await conn.execute(text(cleaned))
+            for statement in _strip_sql_comments(migration_sql).split(";"):
+                cleaned = statement.strip()
+                if cleaned:
+                    await conn.execute(text(cleaned))
+    except DBAPIError as exc:
+        await engine.dispose()
+        pytest.skip(f"DB integration tests require a PostgreSQL instance with pgvector: {exc}")
 
     yield engine
     await engine.dispose()

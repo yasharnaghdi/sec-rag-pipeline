@@ -5,10 +5,12 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from ingestion.comp_table_extractor import _SUMMARY_COMP_COLS, _map_row
+from ingestion.comp_table_extractor import _SUMMARY_COMP_COLS, _map_row, extract_summary_compensation
+from ingestion.metadata_model import HeadingBlock, TableBlock
 from scripts.run_batch50_key_results import (
     KEY_RESULTS_COLUMNS,
     _collapse_to_roles,
+    _role_fiscal_year,
     _row_from_det,
 )
 from scripts.validate_key_results import validate
@@ -30,6 +32,41 @@ def _make_det_row(**kwargs: Any) -> dict[str, Any]:
     }
     base.update(kwargs)
     return base
+
+
+def _summary_heading(order_index: int = 0) -> HeadingBlock:
+    return HeadingBlock(
+        document_id="doc-summary-001",
+        section_id="root",
+        order_index=order_index,
+        source_char_start=0,
+        source_char_end=32,
+        text="Summary Compensation Table",
+        level=2,
+        detection_method="keyword_match",
+    )
+
+
+def _summary_table(
+    rows: list[list[str]],
+    section_id: str,
+    order_index: int,
+    header_row_count: int = 1,
+) -> TableBlock:
+    linearized = " | ".join(cell for row in rows for cell in row)
+    return TableBlock(
+        document_id="doc-summary-001",
+        section_id=section_id,
+        order_index=order_index,
+        source_char_start=0,
+        source_char_end=max(1, len(linearized)),
+        rows=rows,
+        header_row_count=header_row_count,
+        linearized_text=linearized,
+        footnotes={},
+        has_merged_cells=False,
+        token_count_linearized=max(1, len(linearized.split())),
+    )
 
 
 class TestExecNameTitleSplit:
@@ -92,6 +129,79 @@ class TestExecNameTitleSplit:
         assert result["exec_name"] == "Jane Smith"
         assert result["exec_title"] == "CEO"
 
+    def test_extract_summary_compensation_carries_forward_multiyear_rows(self) -> None:
+        heading = _summary_heading()
+        rows = [
+            [
+                "Name and Principal Position",
+                "Year",
+                "Salary",
+                "Bonus",
+                "Stock Awards",
+                "Option Awards",
+                "Non-Equity Incentive Plan Compensation",
+                "All Other Compensation",
+                "Total",
+            ],
+            [
+                "Jane Smith, Chief Executive Officer",
+                "2023",
+                "$1,250,000",
+                "0",
+                "2,100,000",
+                "0",
+                "600000",
+                "15000",
+                "3965000",
+            ],
+            [
+                "",
+                "2022",
+                "$1,100,000",
+                "0",
+                "1,900,000",
+                "0",
+                "550000",
+                "14000",
+                "3564000",
+            ],
+            [
+                "Bob Lee\nChief Financial Officer",
+                "2023",
+                "800000",
+                "0",
+                "900000",
+                "0",
+                "250000",
+                "5000",
+                "1955000",
+            ],
+        ]
+        table = _summary_table(rows, section_id=heading.id, order_index=1)
+
+        extracted = extract_summary_compensation([heading, table], {"cik": "0000001"}, selected_table=table)
+
+        assert [row["year"] for row in extracted] == ["2023", "2022", "2023"]
+        assert extracted[0]["exec_name"] == "Jane Smith"
+        assert extracted[0]["exec_title"] == "Chief Executive Officer"
+        assert extracted[1]["exec_name"] == "Jane Smith"
+        assert extracted[1]["exec_title"] == "Chief Executive Officer"
+        assert extracted[2]["exec_name"] == "Bob Lee"
+        assert extracted[2]["exec_title"] == "Chief Financial Officer"
+
+        for row in extracted:
+            for field in (
+                "salary",
+                "bonus",
+                "stock_awards",
+                "option_awards",
+                "non_equity_incentive",
+                "other_comp",
+                "total",
+            ):
+                value = row.get(field)
+                assert value is None or str(value).isdigit()
+
 
 class TestCollapseToRoles:
     def test_ceo_matched_by_exec_title(self) -> None:
@@ -153,6 +263,7 @@ class TestCollapseToRoles:
         ]
         roles = _collapse_to_roles(rows)
         assert roles["ceo"]["year"] == "2023"
+        assert _role_fiscal_year("deterministic", roles) == "2023"
 
 
 class TestRowFromDet:
@@ -189,6 +300,9 @@ class TestValidateKeyResults:
         row.update(
             {
                 "cik": "1234567",
+                "company_name": "Acme Corp",
+                "accession_number": "0001234567-24-000001",
+                "filing_url": "https://example.com/filing",
                 "status": "ok",
                 "extraction_method": "deterministic",
                 "ceo_name": "Jane",
@@ -197,6 +311,7 @@ class TestValidateKeyResults:
                 "ceo_salary": "$1,250,000",
                 "fiscal_year": "2023",
                 "cda_token_count": "100",
+                "pay_for_performance_flag": "False",
             }
         )
         path = self._write_csv([row] * 50, tmp_path)
@@ -208,12 +323,16 @@ class TestValidateKeyResults:
         row.update(
             {
                 "cik": "1234567",
+                "company_name": "Acme Corp",
+                "accession_number": "0001234567-24-000001",
+                "filing_url": "https://example.com/filing",
                 "status": "ok",
                 "extraction_method": "deterministic",
                 "ceo_total": "3850000",
                 "ceo_name": "Jane",
                 "fiscal_year": "FY2023",
                 "cda_token_count": "500",
+                "pay_for_performance_flag": "True",
             }
         )
         path = self._write_csv([row] * 50, tmp_path)
@@ -225,6 +344,9 @@ class TestValidateKeyResults:
         row.update(
             {
                 "cik": "1234567",
+                "company_name": "Acme Corp",
+                "accession_number": "0001234567-24-000001",
+                "filing_url": "https://example.com/filing",
                 "status": "ok",
                 "extraction_method": "deterministic",
                 "ceo_name": "Jane Smith",
@@ -240,3 +362,63 @@ class TestValidateKeyResults:
         path = self._write_csv([row] * 50, tmp_path)
         failures = validate(path, expected_rows=50)
         assert failures == []
+
+    def test_empty_key_columns_fail_check6(self, tmp_path: Path) -> None:
+        row = {column: "" for column in KEY_RESULTS_COLUMNS}
+        row.update(
+            {
+                "cik": "",
+                "company_name": "",
+                "accession_number": "",
+                "filing_url": "",
+                "status": "failed",
+                "pay_for_performance_flag": "False",
+            }
+        )
+        path = self._write_csv([row] * 50, tmp_path)
+        failures = validate(path, expected_rows=50)
+        assert [failure for failure in failures if "CHECK 6" in failure]
+
+    def test_ceo_title_copied_from_name_fails_check7(self, tmp_path: Path) -> None:
+        row = {column: "" for column in KEY_RESULTS_COLUMNS}
+        row.update(
+            {
+                "cik": "1234567",
+                "company_name": "Acme Corp",
+                "accession_number": "0001234567-24-000001",
+                "filing_url": "https://example.com/filing",
+                "status": "ok",
+                "extraction_method": "deterministic",
+                "ceo_name": "Jane Smith",
+                "ceo_title": "Jane Smith",
+                "ceo_total": "3850000",
+                "fiscal_year": "2023",
+                "cda_token_count": "500",
+                "pay_for_performance_flag": "True",
+            }
+        )
+        path = self._write_csv([row] * 50, tmp_path)
+        failures = validate(path, expected_rows=50)
+        assert [failure for failure in failures if "CHECK 7" in failure]
+
+    def test_missing_pay_for_performance_flag_fails_check8(self, tmp_path: Path) -> None:
+        row = {column: "" for column in KEY_RESULTS_COLUMNS}
+        row.update(
+            {
+                "cik": "1234567",
+                "company_name": "Acme Corp",
+                "accession_number": "0001234567-24-000001",
+                "filing_url": "https://example.com/filing",
+                "status": "ok",
+                "extraction_method": "deterministic",
+                "ceo_name": "Jane Smith",
+                "ceo_title": "Chief Executive Officer",
+                "ceo_total": "3850000",
+                "fiscal_year": "2023",
+                "cda_token_count": "500",
+                "pay_for_performance_flag": "",
+            }
+        )
+        path = self._write_csv([row] * 50, tmp_path)
+        failures = validate(path, expected_rows=50)
+        assert [failure for failure in failures if "CHECK 8" in failure]
