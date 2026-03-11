@@ -153,10 +153,40 @@ DEFAULT_MODEL = "gpt-4o-mini"
 MIN_CEO_COVERAGE = 30
 BATCH_OUTPUT_BASE = Path("output")
 
-CEO_KEYWORDS = {"chief executive officer", "ceo"}
-CFO_KEYWORDS = {"chief financial officer", "cfo"}
-COO_KEYWORDS = {"chief operating officer", "coo"}
+CEO_KEYWORDS = {"chief executive officer", "chief executive", "ceo", "principal executive officer"}
+CFO_KEYWORDS = {"chief financial officer", "chief financial", "cfo", "principal financial officer"}
+COO_KEYWORDS = {"chief operating officer", "chief operating", "coo"}
 PRESIDENT_KEYWORDS = {"president"}
+_TITLE_FRAGMENT_KEYWORDS = {
+    "chief",
+    "officer",
+    "executive",
+    "president",
+    "vice",
+    "interim",
+    "former",
+    "principal",
+    "operating",
+    "financial",
+    "strategy",
+    "administrative",
+    "customer",
+    "merchandising",
+    "chairman",
+    "director",
+    "evp",
+    "svp",
+}
+_SUMMARY_COMP_NUMERIC_FIELDS = (
+    "salary",
+    "bonus",
+    "stock_awards",
+    "option_awards",
+    "non_equity_incentive",
+    "pension_change",
+    "other_comp",
+    "total",
+)
 
 _COMP_SIGNATURES = [
     "summary compensation table",
@@ -516,8 +546,153 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _det_row_has_comp_numeric_payload(row: dict[str, Any]) -> bool:
+    for field in _SUMMARY_COMP_NUMERIC_FIELDS:
+        value = row.get(field)
+        if isinstance(value, (int, float)):
+            return True
+        text = str(value or "").strip()
+        if text and any(char.isdigit() for char in text):
+            return True
+    return False
+
+
+def _is_title_fragment_text(value: str) -> bool:
+    text = " ".join(value.split()).strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(char.isdigit() for char in lowered):
+        return False
+    return any(keyword in lowered for keyword in _TITLE_FRAGMENT_KEYWORDS)
+
+
+def _merge_title_fragments(base: str, addition: str) -> str:
+    left = " ".join(base.split()).strip()
+    right = " ".join(addition.split()).strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if right.lower() in left.lower():
+        return left
+    if left.lower() in right.lower():
+        return right
+
+    left_tokens = left.split()
+    right_tokens = right.split()
+
+    # Remove duplicated prefix when both fragments start similarly.
+    for overlap in range(min(len(left_tokens), len(right_tokens)), 1, -1):
+        if [tok.lower() for tok in left_tokens[:overlap]] == [tok.lower() for tok in right_tokens[:overlap]]:
+            right_tokens = right_tokens[overlap:]
+            break
+    if not right_tokens:
+        return left
+
+    # Remove overlap between suffix(left) and prefix(right).
+    for overlap in range(min(len(left_tokens), len(right_tokens)), 0, -1):
+        if [tok.lower() for tok in left_tokens[-overlap:]] == [tok.lower() for tok in right_tokens[:overlap]]:
+            return " ".join(left_tokens + right_tokens[overlap:])
+    return " ".join(left_tokens + right_tokens)
+
+
+def _merge_footnote_refs(base: str, addition: str) -> str:
+    left = [item.strip() for item in re.split(r"[,;]", base) if item.strip()]
+    right = [item.strip() for item in re.split(r"[,;]", addition) if item.strip()]
+    out: list[str] = []
+    for item in left + right:
+        if item not in out:
+            out.append(item)
+    return ", ".join(out)
+
+
+def _normalize_det_comp_rows(det_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize deterministic rows before fiscal-year filtering and role collapse."""
+    if not det_rows:
+        return det_rows
+
+    normalized: list[dict[str, Any]] = []
+    current_name_by_table: dict[str, str] = {}
+
+    for raw in det_rows:
+        row = dict(raw)
+        table_id = str(row.get("table_block_id", "") or "")
+        exec_name = str(row.get("exec_name", "") or "").strip()
+        exec_title = str(row.get("exec_title", "") or "").strip()
+        year_text = str(row.get("year", "") or "").strip()
+        has_numeric = _det_row_has_comp_numeric_payload(row)
+
+        # If exec_name is actually a title fragment, carry forward the previous
+        # real person name for the table and move this fragment into exec_title.
+        if exec_name and _is_title_fragment_text(exec_name):
+            prior_name = current_name_by_table.get(table_id, "")
+            if prior_name:
+                row["exec_name"] = prior_name
+                row["exec_title"] = _merge_title_fragments(exec_name, exec_title)
+                exec_name = prior_name
+                exec_title = str(row.get("exec_title", "") or "").strip()
+
+        if exec_name and not _is_title_fragment_text(exec_name):
+            current_name_by_table[table_id] = exec_name
+
+        if normalized:
+            prior = normalized[-1]
+            prior_table_id = str(prior.get("table_block_id", "") or "")
+            prior_name = str(prior.get("exec_name", "") or "").strip()
+            prior_year = str(prior.get("year", "") or "").strip()
+
+            if table_id and table_id == prior_table_id:
+                can_merge = (
+                    (not has_numeric)
+                    and (not year_text)
+                    and (
+                        (exec_name and prior_name and exec_name == prior_name)
+                        or (not exec_name and prior_name)
+                    )
+                )
+                if can_merge:
+                    merged_title = _merge_title_fragments(
+                        str(prior.get("exec_title", "") or "").strip(),
+                        exec_title,
+                    )
+                    prior["exec_title"] = merged_title
+                    prior["footnote_refs"] = _merge_footnote_refs(
+                        str(prior.get("footnote_refs", "") or ""),
+                        str(row.get("footnote_refs", "") or ""),
+                    )
+                    if not prior_year and year_text:
+                        prior["year"] = year_text
+                    continue
+
+        normalized.append(row)
+
+    return normalized
+
+
 def _as_text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def _as_digit_string(value: Any) -> str:
+    """Normalize numeric-like values to plain digit strings for CSV output."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"-", "—", "–", "n/a", "na", "none", "null"}:
+        return ""
+    candidates: list[str] = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    if not candidates:
+        return ""
+    best: str = max(candidates, key=lambda token: len(re.sub(r"\D", "", token)))
+    normalized: str = best.replace(",", "")
+    try:
+        if float(normalized) == 0.0:
+            return ""
+    except ValueError:
+        return ""
+    return normalized
 
 
 def _normalize_llm_comp_cell(cell: str) -> str:
@@ -528,7 +703,17 @@ def _normalize_llm_comp_cell(cell: str) -> str:
 def _is_standalone_footnote_marker(cell: str) -> bool:
     """True when a cell only contains one or more parenthetical footnote markers."""
     value = cell.strip()
-    return bool(re.fullmatch(r"(?:\(\d+\))+", value))
+    return bool(re.fullmatch(r"(?:\(\d+\)\s*)+", value))
+
+
+def _is_currency_placeholder_cell(cell: str) -> bool:
+    """True when a cell is currency markers only (e.g. '$', '$ $', 'USD $')."""
+    value = cell.strip()
+    if not value:
+        return False
+    if any(char.isdigit() for char in value):
+        return False
+    return bool(re.fullmatch(r"(?i)(?:US\$|USD|\$)(?:\s*(?:US\$|USD|\$))*", value))
 
 
 def _extract_unique_year_tokens(cell: str) -> list[str]:
@@ -638,7 +823,7 @@ def _clean_llm_comp_row(raw_row: list[str]) -> list[str]:
         if not cell:
             index += 1
             continue
-        if cell in {"$", "US$", "USD"}:
+        if _is_currency_placeholder_cell(cell):
             next_index = index + 1
             if next_index < len(normalized_cells):
                 next_cell = normalized_cells[next_index]
@@ -705,7 +890,9 @@ def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, An
     for row in det_rows:
         title_field = str(row.get("exec_title", "") or "")
         name_field = str(row.get("exec_name", "") or "")
-        role_text = (title_field or name_field).lower()
+        # Use both fields because SEC parser row-splits can place role words
+        # in either exec_name or exec_title for the same logical row.
+        role_text = f"{title_field} {name_field}".lower().strip()
 
         if _role_match(role_text, CEO_KEYWORDS):
             ceo_rows.append(row)
@@ -831,10 +1018,10 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
             or ("name" in combined and "principal position" in combined)
             or ("name" in combined and "salary" in combined)
         )
-        has_comp_columns = any(
+        has_salary = "salary" in combined
+        has_component_columns = any(
             token in combined
             for token in (
-                "salary",
                 "bonus",
                 "stock awards",
                 "option awards",
@@ -858,7 +1045,7 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
         if any(token in combined for token in reject_tokens):
             return False
 
-        return has_name_axis and has_comp_columns and has_total
+        return has_name_axis and has_salary and has_component_columns and has_total
 
     def _score_comp_table_candidate(table: TableBlock, heading_text: str) -> int:
         header_text = _table_header_text(table)
@@ -903,6 +1090,8 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
             score -= 6
         if "beneficial ownership" in header_text:
             score -= 10
+        if "base salary" in header_text and "total increase" in header_text:
+            score -= 12
 
         return score
 
@@ -916,6 +1105,7 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
     scored_candidates: list[tuple[int, int, int, TableBlock, HeadingBlock | None]] = []
 
     for heading_index, heading in comp_headings:
+        heading_lc = heading.text.lower()
         # Section-linked candidates.
         for block in blocks:
             if not isinstance(block, TableBlock):
@@ -925,6 +1115,20 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
             score = _score_comp_table_candidate(block, heading.text)
             if score >= 4:
                 scored_candidates.append((score, 1, 0, block, heading))
+                continue
+
+            # Some valid summary tables have sparse/blank top rows that hide
+            # header tokens from schema scoring. Keep a relaxed path only when
+            # the section heading explicitly says summary compensation table.
+            if "summary compensation table" in heading_lc and len(block.rows) >= 4:
+                linearized = block.linearized_text.lower()
+                if (
+                    "name" in linearized
+                    and "salary" in linearized
+                    and "total" in linearized
+                    and "director compensation" not in heading_lc
+                ):
+                    scored_candidates.append((max(score, 3), 2, 0, block, heading))
 
         # Nearby fallback candidates.
         for offset in range(1, 16):
@@ -953,6 +1157,34 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
         prefix_text = _table_prefix_text(block)
         if score >= 6 and _comp_schema_fit(header_text, prefix_text):
             global_candidates.append((score, block))
+            continue
+
+        # Fallback when heading association fails and detected header rows are noisy.
+        linearized = block.linearized_text.lower()
+        has_name = "name" in linearized and "year" in linearized
+        has_salary = "salary" in linearized
+        has_total = "total" in linearized
+        has_component = any(
+            token in linearized
+            for token in (
+                "bonus",
+                "stock awards",
+                "option awards",
+                "non-equity incentive",
+                "non equity incentive",
+                "all other compensation",
+            )
+        )
+        looks_base_salary_grid = "base salary" in linearized and "total increase" in linearized
+        if (
+            has_name
+            and has_salary
+            and has_total
+            and has_component
+            and not looks_base_salary_grid
+            and len(block.rows) >= 4
+        ):
+            global_candidates.append((max(score, 6), block))
     if global_candidates:
         best_global = max(global_candidates, key=lambda item: item[0])
         return best_global[1], None
@@ -1158,12 +1390,37 @@ def _filter_det_rows_by_fiscal_year(
 ) -> list[dict[str, Any]]:
     if fiscal_year_start is None or fiscal_year_end is None:
         return det_rows
+    has_explicit_year_signal = any(
+        bool(re.fullmatch(r"\d{4}", str(row.get("year", "") or "").strip()))
+        for row in det_rows
+    )
     filtered_rows: list[dict[str, Any]] = []
     for row in det_rows:
-        resolved_year = _normalize_compensation_year(str(row.get("year", "") or ""), fallback_year)
+        raw_year = str(row.get("year", "") or "").strip()
+        if re.fullmatch(r"\d{4}", raw_year):
+            if _is_within_fiscal_year_range(raw_year, fiscal_year_start, fiscal_year_end):
+                filtered_rows.append(row)
+            continue
+
+        # If table has explicit fiscal-year rows, treat blank-year rows as
+        # continuation/header fragments and exclude them from year filtering.
+        if has_explicit_year_signal:
+            continue
+
+        resolved_year = _normalize_compensation_year(raw_year, fallback_year)
         if _is_within_fiscal_year_range(resolved_year, fiscal_year_start, fiscal_year_end):
             filtered_rows.append(row)
     return filtered_rows
+
+
+def _table_contains_fiscal_year(table: TableBlock, fiscal_year: int) -> bool:
+    """Return True when the target fiscal year appears in any table cell."""
+    target = str(fiscal_year)
+    for row in table.rows:
+        for cell in row:
+            if target in str(cell or ""):
+                return True
+    return False
 
 
 def _locate_grants_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, HeadingBlock | None]:
@@ -2065,8 +2322,8 @@ def process_cik(
                 model=model,
             )
             if _llm_result_has_outstanding_equity_payload(llm_outstanding_equity_result):
-                for llm_row in llm_outstanding_equity_result.rows:
-                    output_row = _outstanding_equity_row_from_llm(llm_row)
+                for equity_row in llm_outstanding_equity_result.rows:
+                    output_row = _outstanding_equity_row_from_llm(equity_row)
                     output_row["CIK"] = cik
                     output_row["Company Name"] = company_name
                     output_row["Filing URL"] = filing.filing_url
@@ -2087,6 +2344,7 @@ def process_cik(
 
     try:
         det_rows = _extract_summary_compensation_rows(blocks, meta_dict, comp_table)
+        det_rows = _normalize_det_comp_rows(det_rows)
     except Exception as exc:  # noqa: BLE001
         return _failed(
             f"deterministic_extract_failed: {exc}",
@@ -2108,6 +2366,19 @@ def process_cik(
         and fiscal_year_start == fiscal_year_end
     ):
         target_comp_year = fiscal_year_start
+    if target_comp_year is not None and comp_table is not None:
+        if not _table_contains_fiscal_year(comp_table, target_comp_year):
+            return _failed(
+                "target_year_not_in_comp_table",
+                company_name,
+                {
+                    "block_count": block_count,
+                    "table_count": table_count,
+                    "comp_heading_found": comp_heading_found,
+                    "comp_table_found": comp_table_found,
+                    "grant_table_found": grant_table_found,
+                },
+            )
     if det_rows and _det_rows_have_comp_payload(det_rows):
         det_rows = _filter_det_rows_by_fiscal_year(
             det_rows,
@@ -2600,6 +2871,12 @@ def main() -> None:
                         filing=year_filing,
                         cik=cik,
                     )
+                    if str(year_log_row.get("status", "")).lower() == "failed":
+                        error_text = str(year_log_row.get("error", "") or "")
+                        if error_text in {"no_comp_table_located", "target_year_not_in_comp_table"}:
+                            year_log_row["status"] = "skipped"
+                            if not year_log_row.get("extraction_method"):
+                                year_log_row["extraction_method"] = "failed"
                     supplemental_log_rows.append(year_log_row)
                     log.info(
                         "[%d/%d][Year%d/%d] supplemental year result | cik=%s fiscal_year=%d status=%s method=%s grants_rows=%d compensation_rows=%d error=%s",

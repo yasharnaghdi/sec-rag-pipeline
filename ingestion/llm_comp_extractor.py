@@ -424,6 +424,10 @@ EXTRACTION RULES:
    value in string form (currency symbols/commas allowed) or null.
    Examples: "$ 1,250,000", "1,250,000", "1250000", null.
    Use null if the value is missing, zero, a dash, or the table cell is blank.
+5b. If a column does not exist in the table header, set the corresponding
+    JSON field to null for every row. Never move values into a different field.
+5c. If a column exists but the row cell is blank/dash/placeholder, return null
+    for that field in that row.
 6. fiscal_year should be a 4-digit year string (e.g. "2023") and must come
    from the table row/year header, not from filing metadata.
 7. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
@@ -445,7 +449,172 @@ schema. Return ONLY the corrected JSON object using the schema provided.
 Do not include any explanation, markdown, or code fences.
 Required top-level keys: rows, confidence, notes.
 Do NOT output role keys (ceo/cfo/coo/other1/other2) in retry.
+Output compact JSON only (no trailing commas, no comments, no extra keys).
 """
+
+
+def _extract_comp_column_availability(table_text: str) -> dict[str, bool] | None:
+    """Infer which compensation columns are present from row-style header text."""
+    header_line: str | None = None
+    for raw_line in table_text.splitlines()[:16]:
+        line = raw_line.strip()
+        if not line or "|" not in line:
+            continue
+        if not line.lower().startswith("row "):
+            continue
+        _, _, body = line.partition(":")
+        body_text = body.strip()
+        lowered = body_text.lower()
+        if "year" in lowered and ("salary" in lowered or "total" in lowered):
+            header_line = body_text
+            break
+
+    if not header_line:
+        return None
+
+    header_cells = [cell.strip().lower() for cell in header_line.split("|") if cell.strip()]
+    if not header_cells:
+        return None
+
+    def has_any(*needles: str) -> bool:
+        return any(any(needle in cell for needle in needles) for cell in header_cells)
+
+    return {
+        "salary": has_any("salary"),
+        "bonus": has_any("bonus"),
+        "stock_awards": has_any("stock award"),
+        "option_awards": has_any("option award", "option/ sar award", "option/sar award"),
+        "non_equity_incentive": has_any("non-equity incentive", "non equity incentive"),
+        "pension_change": has_any("pension value", "deferred compensation"),
+        "other_comp": has_any("all other compensation"),
+        "total": has_any("total"),
+    }
+
+
+def _iter_comp_records(result: CompanyCompResult) -> list[ExecCompRecord]:
+    """Collect row and legacy role records from an extraction result."""
+    records: list[ExecCompRecord] = []
+    records.extend(record for record in result.rows if isinstance(record, ExecCompRecord))
+    for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
+        role_record = getattr(result, role_key, None)
+        if isinstance(role_record, ExecCompRecord):
+            records.append(role_record)
+    return records
+
+
+def _collect_comp_column_violations(
+    result: CompanyCompResult,
+    column_availability: dict[str, bool] | None,
+) -> list[str]:
+    """Detect mismatches between extracted payload and available table columns."""
+    if not column_availability:
+        return []
+
+    violations: list[str] = []
+    fields = (
+        "salary",
+        "bonus",
+        "stock_awards",
+        "option_awards",
+        "non_equity_incentive",
+        "pension_change",
+        "other_comp",
+        "total",
+    )
+
+    for record in _iter_comp_records(result):
+        for field_name in fields:
+            if column_availability.get(field_name, True):
+                continue
+            if getattr(record, field_name):
+                violations.append(f"missing_column_has_value:{field_name}")
+
+        if (
+            column_availability.get("bonus", False)
+            and not column_availability.get("stock_awards", False)
+            and not record.bonus
+            and bool(record.stock_awards)
+        ):
+            violations.append("bonus_value_mapped_to_stock_awards")
+
+    return violations
+
+
+def _apply_comp_column_guardrails(
+    result: CompanyCompResult,
+    column_availability: dict[str, bool] | None,
+) -> bool:
+    """Coerce extracted values to respect available columns."""
+    if not column_availability:
+        return False
+
+    changed = False
+    fields = (
+        "salary",
+        "bonus",
+        "stock_awards",
+        "option_awards",
+        "non_equity_incentive",
+        "pension_change",
+        "other_comp",
+        "total",
+    )
+
+    for record in _iter_comp_records(result):
+        if (
+            column_availability.get("bonus", False)
+            and not column_availability.get("stock_awards", False)
+            and not record.bonus
+            and bool(record.stock_awards)
+        ):
+            record.bonus = record.stock_awards
+            record.stock_awards = None
+            changed = True
+
+        for field_name in fields:
+            if column_availability.get(field_name, True):
+                continue
+            if getattr(record, field_name) is not None:
+                setattr(record, field_name, None)
+                changed = True
+
+    return changed
+
+
+def _build_comp_guardrail_retry_prompt(
+    column_availability: dict[str, bool] | None,
+    violations: list[str],
+) -> str:
+    """Build retry prompt for field/header mismatches."""
+    if not column_availability:
+        return _RETRY_SYSTEM_PROMPT
+
+    field_labels = {
+        "salary": "Salary ($)",
+        "bonus": "Bonus Awards ($)",
+        "stock_awards": "Stock Awards ($)",
+        "option_awards": "Option Awards ($)",
+        "non_equity_incentive": "Non-Equity Incentive Plan Compensation ($)",
+        "pension_change": "Change in pension value and nonqualified deferred compensation earnings ($)",
+        "other_comp": "All Other Compensation ($)",
+        "total": "Total ($)",
+    }
+    present_columns = [label for key, label in field_labels.items() if column_availability.get(key, False)]
+    missing_columns = [label for key, label in field_labels.items() if not column_availability.get(key, False)]
+    violation_text = ", ".join(violations[:10]) if violations else "unknown"
+
+    return (
+        "Your previous JSON has column-mapping violations and must be corrected.\n"
+        f"Present columns: {present_columns}\n"
+        f"Missing columns: {missing_columns}\n"
+        f"Violations: {violation_text}\n"
+        "Rules:\n"
+        "1) If a column is missing from header, set that field to null in every row.\n"
+        "2) If Bonus exists and Stock Awards is missing, place values in bonus and set stock_awards=null.\n"
+        "3) Return ONLY compact valid JSON with keys rows, confidence, notes.\n"
+        "Do NOT output role keys (ceo/cfo/coo/other1/other2)."
+    )
+
 
 _GRANTS_SYSTEM_PROMPT = """\
 You are a financial data extraction assistant specialised in SEC DEF 14A
@@ -587,6 +756,7 @@ def _call_openai(
     client: OpenAI,
     messages: list[dict[str, str]],
     model: str,
+    max_tokens: int = 800,
 ) -> str:
     """Call OpenAI chat completions and return raw response text.
 
@@ -612,7 +782,7 @@ def _call_openai(
         messages=messages,
         response_format={"type": "json_object"},
         temperature=0.0,
-        max_tokens=800,
+        max_tokens=max_tokens,
     )
     return response.choices[0].message.content or ""
 
@@ -821,7 +991,7 @@ def extract_company_comp_from_summary_table(
         else:
             if client is None:
                 client = OpenAI(api_key=api_key)
-            raw = _call_openai(client, messages, model)
+            raw = _call_openai(client, messages, model, max_tokens=1800)
     except Exception as exc:  # noqa: BLE001
         if not use_ollama and _is_openai_auth_error(exc):
             log.warning(
@@ -850,20 +1020,33 @@ def extract_company_comp_from_summary_table(
             )
             return CompanyCompResult()
 
+    column_availability = _extract_comp_column_availability(table_text)
+    guardrail_fallback_result: CompanyCompResult | None = None
+    retry_prompt = _RETRY_SYSTEM_PROMPT
+
     result = _parse_and_validate(raw)
     if result is not None:
-        log.info(
-            "llm_extractor | success attempt 1 | cik=%s confidence=%.2f",
+        guardrail_violations = _collect_comp_column_violations(result, column_availability)
+        if not guardrail_violations:
+            log.info(
+                "llm_extractor | success attempt 1 | cik=%s confidence=%.2f",
+                cik,
+                result.confidence,
+            )
+            return result
+        guardrail_fallback_result = result
+        retry_prompt = _build_comp_guardrail_retry_prompt(column_availability, guardrail_violations)
+        log.warning(
+            "llm_extractor | guardrail violation attempt 1 | cik=%s violations=%s",
             cik,
-            result.confidence,
+            ",".join(guardrail_violations[:6]),
         )
-        return result
-
-    log.warning("llm_extractor | invalid response attempt 1 | cik=%s", cik)
+    else:
+        log.warning("llm_extractor | invalid response attempt 1 | cik=%s", cik)
 
     retry_messages = messages + [
         {"role": "assistant", "content": raw},
-        {"role": "user", "content": _RETRY_SYSTEM_PROMPT},
+        {"role": "user", "content": retry_prompt},
     ]
 
     log.info("llm_extractor | attempt 2 (retry) | cik=%s", cik)
@@ -874,7 +1057,7 @@ def extract_company_comp_from_summary_table(
         else:
             if client is None:
                 client = OpenAI(api_key=api_key)
-            raw_retry = _call_openai(client, retry_messages, model)
+            raw_retry = _call_openai(client, retry_messages, model, max_tokens=2200)
     except Exception as exc:  # noqa: BLE001
         if not use_ollama and _is_openai_auth_error(exc):
             log.warning(
@@ -893,6 +1076,9 @@ def extract_company_comp_from_summary_table(
                     "ollama",
                     ollama_exc,
                 )
+                if guardrail_fallback_result is not None:
+                    _apply_comp_column_guardrails(guardrail_fallback_result, column_availability)
+                    return guardrail_fallback_result
                 return CompanyCompResult()
         else:
             log.error(
@@ -901,16 +1087,32 @@ def extract_company_comp_from_summary_table(
                 "ollama" if use_ollama else "openai",
                 exc,
             )
+            if guardrail_fallback_result is not None:
+                _apply_comp_column_guardrails(guardrail_fallback_result, column_availability)
+                return guardrail_fallback_result
             return CompanyCompResult()
 
     result_retry = _parse_and_validate(raw_retry)
     if result_retry is not None:
+        retry_violations = _collect_comp_column_violations(result_retry, column_availability)
+        if retry_violations:
+            _apply_comp_column_guardrails(result_retry, column_availability)
+            log.warning(
+                "llm_extractor | guardrail coercion after retry | cik=%s violations=%s",
+                cik,
+                ",".join(retry_violations[:6]),
+            )
         log.info(
             "llm_extractor | success attempt 2 | cik=%s confidence=%.2f",
             cik,
             result_retry.confidence,
         )
         return result_retry
+
+    if guardrail_fallback_result is not None:
+        _apply_comp_column_guardrails(guardrail_fallback_result, column_availability)
+        log.warning("llm_extractor | using attempt 1 with local guardrails | cik=%s", cik)
+        return guardrail_fallback_result
 
     log.error(
         "llm_extractor | failed both attempts | cik=%s accession=%s",
