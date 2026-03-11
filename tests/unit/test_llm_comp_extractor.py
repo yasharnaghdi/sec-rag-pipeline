@@ -15,6 +15,7 @@ from ingestion.llm_comp_extractor import (
     CompanyCompResult,
     extract_company_comp_from_summary_table,
     extract_grants_from_plan_based_table,
+    extract_outstanding_equity_awards_table,
 )
 
 VALID_RESPONSE = {
@@ -92,6 +93,26 @@ VALID_GRANTS_RESPONSE = {
     ],
     "confidence": 0.88,
     "notes": "Structured grants extracted.",
+}
+
+VALID_OUTSTANDING_EQUITY_RESPONSE = {
+    "rows": [
+        {
+            "name": "Jane Smith",
+            "grant_date": "2022-03-01",
+            "options_exercisable": "1000",
+            "options_unexercisable": "500",
+            "equity_incentive_unearned_options": "100",
+            "option_exercise_price": "25.10",
+            "option_expiration_date": "2030-03-01",
+            "stock_unvested_shares": "200",
+            "stock_unvested_value": "12000",
+            "equity_incentive_unearned_shares": "50",
+            "equity_incentive_unearned_value": "8000",
+        }
+    ],
+    "confidence": 0.87,
+    "notes": "Structured outstanding equity awards extracted.",
 }
 
 
@@ -239,6 +260,50 @@ class TestExtractGrants:
     def test_empty_table_text_returns_empty_grants_result_without_api_call(self) -> None:
         client = _mock_client([])
         result = extract_grants_from_plan_based_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="",
+            client=client,
+        )
+        assert result.confidence == 0.0
+        assert result.rows == []
+        assert client.chat.completions.create.call_count == 0
+
+
+class TestExtractOutstandingEquityAwards:
+    def test_valid_response_returns_rows(self) -> None:
+        client = _mock_client([json.dumps(VALID_OUTSTANDING_EQUITY_RESPONSE)])
+        result = extract_outstanding_equity_awards_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="Name | Grant Date | Option Exercise Price",
+            client=client,
+        )
+        assert len(result.rows) == 1
+        assert result.rows[0].name == "Jane Smith"
+        assert result.rows[0].options_exercisable == "1000"
+        assert result.confidence == pytest.approx(0.87)
+
+    def test_invalid_json_triggers_retry(self) -> None:
+        client = _mock_client(["not json", json.dumps(VALID_OUTSTANDING_EQUITY_RESPONSE)])
+        result = extract_outstanding_equity_awards_table(
+            company_name="Test Corp",
+            cik="1234567",
+            filing_date="2024-04-15",
+            accession_number="0001234567-24-000001",
+            table_text="Name | Grant Date | Option Exercise Price",
+            client=client,
+        )
+        assert len(result.rows) == 1
+        assert client.chat.completions.create.call_count == 2
+
+    def test_empty_table_text_returns_empty_result_without_api_call(self) -> None:
+        client = _mock_client([])
+        result = extract_outstanding_equity_awards_table(
             company_name="Test Corp",
             cik="1234567",
             filing_date="2024-04-15",

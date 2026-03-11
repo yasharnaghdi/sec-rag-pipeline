@@ -31,7 +31,7 @@ else:
 load_dotenv(project_root / ".env", override=False)
 
 import ingestion.edgar_folder_fetcher as fetcher  # noqa: E402
-from ingestion.cda_markdown_extractor import SECTION_NAMES, extract_section_markdown  # noqa: E402
+from ingestion.section_extractor import SECTION_NAMES, extract_section_markdown  # noqa: E402
 from ingestion.metadata_model import DocumentMetadata  # noqa: E402
 
 log = logging.getLogger(__name__)
