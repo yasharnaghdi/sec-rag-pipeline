@@ -4,6 +4,8 @@ import re
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from ingestion.metadata_model import DocumentMetadata, ProseBlock, TableBlock
 from ingestion.sec_chunker import SECChunker
 from ingestion.sec_html_parser import SECHTMLParser
@@ -160,7 +162,8 @@ def test_chunk_toc_page_range_none_when_not_in_toc() -> None:
 
 def test_real_filing_chunks_preserve_compensation_and_cda_text() -> None:
     filing_path = Path("data/raw/0000320193_000130817926000008.html")
-    assert filing_path.exists()
+    if not filing_path.exists():
+        pytest.skip("requires locally cached Apple filing fixture")
 
     raw_html = filing_path.read_text(encoding="utf-8", errors="replace")
     metadata = DocumentMetadata(
