@@ -472,6 +472,160 @@ def _as_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _normalize_llm_comp_cell(cell: str) -> str:
+    text = str(cell or "").replace("\xa0", " ")
+    return " ".join(text.split()).strip()
+
+
+def _extract_unique_year_tokens(cell: str) -> list[str]:
+    tokens = re.findall(r"\b(?:19|20)\d{2}\b", cell)
+    unique: list[str] = []
+    for token in tokens:
+        if token not in unique:
+            unique.append(token)
+    return unique
+
+
+def _dedupe_adjacent_tokens(tokens: list[str]) -> list[str]:
+    if not tokens:
+        return []
+    deduped = [tokens[0]]
+    for token in tokens[1:]:
+        if token != deduped[-1]:
+            deduped.append(token)
+    return deduped
+
+
+def _split_multi_year_value_cell(cell: str, year_count: int) -> list[str]:
+    """Split one fused value cell into per-year values when possible."""
+    if year_count <= 1:
+        return [cell]
+
+    text = cell.strip()
+    if not text:
+        return ["" for _ in range(year_count)]
+
+    lowered = text.lower()
+    if lowered in {"-", "—", "–", "null", "none", "n/a", "na"}:
+        return ["" for _ in range(year_count)]
+
+    comma_tokens = re.findall(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:\s*\(\d+\))?", text)
+    generic_tokens = re.findall(r"\d+(?:\.\d+)?(?:\s*\(\d+\))?", text)
+    tokens = comma_tokens if comma_tokens else generic_tokens
+    tokens = _dedupe_adjacent_tokens(tokens)
+
+    if len(tokens) == year_count:
+        return tokens
+    if len(tokens) > year_count and len(tokens) % year_count == 0:
+        block = len(tokens) // year_count
+        return [tokens[index * block] for index in range(year_count)]
+    if len(tokens) > year_count:
+        return tokens[:year_count]
+    if len(tokens) == 1:
+        return [tokens[0]] + ["" for _ in range(year_count - 1)]
+    return [text] + ["" for _ in range(year_count - 1)]
+
+
+def _expand_multi_year_comp_row(
+    cleaned_row: list[str],
+    target_fiscal_year: int | None = None,
+) -> list[list[str]]:
+    """Expand rows that contain multiple fiscal years fused in one row."""
+    year_col_index: int | None = None
+    year_tokens: list[str] = []
+
+    for index, cell in enumerate(cleaned_row):
+        tokens = _extract_unique_year_tokens(cell)
+        if len(tokens) > 1:
+            year_col_index = index
+            year_tokens = tokens
+            break
+
+    if year_col_index is None or len(year_tokens) <= 1:
+        return [cleaned_row]
+
+    year_count = len(year_tokens)
+    expanded_columns: list[list[str]] = []
+    for index, cell in enumerate(cleaned_row):
+        if index < year_col_index:
+            expanded_columns.append([cell for _ in range(year_count)])
+            continue
+        if index == year_col_index:
+            expanded_columns.append(year_tokens)
+            continue
+        expanded_columns.append(_split_multi_year_value_cell(cell, year_count))
+
+    selected_indexes = list(range(year_count))
+    if target_fiscal_year is not None:
+        target_year_text = str(target_fiscal_year)
+        selected_indexes = [
+            index for index, year_text in enumerate(year_tokens) if year_text == target_year_text
+        ]
+        if not selected_indexes:
+            selected_indexes = list(range(year_count))
+
+    rows_out: list[list[str]] = []
+    for year_index in selected_indexes:
+        split_row = [
+            col_values[year_index] if year_index < len(col_values) else ""
+            for col_values in expanded_columns
+        ]
+        rows_out.append(split_row)
+    return rows_out
+
+
+def _clean_llm_comp_row(raw_row: list[str]) -> list[str]:
+    """Clean one Summary Compensation table row for LLM consumption."""
+    normalized_cells = [_normalize_llm_comp_cell(cell) for cell in raw_row]
+    merged: list[str] = []
+    index = 0
+    while index < len(normalized_cells):
+        cell = normalized_cells[index]
+        if not cell:
+            index += 1
+            continue
+        if cell in {"$", "US$", "USD"}:
+            next_index = index + 1
+            if next_index < len(normalized_cells):
+                next_cell = normalized_cells[next_index]
+                if next_cell and any(char.isdigit() for char in next_cell):
+                    merged.append(next_cell)
+                    index += 2
+                    continue
+            index += 1
+            continue
+        merged.append(cell)
+        index += 1
+
+    deduped: list[str] = []
+    for cell in merged:
+        if deduped and cell == deduped[-1]:
+            continue
+        deduped.append(cell)
+    return deduped
+
+
+def _build_llm_comp_table_text(
+    table: TableBlock,
+    target_fiscal_year: int | None = None,
+) -> str:
+    """Build a cleaner row-preserving table text for LLM extraction."""
+    cleaned_lines: list[str] = []
+    for row_index, raw_row in enumerate(table.rows, start=1):
+        cleaned_row = _clean_llm_comp_row(raw_row)
+        if not cleaned_row:
+            continue
+        expanded_rows = _expand_multi_year_comp_row(cleaned_row, target_fiscal_year)
+        if len(expanded_rows) == 1:
+            cleaned_lines.append(f"row {row_index}: {' | '.join(expanded_rows[0])}")
+            continue
+        for expanded_index, expanded_row in enumerate(expanded_rows, start=1):
+            cleaned_lines.append(f"row {row_index}.{expanded_index}: {' | '.join(expanded_row)}")
+    if cleaned_lines:
+        return "\n".join(cleaned_lines)
+    return table.linearized_text
+
+
 def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """
     Collapse deterministic extractor rows (one per exec per year)
@@ -1594,12 +1748,13 @@ def process_cik(
             cik,
             target_comp_year if target_comp_year is not None else "most_recent",
         )
+        llm_table_text = _build_llm_comp_table_text(comp_table, target_comp_year)
         llm_result = extract_company_comp_from_summary_table(
             company_name=company_name,
             cik=cik,
             filing_date=str(filing.filing_date or ""),
             accession_number=filing.accession_number,
-            table_text=comp_table.linearized_text,
+            table_text=llm_table_text,
             target_fiscal_year=target_comp_year,
             model=model,
         )

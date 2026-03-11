@@ -233,6 +233,21 @@ def extract_section_markdown(
         )
 
     start_index = _find_block_index_for_node(content_blocks, start_node)
+    if start_index is None and start_node is not None:
+        start_index = _find_section_index_near_anchor(
+            blocks=content_blocks,
+            anchor_node=start_node,
+            spec=spec,
+            excluded_table_ids=toc_table_ids,
+        )
+        if start_index is not None:
+            strategy_steps.append("toc_anchor_keyword_probe_start")
+            confidence = max(confidence, 0.84)
+    if start_index is None and start_node is not None:
+        start_index = _find_next_block_index_for_node(content_blocks, start_node)
+        if start_index is not None:
+            strategy_steps.append("toc_anchor_next_block_start")
+            confidence = max(confidence, 0.83)
     if start_index is None:
         start_index = _find_first_section_block(content_blocks, spec)
         strategy_steps.append("keyword_window_start")
@@ -262,6 +277,17 @@ def extract_section_markdown(
 
     if end_node is not None:
         end_index = _find_block_index_for_node(content_blocks, end_node)
+        if end_index is None and end_entry is not None:
+            end_index = _find_toc_label_index_near_anchor(
+                blocks=content_blocks,
+                anchor_node=end_node,
+                toc_label=end_entry.label,
+                excluded_table_ids=toc_table_ids,
+            )
+            if end_index is not None:
+                strategy_steps.append("toc_anchor_keyword_probe_end")
+        if end_index is None:
+            end_index = _find_next_block_index_for_node(content_blocks, end_node)
         if end_index is not None and end_index > start_index:
             if spec.end_mode == "major_non_exec":
                 strategy_steps.append("toc_major_item_end")
@@ -619,6 +645,8 @@ def _collect_content_blocks(soup: BeautifulSoup, excluded_table_ids: set[int]) -
 
 
 def _is_in_excluded_table(tag: Tag, excluded_table_ids: set[int]) -> bool:
+    if tag.name == "table" and id(tag) in excluded_table_ids:
+        return True
     parent_table = tag.find_parent("table")
     if parent_table is None:
         return False
@@ -633,6 +661,102 @@ def _find_block_index_for_node(blocks: list[Tag], node: Tag | None) -> int | Non
             return index
         if node in block.descendants:
             return index
+    return None
+
+
+def _find_next_block_index_for_node(blocks: list[Tag], node: Tag | None) -> int | None:
+    if node is None:
+        return None
+    block_index_by_id = {id(block): index for index, block in enumerate(blocks)}
+    for candidate in node.find_all_next(_CONTENT_BLOCK_TAGS):
+        index = block_index_by_id.get(id(candidate))
+        if index is not None:
+            return index
+    return None
+
+
+def _find_section_index_near_anchor(
+    blocks: list[Tag],
+    anchor_node: Tag | None,
+    spec: SectionSpec,
+    excluded_table_ids: set[int],
+    max_tag_hops: int = 160,
+    max_block_distance: int = 36,
+) -> int | None:
+    if anchor_node is None:
+        return None
+    anchor_next_index = _find_next_block_index_for_node(blocks, anchor_node)
+    block_index_by_id = {id(block): index for index, block in enumerate(blocks)}
+    min_score = max(spec.min_heading_score, 0.72)
+
+    for candidate in anchor_node.find_all_next(True, limit=max_tag_hops):
+        if _is_in_excluded_table(candidate, excluded_table_ids):
+            continue
+        text = _normalize_label(candidate.get_text(" ", strip=True))
+        if not text or text == "TABLE OF CONTENTS":
+            continue
+        if len(text) > 240:
+            continue
+        score = _section_label_score(text, spec)
+        if score < min_score:
+            continue
+
+        index = block_index_by_id.get(id(candidate))
+        if index is None:
+            index = _find_next_block_index_for_node(blocks, candidate)
+        if index is None:
+            continue
+        if anchor_next_index is not None and index > (anchor_next_index + max_block_distance):
+            continue
+        return index
+    return None
+
+
+def _find_toc_label_index_near_anchor(
+    blocks: list[Tag],
+    anchor_node: Tag | None,
+    toc_label: str,
+    excluded_table_ids: set[int],
+    max_tag_hops: int = 180,
+    max_block_distance: int = 40,
+) -> int | None:
+    if anchor_node is None:
+        return None
+    normalized_label = _normalize_label(toc_label)
+    if not normalized_label:
+        return None
+    anchor_next_index = _find_next_block_index_for_node(blocks, anchor_node)
+    block_index_by_id = {id(block): index for index, block in enumerate(blocks)}
+
+    for candidate in anchor_node.find_all_next(True, limit=max_tag_hops):
+        if _is_in_excluded_table(candidate, excluded_table_ids):
+            continue
+        text = _normalize_label(candidate.get_text(" ", strip=True))
+        if not text or text == "TABLE OF CONTENTS":
+            continue
+        if len(text) > 260:
+            continue
+
+        ratio = SequenceMatcher(None, text, normalized_label).ratio()
+        compact_ratio = SequenceMatcher(
+            None,
+            text.replace(" ", ""),
+            normalized_label.replace(" ", ""),
+        ).ratio()
+        score = max(ratio, compact_ratio)
+        if normalized_label in text:
+            score = max(score, 0.93)
+        if score < 0.78:
+            continue
+
+        index = block_index_by_id.get(id(candidate))
+        if index is None:
+            index = _find_next_block_index_for_node(blocks, candidate)
+        if index is None:
+            continue
+        if anchor_next_index is not None and index > (anchor_next_index + max_block_distance):
+            continue
+        return index
     return None
 
 

@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -112,6 +113,29 @@ class ExecCompRecord(BaseModel):
         description="Fiscal year of the compensation values (e.g. '2023').",
     )
 
+    @model_validator(mode="after")
+    def normalize_fields(self) -> ExecCompRecord:
+        """Normalize numeric and year fields for robust downstream mapping."""
+        numeric_fields = (
+            "salary",
+            "bonus",
+            "stock_awards",
+            "option_awards",
+            "non_equity_incentive",
+            "pension_change",
+            "other_comp",
+            "total",
+        )
+        for field_name in numeric_fields:
+            raw_value = cast(str | None, getattr(self, field_name))
+            setattr(self, field_name, _normalize_numeric_value(raw_value))
+
+        self.name = self.name.strip()
+        self.title = self.title.strip()
+        self.footnotes = _normalize_optional_text(self.footnotes)
+        self.fiscal_year = _normalize_fiscal_year(self.fiscal_year)
+        return self
+
 
 def _exec_comp_record_has_payload(record: ExecCompRecord | None) -> bool:
     """Return True when an executive compensation record has any payload."""
@@ -132,6 +156,52 @@ def _exec_comp_record_has_payload(record: ExecCompRecord | None) -> bool:
         str(record.fiscal_year or "").strip(),
     ]
     return any(values)
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text if text else None
+
+
+def _normalize_fiscal_year(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"\b(19|20)\d{2}\b", text)
+    if match:
+        return match.group(0)
+    return ""
+
+
+def _normalize_numeric_value(value: str | None) -> str | None:
+    """Normalize raw numeric table text to plain digit strings or null."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if lowered in {"-", "—", "–", "n/a", "na", "none", "null"}:
+        return None
+
+    # Standalone footnote references like "(4)" should not become amounts.
+    if re.fullmatch(r"\(?\d{1,3}\)?", text) and "$" not in text and "," not in text and "." not in text:
+        return None
+
+    candidates: list[str] = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    if not candidates:
+        return None
+
+    best: str = max(candidates, key=lambda token: len(re.sub(r"\D", "", token)))
+    normalized: str = best.replace(",", "")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", normalized):
+        return None
+
+    try:
+        if float(normalized) == 0.0:
+            return None
+    except ValueError:
+        return None
+    return normalized
 
 
 class CompanyCompResult(BaseModel):
@@ -279,9 +349,10 @@ EXTRACTION RULES:
    - other_comp can equal total only when the source row explicitly shows the same
      number in both "All Other Compensation" and "Total" columns.
 5. salary, bonus, stock_awards, option_awards, non_equity_incentive,
-   pension_change, other_comp, total must be plain digit strings without
-   currency symbols or commas (e.g. "1250000"). Use null if the value is
-   missing, zero, a dash, or the table cell is blank.
+   pension_change, other_comp, total should preserve the raw numeric table
+   value in string form (currency symbols/commas allowed) or null.
+   Examples: "$ 1,250,000", "1,250,000", "1250000", null.
+   Use null if the value is missing, zero, a dash, or the table cell is blank.
 6. fiscal_year should be a 4-digit year string (e.g. "2023") and must come
    from the table row/year header, not from filing metadata.
 7. confidence: 0.0 (cannot extract reliably) to 1.0 (clean extraction).
