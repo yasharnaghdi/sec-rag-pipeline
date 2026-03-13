@@ -16,15 +16,17 @@ Production-grade SEC filing RAG pipeline for DEF 14A proxy statements and 10-K d
 3. Deterministic summary compensation extraction, with LLM fallback only when needed
 4. Role assignment keyed to the most recent fiscal year per executive
 5. CD&A extraction with token counts and pay-for-performance flagging
-6. Batch outputs validated by `scripts/validate_key_results.py`
+6. Rule-based critical-section labeling for compensation coverage signals
+7. Batch outputs validated by `scripts/validate_key_results.py`
 
 For the hardened 50-CIK reference run on this branch, the local acceptance result was:
 
 - `50/50` rows written
-- `42/50` rows with non-empty `ceo_total`
-- `42/50` rows with `cda_token_count > 0`
+- `43/50` rows with non-empty `ceo_total`
+- `43/50` rows with `cda_token_count > 0`
 - no empty key identifiers in `key_results.csv`
 - numeric compensation fields normalized to plain digit strings
+- rule-based critical section flags available in batch rows
 
 ## What This Does
 
@@ -158,7 +160,8 @@ The current `output/<batch_label>/key_results.csv` schema contains 40 columns. T
 | `other2_name`, `other2_title`, `other2_salary`, `other2_total` | Second non-CEO/CFO/COO named executive selected by rank. |
 | `source_table_block_id`, `source_section_id` | The table block and section that supplied the extracted row. |
 | `extraction_method`, `llm_model`, `llm_confidence` | Extraction provenance. `extraction_method` is `deterministic`, `llm`, or `failed`. |
-| `cda_token_count`, `pay_for_performance_flag`, `cda_section_found` | Companion CD&A metrics captured during the same filing pass. |
+| `has_exec_comp`, `exec_comp_token_count`, `has_cda`, `cda_token_count`, `pay_for_performance_flag`, `cda_section_found` | Executive-compensation and CD&A section coverage signals captured during the same filing pass. |
+| `has_summary_comp`, `summary_comp_token_count`, `has_equity_awards`, `equity_awards_token_count`, `has_grants_plan_based`, `grants_plan_based_token_count`, `has_option_exercises`, `option_exercises_token_count`, `has_pension_benefits`, `pension_benefits_token_count`, `has_pay_vs_performance`, `pay_vs_performance_token_count` | Rule-based critical-section coverage flags and token counts for compensation-related tables and disclosure sections. |
 | `status`, `error` | Final row status and any error message recorded by the batch runner. |
 
 Companion file: `output/<batch_label>/batch_log.csv`
@@ -254,7 +257,7 @@ For local inspection only, the most relevant generated evidence is:
 | Problem | Likely Cause | Fix |
 | --- | --- | --- |
 | SEC fetch fails immediately | `EDGAR_USER_AGENT` or `SEC_USER_AGENT` is missing | Set both env vars to a real name plus email before hitting EDGAR. |
-| `pytest` fails on first run while importing `tiktoken` | Local tokenizer cache is empty | Re-run the suite once with network access so `cl100k_base` is cached locally. |
+| `pytest` reaches chunking tests offline | No action needed | `chunking/splitter.py` now falls back to deterministic local token counting when `cl100k_base` is not cached. |
 | `docker compose --profile full up` starts but `app` is unhealthy | Missing API keys or incorrect env values in `.env` | Confirm `.env` contains valid `EDGAR_USER_AGENT` and defaults for `VOYAGE_API_KEY` / `OPENAI_API_KEY`. |
 | Ollama fallback does not trigger | `OPENAI_API_KEY` is set to a real key, so the OpenAI path is used | Set `OPENAI_API_KEY=dummy` or clear it to force the local Ollama path. |
 | Ollama container is up but extraction still fails | The target model is not pulled or `OLLAMA_BASE_URL` points at the wrong host | Use the full Docker profile or run `ollama pull llama3.1`, then verify `OLLAMA_BASE_URL`. |

@@ -131,6 +131,7 @@ load_dotenv(project_root / ".env", override=False)
 
 import ingestion.cda_extractor as cda_extractor  # noqa: E402
 import ingestion.comp_table_extractor as det_extractor  # noqa: E402
+import ingestion.critical_section_labeler as critical_section_labeler  # noqa: E402
 import ingestion.edgar_folder_fetcher as fetcher  # noqa: E402
 from ingestion.llm_comp_extractor import (  # noqa: E402
     CompanyGrantsResult,
@@ -306,9 +307,24 @@ KEY_RESULTS_COLUMNS = [
     "extraction_method",
     "llm_model",
     "llm_confidence",
+    "has_exec_comp",
+    "exec_comp_token_count",
+    "has_cda",
     "cda_token_count",
     "pay_for_performance_flag",
     "cda_section_found",
+    "has_pay_vs_performance",
+    "pay_vs_performance_token_count",
+    "has_summary_comp",
+    "summary_comp_token_count",
+    "has_equity_awards",
+    "equity_awards_token_count",
+    "has_grants_plan_based",
+    "grants_plan_based_token_count",
+    "has_option_exercises",
+    "option_exercises_token_count",
+    "has_pension_benefits",
+    "pension_benefits_token_count",
     "status",
     "error",
 ]
@@ -454,10 +470,22 @@ def _most_recent_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not rows:
         return None
 
-    def _year_key(row: dict[str, Any]) -> str:
-        return str(row.get("year", "") or "")
+    best_index = 0
+    best_row = rows[0]
+    best_year = _parse_fiscal_year(_normalize_compensation_year(str(best_row.get("year", "") or ""), ""))
 
-    return sorted(rows, key=_year_key, reverse=True)[0]
+    for index, row in enumerate(rows[1:], start=1):
+        row_year = _parse_fiscal_year(_normalize_compensation_year(str(row.get("year", "") or ""), ""))
+        if row_year is None:
+            continue
+        if best_year is None or row_year > best_year:
+            best_index = index
+            best_row = row
+            best_year = row_year
+
+    if best_year is not None:
+        return best_row
+    return rows[best_index]
 
 
 def _to_float(value: Any) -> float:
@@ -1280,10 +1308,13 @@ def _grant_row_from_llm(row: GrantPlanAwardRecord) -> dict[str, Any]:
 
 
 def _normalize_compensation_year(raw_year: str, fallback_year: str) -> str:
-    if re.fullmatch(r"\d{4}", raw_year.strip()):
-        return raw_year.strip()
-    if re.fullmatch(r"\d{4}", fallback_year.strip()):
-        return fallback_year.strip()
+    raw_match = re.search(r"(19|20)\d{2}", raw_year.strip())
+    if raw_match is not None:
+        return raw_match.group(0)
+
+    fallback_match = re.search(r"(19|20)\d{2}", fallback_year.strip())
+    if fallback_match is not None:
+        return fallback_match.group(0)
     return "unknown"
 
 
@@ -1512,12 +1543,30 @@ def process_cik(
         pay_for_performance_flag = False
         cda_section_found = False
 
+    try:
+        section_labels = critical_section_labeler.label_critical_sections(blocks)
+    except Exception as section_exc:  # noqa: BLE001
+        log.warning("critical_section_labeling_failed | cik=%s error=%s", cik, section_exc)
+        section_labels = critical_section_labeler.label_critical_sections([])
+
+    section_labels["has_cda"] = bool(section_labels.get("has_cda", False) or cda_section_found)
+    section_labels["cda_token_count"] = max(
+        int(section_labels.get("cda_token_count", 0) or 0),
+        int(cda_token_count or 0),
+    )
+
     table_blocks = [block for block in blocks if isinstance(block, TableBlock)]
     block_count = len(blocks)
     table_count = len(table_blocks)
 
     grants_table, _ = _locate_grants_table(blocks)
     grant_table_found = grants_table is not None
+    if grants_table is not None:
+        section_labels["has_grants_plan_based"] = True
+        section_labels["grants_plan_based_token_count"] = max(
+            int(section_labels.get("grants_plan_based_token_count", 0) or 0),
+            grants_table.token_count_linearized,
+        )
     grants_det_rows: list[dict[str, Any]] = []
     try:
         if grants_table is not None:
@@ -1569,6 +1618,24 @@ def process_cik(
     comp_table, comp_heading = _locate_comp_table(blocks)
     comp_heading_found = comp_heading is not None
     comp_table_found = comp_table is not None
+    if comp_table is not None:
+        section_labels["has_summary_comp"] = True
+        section_labels["summary_comp_token_count"] = max(
+            int(section_labels.get("summary_comp_token_count", 0) or 0),
+            comp_table.token_count_linearized,
+        )
+    section_labels["has_exec_comp"] = bool(
+        section_labels.get("has_exec_comp", False)
+        or comp_heading_found
+        or cda_section_found
+        or comp_table_found
+    )
+    section_labels["exec_comp_token_count"] = max(
+        int(section_labels.get("exec_comp_token_count", 0) or 0),
+        int(section_labels.get("summary_comp_token_count", 0) or 0),
+        int(section_labels.get("grants_plan_based_token_count", 0) or 0),
+        int(section_labels.get("cda_token_count", 0) or 0),
+    )
 
     extraction_method = "failed"
     llm_confidence: float | str = ""
@@ -1739,9 +1806,32 @@ def process_cik(
             "extraction_method": extraction_method,
             "llm_model": llm_model_used,
             "llm_confidence": llm_confidence,
-            "cda_token_count": cda_token_count,
+            "has_exec_comp": bool(section_labels.get("has_exec_comp", False)),
+            "exec_comp_token_count": int(section_labels.get("exec_comp_token_count", 0) or 0),
+            "has_cda": bool(section_labels.get("has_cda", False)),
+            "cda_token_count": int(section_labels.get("cda_token_count", 0) or 0),
             "pay_for_performance_flag": pay_for_performance_flag,
             "cda_section_found": cda_section_found,
+            "has_pay_vs_performance": bool(section_labels.get("has_pay_vs_performance", False)),
+            "pay_vs_performance_token_count": int(
+                section_labels.get("pay_vs_performance_token_count", 0) or 0
+            ),
+            "has_summary_comp": bool(section_labels.get("has_summary_comp", False)),
+            "summary_comp_token_count": int(section_labels.get("summary_comp_token_count", 0) or 0),
+            "has_equity_awards": bool(section_labels.get("has_equity_awards", False)),
+            "equity_awards_token_count": int(section_labels.get("equity_awards_token_count", 0) or 0),
+            "has_grants_plan_based": bool(section_labels.get("has_grants_plan_based", False)),
+            "grants_plan_based_token_count": int(
+                section_labels.get("grants_plan_based_token_count", 0) or 0
+            ),
+            "has_option_exercises": bool(section_labels.get("has_option_exercises", False)),
+            "option_exercises_token_count": int(
+                section_labels.get("option_exercises_token_count", 0) or 0
+            ),
+            "has_pension_benefits": bool(section_labels.get("has_pension_benefits", False)),
+            "pension_benefits_token_count": int(
+                section_labels.get("pension_benefits_token_count", 0) or 0
+            ),
             "status": "ok",
             "error": "",
         }
@@ -1755,9 +1845,9 @@ def process_cik(
         if isinstance(role_data, dict):
             result_row.update(_row_from_det(role_data, prefix))
 
-    if not result_row.get("ceo_name", "").strip() and not result_row.get("ceo_total", "").strip():
+    if not result_row.get("ceo_name", "").strip() or not result_row.get("ceo_total", "").strip():
         return _failed(
-            "ceo_role_unresolved",
+            "ceo_role_incomplete",
             company_name,
             {
                 "block_count": block_count,

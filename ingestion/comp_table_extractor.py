@@ -726,6 +726,18 @@ def _normalize_summary_numeric_value(value: Any) -> str | None:
     return text
 
 
+def _normalize_summary_year_value(value: Any) -> str:
+    """Extract a clean four-digit compensation year when present."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    match = re.search(r"(19|20)\d{2}", text)
+    if match is not None:
+        return match.group(0)
+    return text
+
+
 def _summary_row_has_payload(row: Mapping[str, Any]) -> bool:
     if str(row.get("year", "") or "").strip():
         return True
@@ -839,6 +851,7 @@ def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
             current_name_by_table[table_id] = exec_name
             last_person_row_by_table[table_id] = out
 
+        out["year"] = _normalize_summary_year_value(out.get("year"))
         for field in _SUMMARY_COMP_REQUIRED_NUMERIC_COLS:
             out[field] = _normalize_summary_numeric_value(out.get(field))
 
