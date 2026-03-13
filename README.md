@@ -215,7 +215,7 @@ output/                 generated batch artifacts
 | --- | --- | --- |
 | 0 | Done | HTML parsing, SEC block modeling, fixture-based ingestion |
 | 1 | Done | Batch extraction, compensation outputs, Ollama fallback, S&P 500 manifest workflow |
-| 2 | In progress | SEC-aware chunking and OpenAI embedding pipeline |
+| 2 | Done | SEC-aware chunking and Voyage Finance-2 embedding pipeline |
 | 3 | Done (schema) | PostgreSQL schema, chunk writer, and storage migration groundwork |
 | 4 | Planned | Hybrid retrieval over PostgreSQL + Qdrant |
 | 5 | Planned | API query layer and citation-grounded generation |
@@ -241,15 +241,22 @@ CI currently enforces the static and test portion of that gate. The batch run an
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for branching rules, required local checks, and data-quality expectations for extraction-critical changes.
 
+## Project Audit & Lessons
+
+For a narrative of the branch audit, root causes, and the stabilization work merged from `cleanup-finalize`, see [docs/audit_and_lessons.md](docs/audit_and_lessons.md).
+
 ## End-State Review Pointers
 
 When reviewing the current extraction contract or validating the reasoning behind the latest iterations, start with these files:
 
 - `ingestion/comp_table_extractor.py` for deterministic summary compensation parsing, name/title split, year handling, and numeric normalization
+- `ingestion/critical_section_labeler.py` for rule-based compensation section coverage signals
+- `indexing/embedder.py` for the Voyage Finance-2 embedding path
 - `scripts/run_batch50_key_results.py` for orchestration, role collapsing, fiscal-year selection, and output serialization
 - `scripts/validate_key_results.py` for the safety checks that define acceptable `key_results.csv` outputs
 - `ingestion/cda_extractor.py` for CD&A section capture, token counts, and pay-for-performance signals
 - `ingestion/sec_chunker.py` for table-aware chunk preservation
+- `chunking/splitter.py` for offline-safe token counting and chunk splitting behavior
 - `docs/PIPELINE_AGENT_HANDOFF.md` for the cross-iteration reasoning and operational handoff context
 
 For local inspection only, the most relevant generated evidence is:
