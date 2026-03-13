@@ -6,6 +6,9 @@ Primary scripts: `scripts/run_batch50_key_results.py`, `scripts/validate_key_res
 
 This document is the persistent handoff for agents working on the current DEF 14A batch extraction baseline. It records the behavior that the last week of iterations converged on so later branches do not reintroduce earlier regressions.
 
+Detailed control-flow map for the batch runner lives in:
+`docs/RUN_BATCH50_WORKFLOW.md`
+
 ## 1. Stable extraction contract
 
 Per CIK, the stable branch should do all of the following:

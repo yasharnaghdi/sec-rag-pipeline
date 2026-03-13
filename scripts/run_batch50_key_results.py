@@ -2430,8 +2430,20 @@ def process_cik(
         llm_confidence = llm_result.confidence
         llm_model_used = model
         if not _llm_result_has_comp_payload(llm_result):
+            llm_failure_note = " ".join(str(llm_result.notes or "").split()).strip()
+            if llm_failure_note:
+                log.warning(
+                    "llm_comp_failed | cik=%s accession=%s reason=%s",
+                    cik,
+                    filing.accession_number,
+                    llm_failure_note,
+                )
             return _failed(
-                "llm_extract_failed_empty_result",
+                (
+                    f"llm_extract_failed_empty_result: {llm_failure_note}"
+                    if llm_failure_note
+                    else "llm_extract_failed_empty_result"
+                ),
                 company_name,
                 {
                     "block_count": block_count,

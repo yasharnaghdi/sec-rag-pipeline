@@ -40,7 +40,8 @@ Design constraints
    which balances accuracy and cost for structured table extraction.
 
 6. This module has zero side effects: no file I/O, no DB writes,
-   no logging of raw LLM responses (to avoid secret leakage).
+   and no raw LLM response logging unless TRACE_LLM_COMP=1 is
+   explicitly enabled for local debugging.
 """
 from __future__ import annotations
 
@@ -722,6 +723,51 @@ REQUIRED JSON SCHEMA:
 _OLLAMA_BASE_URL_DEFAULT = "http://localhost:11434"
 _OLLAMA_MODEL_DEFAULT = "llama3.1"
 _DUMMY_KEY_VALUES = {"dummy", "", "your-key-here", "sk-dummy"}
+_TRACE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _is_env_flag_enabled(name: str) -> bool:
+    """Return True when an environment flag is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in _TRACE_ENV_VALUES
+
+
+def _should_trace_comp_llm() -> bool:
+    """Enable verbose compensation LLM tracing only when explicitly requested."""
+    return _is_env_flag_enabled("TRACE_LLM_COMP") or _is_env_flag_enabled("TRACE_LLM")
+
+
+def _compact_failure_note(prefix: str, detail: str | Exception | None = None) -> str:
+    """Return a single-line diagnostic note safe for logs and CSV output."""
+    detail_text = " ".join(str(detail or "").split()).strip()
+    if not detail_text:
+        return prefix
+    if len(detail_text) > 240:
+        detail_text = f"{detail_text[:237]}..."
+    return f"{prefix}: {detail_text}"
+
+
+def _trace_comp_payload(
+    *,
+    cik: str,
+    accession_number: str,
+    stage: str,
+    payload: str,
+) -> None:
+    """Log full compensation prompt/response payloads when tracing is enabled."""
+    if not _should_trace_comp_llm():
+        return
+    log.info(
+        "llm_comp_trace | cik=%s accession=%s stage=%s\n%s",
+        cik,
+        accession_number,
+        stage,
+        payload if payload.strip() else "(empty)",
+    )
+
+
+def _empty_comp_result(note: str = "") -> CompanyCompResult:
+    """Return an empty compensation result with an optional diagnostic note."""
+    return CompanyCompResult(notes=note)
 
 
 def _build_user_message(
@@ -862,6 +908,20 @@ def _parse_and_validate(raw: str) -> CompanyCompResult | None:
         return None
 
 
+def _parse_and_validate_comp(raw: str) -> tuple[CompanyCompResult | None, str | None]:
+    """Parse compensation JSON and return a compact failure reason on error."""
+    try:
+        data: dict[str, Any] = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.debug("LLM JSON parse error: %s", exc)
+        return None, _compact_failure_note("json_parse_error", exc)
+    try:
+        return CompanyCompResult.model_validate(data), None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("LLM schema validation error: %s", exc)
+        return None, _compact_failure_note("schema_validation_error", exc)
+
+
 def _parse_and_validate_grants(raw: str) -> CompanyGrantsResult | None:
     """Parse raw LLM JSON string into a validated CompanyGrantsResult."""
     try:
@@ -938,7 +998,7 @@ def extract_company_comp_from_summary_table(
             cik,
             accession_number,
         )
-        return CompanyCompResult()
+        return _empty_comp_result()
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key.strip():
@@ -963,6 +1023,12 @@ def extract_company_comp_from_summary_table(
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
+    _trace_comp_payload(
+        cik=cik,
+        accession_number=accession_number,
+        stage="request_table",
+        payload=table_text,
+    )
 
     # ── Route to Ollama if OpenAI key is absent/dummy ─────────────
     # This allows full local operation (Docker Compose, offline dev)
@@ -1004,27 +1070,41 @@ def extract_company_comp_from_summary_table(
             try:
                 raw = _call_ollama(messages)
             except Exception as ollama_exc:  # noqa: BLE001
+                failure_note = _compact_failure_note("api_error_attempt_1_ollama", ollama_exc)
                 log.error(
                     "llm_extractor | API error attempt 1 | cik=%s backend=%s error=%s",
                     cik,
                     "ollama",
                     ollama_exc,
                 )
-                return CompanyCompResult()
+                return _empty_comp_result(failure_note)
         else:
+            failure_note = _compact_failure_note(
+                f"api_error_attempt_1_{'ollama' if use_ollama else 'openai'}",
+                exc,
+            )
             log.error(
                 "llm_extractor | API error attempt 1 | cik=%s backend=%s error=%s",
                 cik,
                 "ollama" if use_ollama else "openai",
                 exc,
             )
-            return CompanyCompResult()
+            return _empty_comp_result(failure_note)
+
+    _trace_comp_payload(
+        cik=cik,
+        accession_number=accession_number,
+        stage="response_attempt_1",
+        payload=raw,
+    )
 
     column_availability = _extract_comp_column_availability(table_text)
     guardrail_fallback_result: CompanyCompResult | None = None
     retry_prompt = _RETRY_SYSTEM_PROMPT
+    attempt_1_failure_note: str | None = None
+    attempt_2_failure_note: str | None = None
 
-    result = _parse_and_validate(raw)
+    result, attempt_1_failure_note = _parse_and_validate_comp(raw)
     if result is not None:
         guardrail_violations = _collect_comp_column_violations(result, column_availability)
         if not guardrail_violations:
@@ -1042,7 +1122,11 @@ def extract_company_comp_from_summary_table(
             ",".join(guardrail_violations[:6]),
         )
     else:
-        log.warning("llm_extractor | invalid response attempt 1 | cik=%s", cik)
+        log.warning(
+            "llm_extractor | invalid response attempt 1 | cik=%s reason=%s",
+            cik,
+            attempt_1_failure_note or "unknown",
+        )
 
     retry_messages = messages + [
         {"role": "assistant", "content": raw},
@@ -1070,6 +1154,7 @@ def extract_company_comp_from_summary_table(
             try:
                 raw_retry = _call_ollama(retry_messages)
             except Exception as ollama_exc:  # noqa: BLE001
+                failure_note = _compact_failure_note("api_error_attempt_2_ollama", ollama_exc)
                 log.error(
                     "llm_extractor | API error attempt 2 | cik=%s backend=%s error=%s",
                     cik,
@@ -1079,8 +1164,12 @@ def extract_company_comp_from_summary_table(
                 if guardrail_fallback_result is not None:
                     _apply_comp_column_guardrails(guardrail_fallback_result, column_availability)
                     return guardrail_fallback_result
-                return CompanyCompResult()
+                return _empty_comp_result(failure_note)
         else:
+            failure_note = _compact_failure_note(
+                f"api_error_attempt_2_{'ollama' if use_ollama else 'openai'}",
+                exc,
+            )
             log.error(
                 "llm_extractor | API error attempt 2 | cik=%s backend=%s error=%s",
                 cik,
@@ -1090,9 +1179,16 @@ def extract_company_comp_from_summary_table(
             if guardrail_fallback_result is not None:
                 _apply_comp_column_guardrails(guardrail_fallback_result, column_availability)
                 return guardrail_fallback_result
-            return CompanyCompResult()
+            return _empty_comp_result(failure_note)
 
-    result_retry = _parse_and_validate(raw_retry)
+    _trace_comp_payload(
+        cik=cik,
+        accession_number=accession_number,
+        stage="response_attempt_2",
+        payload=raw_retry,
+    )
+
+    result_retry, attempt_2_failure_note = _parse_and_validate_comp(raw_retry)
     if result_retry is not None:
         retry_violations = _collect_comp_column_violations(result_retry, column_availability)
         if retry_violations:
@@ -1115,11 +1211,14 @@ def extract_company_comp_from_summary_table(
         return guardrail_fallback_result
 
     log.error(
-        "llm_extractor | failed both attempts | cik=%s accession=%s",
+        "llm_extractor | failed both attempts | cik=%s accession=%s reason1=%s reason2=%s",
         cik,
         accession_number,
+        attempt_1_failure_note or "",
+        attempt_2_failure_note or "",
     )
-    return CompanyCompResult()
+    failure_parts = [note for note in (attempt_1_failure_note, attempt_2_failure_note) if note]
+    return _empty_comp_result("; ".join(failure_parts))
 
 
 def extract_grants_from_plan_based_table(
