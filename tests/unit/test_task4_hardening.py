@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import csv
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from ingestion.comp_table_extractor import _SUMMARY_COMP_COLS, _map_row, extract_summary_compensation
-from ingestion.metadata_model import HeadingBlock, TableBlock
+from ingestion.metadata_model import DocumentMetadata, HeadingBlock, TableBlock
+from ingestion.sec_html_parser import SECHTMLParser
 from scripts.run_batch50_key_results import (
     KEY_RESULTS_COLUMNS,
     _collapse_to_roles,
@@ -201,6 +203,33 @@ class TestExecNameTitleSplit:
             ):
                 value = row.get(field)
                 assert value is None or str(value).isdigit()
+
+    def test_fixture_normalizes_year_tokens_and_prefers_latest_role_year(self) -> None:
+        fixture_path = Path(__file__).resolve().parents[1] / "fixtures" / "summary_comp_multi_year.html"
+        raw_html = fixture_path.read_text(encoding="utf-8")
+        metadata = DocumentMetadata(
+            document_id="doc-summary-fixture",
+            cik="0000001",
+            company_name="Acme Corp",
+            form_type="DEF 14A",
+            filing_date=date(2025, 4, 11),
+            accession_number="0000001-25-000001",
+            source_url="https://example.com/def14a",
+            fiscal_year_end=None,
+            raw_html_path=str(fixture_path),
+        )
+
+        blocks = SECHTMLParser().parse(raw_html, metadata)
+        extracted = extract_summary_compensation(blocks, {"cik": "0000001"})
+        roles = _collapse_to_roles(extracted)
+
+        ceo_rows = [row for row in extracted if row.get("exec_name") == "Jane Smith"]
+        cfo_rows = [row for row in extracted if row.get("exec_name") == "Bob Lee"]
+
+        assert [row["year"] for row in ceo_rows] == ["2023", "2022"]
+        assert [row["year"] for row in cfo_rows] == ["2023", "2022"]
+        assert roles["ceo"]["year"] == "2023"
+        assert roles["cfo"]["year"] == "2023"
 
 
 class TestCollapseToRoles:
