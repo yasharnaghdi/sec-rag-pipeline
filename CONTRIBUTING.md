@@ -14,21 +14,26 @@ poetry install && poetry run pytest tests/ -v --tb=short
 
 Before running SEC-facing scripts, fill in `.env` with a real `EDGAR_USER_AGENT` and `SEC_USER_AGENT`.
 
-## 2. Branch Naming
+## 2. Branching Model
 
-Use short, task-shaped branch names:
+Base all work on `main`. Create short-lived branches from `main`, keep them narrowly scoped, and merge them back through a pull request once the required checks are green.
+
+Preferred branch prefixes:
 
 - `feat/<scope>`
 - `fix/<scope>`
+- `chore/<scope>`
+
+Optional when they describe the work more clearly:
+
 - `docs/<scope>`
 - `test/<scope>`
-- `chore/<scope>`
 
 Examples:
 
 - `feat/voyage-embedder`
 - `fix/edgar-rate-limit`
-- `docs/release-notes-v010`
+- `chore/release-docs`
 
 ## 3. Commit Message Format
 
@@ -67,21 +72,52 @@ Use a test-first loop for behavior changes:
 
 Do not skip the failing-test step for parser, chunking, or extraction logic unless the change is docs-only.
 
-## 6. PR Process
+## 6. Required Local Checks Before PR
+
+Run this minimum gate before opening or updating a pull request:
+
+```bash
+poetry run ruff check .
+poetry run mypy . --ignore-missing-imports
+env DB_URL='' poetry run pytest tests/ -q
+```
+
+This is the baseline local gate expected to match the project CI path for routine changes.
+
+## 7. Data-Extraction-Critical Changes
+
+If your change touches the extraction-critical path, do more than the baseline gate. This applies in particular to:
+
+- `ingestion/comp_table_extractor.py`
+- `ingestion/critical_section_labeler.py`
+- `chunking/splitter.py`
+- `indexing/embedder.py`
+- `scripts/run_batch50_key_results.py`
+
+Required follow-up checks:
+
+```bash
+poetry run python scripts/debug_data_quality.py
+```
+
+If a 50-CIK batch artifact is available locally, also run:
+
+```bash
+poetry run python scripts/validate_key_results.py \
+  --input output/<batch_label>/key_results.csv --expected-rows 50
+```
 
 Use this checklist before requesting review:
 
 1. Rebase or merge the latest `main`.
 2. Keep the PR scope narrow enough to review in one sitting.
-3. Run `poetry run pytest tests/ -v --tb=short`.
-4. Run `poetry run ruff check .`.
-5. Run `poetry run mypy . --ignore-missing-imports`.
-6. Update docs if CLI flags, env vars, or outputs changed.
-7. Paste the verification commands and outcomes into the PR description.
-8. Call out any known risks, skipped tests, or network-dependent steps.
-9. Do not stage generated outputs from `output/`, especially `key_results.csv` and `batch_log.csv`.
+3. Run the required local checks above.
+4. Update docs if CLI flags, env vars, outputs, or validation expectations changed.
+5. Paste the verification commands and outcomes into the PR description.
+6. Call out any known risks, skipped tests, or network-dependent steps.
+7. Do not stage generated outputs from `output/`, especially `key_results.csv` and `batch_log.csv`.
 
-## 7. Protected Files
+## 8. Protected Files
 
 These files or paths need extra care because they define contracts, CI, or storage shape:
 
@@ -93,7 +129,7 @@ These files or paths need extra care because they define contracts, CI, or stora
 | `fixtures/` | Shared research inputs and release fixtures. |
 | `AGENTS.md` | Agent operating contract for the repo. |
 
-## 8. Environment Variables
+## 9. Environment Variables
 
 Minimum variables for active development:
 
@@ -108,7 +144,7 @@ Minimum variables for active development:
 | `OLLAMA_BASE_URL` | conditional | Needed when using local Ollama instead of OpenAI. |
 | `OLLAMA_MODEL` | conditional | Defaults to `llama3.1`. |
 
-## 9. Running a Batch
+## 10. Running a Batch
 
 Three-company smoke run:
 
@@ -133,20 +169,20 @@ If you want the full local stack, use:
 docker compose --profile full up --build -d
 ```
 
-## 10. Stable Baseline And Review Files
+## 11. Stable Baseline And Review Files
 
-If you are trying to understand the current stable extraction contract before making changes, start on `Separate-files` and read these files first:
+Treat `main` as the single source of truth and read these files first when you need the shortest path to the current extraction contract:
 
 - `ingestion/comp_table_extractor.py`
+- `ingestion/critical_section_labeler.py`
+- `chunking/splitter.py`
+- `indexing/embedder.py`
 - `scripts/run_batch50_key_results.py`
 - `scripts/validate_key_results.py`
-- `ingestion/cda_extractor.py`
-- `ingestion/sec_chunker.py`
-- `docs/PIPELINE_AGENT_HANDOFF.md`
 
-Treat those files as the shortest path to the current reasoning, constraints, and release metrics.
+Those files define the current reasoning, validation contract, and release-critical behavior.
 
-## 11. Getting Help
+## 12. Getting Help
 
 Start with these repo-local sources:
 

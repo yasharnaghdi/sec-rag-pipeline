@@ -9,7 +9,7 @@ Production-grade SEC filing RAG pipeline for DEF 14A proxy statements and 10-K d
 
 ## Stable Baseline
 
-`Separate-files` is the current stable integration branch for the compensation extraction workflow. The baseline this branch is meant to preserve is:
+`main` is the current stable integration branch and single source of truth for the compensation extraction workflow. The baseline this branch is meant to preserve is:
 
 1. CIK-only acquisition of the latest `DEF 14A`
 2. SEC HTML parsing into typed blocks
@@ -19,7 +19,7 @@ Production-grade SEC filing RAG pipeline for DEF 14A proxy statements and 10-K d
 6. Rule-based critical-section labeling for compensation coverage signals
 7. Batch outputs validated by `scripts/validate_key_results.py`
 
-For the hardened 50-CIK reference run on this branch, the local acceptance result was:
+For the cached 50-CIK reference output validated on `main`, the current local acceptance result is:
 
 - `50/50` rows written
 - `43/50` rows with non-empty `ceo_total`
@@ -106,18 +106,19 @@ comp_table_extractor.py   llm_comp_extractor.py
 
 ## Branch Guide
 
-The repo has accumulated task-shaped branches during the last week of parser and extraction iterations. Use them as intent markers, not as equally current release lines.
+The repo accumulated task-shaped branches during parser and extraction hardening. Treat them as historical intent markers, not as equally current release lines.
 
 | Branch | Meaning |
 | --- | --- |
-| `Separate-files` | Current stable integration branch for the end-to-end batch extraction path and the branch to use for release validation. |
-| `main` | Conservative baseline branch. It may lag active extraction hardening until a merge is completed and CI is green. |
+| `main` | Current stable integration branch and the branch to base new work on. |
+| `cleanup-finalize` | Stabilization branch merged through PR 22; keep only for audit traceability. |
+| `Separate-files` | Historical audit baseline that matched pre-merge `main` during the stabilization review. |
 | `fix/cik-only-acquisition` | Focused fix branch for latest-`DEF 14A` acquisition by CIK. |
 | `feat/task4-hardening` | Hardening branch for summary compensation parsing, validation checks, and edge-case tests. |
 | `feat/llm-comp-extractor-and-batch50` | LLM fallback and batch-runner development branch. |
 | `feat/ollama-fallback-and-docker-compose` | Local runtime and model fallback branch. |
 
-If you need the branch that best reflects the current extraction contract, start from `Separate-files` and then inspect the files listed in [End-State Review Pointers](#end-state-review-pointers).
+If you need the branch that reflects the current extraction contract, start from `main` and then inspect the files listed in [End-State Review Pointers](#end-state-review-pointers).
 
 ## One-Command Full Stack
 
@@ -221,7 +222,7 @@ output/                 generated batch artifacts
 
 ## Merge Gate
 
-Before merging `Separate-files` into a release branch, the minimum gate is:
+Before tagging a release from `main` or merging a release-critical change into `main`, the minimum gate is:
 
 ```bash
 poetry install --no-interaction
@@ -235,6 +236,10 @@ poetry run python scripts/validate_key_results.py \
 ```
 
 CI currently enforces the static and test portion of that gate. The batch run and validator remain the release-level smoke check to run before tagging or merging a stabilization branch.
+
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for branching rules, required local checks, and data-quality expectations for extraction-critical changes.
 
 ## End-State Review Pointers
 
