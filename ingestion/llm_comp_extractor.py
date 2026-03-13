@@ -54,7 +54,7 @@ from typing import Any, cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +237,12 @@ class CompanyCompResult(BaseModel):
         default="",
         description="Brief extraction notes or caveats from the LLM.",
     )
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def normalize_notes(cls, value: Any) -> str:
+        """Treat null notes from the LLM as an empty string."""
+        return str(value or "").strip()
 
     @model_validator(mode="after")
     def normalize_result(self) -> CompanyCompResult:
