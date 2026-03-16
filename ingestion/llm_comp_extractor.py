@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -295,6 +296,15 @@ EXTRACTION RULES:
 11. Return ONLY the JSON object. No prose, no markdown code fences.
 12. Do NOT infer fiscal year from filing date. Use explicit year values from
    the table rows.
+13. exec_name must contain ONLY the person's proper name (first + last name).
+    Strip all titles, roles, and descriptions such as "Chief Executive Officer",
+    "Former", "President", "Ph.D.", "Jr.", "Sr.", etc.
+    If no proper name can be found (only a role/title is present), set name to ""
+    and place the role text in title.
+    Examples:
+      "Tim Cook Chief Executive Officer" -> name: "Tim Cook"
+      "Former Chief Executive Officer" -> name: ""
+      "J. Kent Masters, Jr." -> name: "J. Kent Masters Jr."
 """
 
 _RETRY_SYSTEM_PROMPT = """\
@@ -364,6 +374,69 @@ REQUIRED JSON SCHEMA:
 _OLLAMA_BASE_URL_DEFAULT = "http://localhost:11434"
 _OLLAMA_MODEL_DEFAULT = "llama3.1"
 _DUMMY_KEY_VALUES = {"dummy", "", "your-key-here", "sk-dummy"}
+_TITLE_WORDS = {
+    "chief",
+    "executive",
+    "officer",
+    "president",
+    "former",
+    "chair",
+    "vice",
+    "chairman",
+    "director",
+    "founder",
+    "senior",
+    "interim",
+    "retired",
+    "ceo",
+    "cfo",
+    "coo",
+    "cto",
+    "evp",
+    "svp",
+    "vp",
+    "general",
+    "counsel",
+    "secretary",
+    "treasurer",
+    "managing",
+    "partner",
+    "board",
+    "group",
+    "jr",
+    "sr",
+    "phd",
+}
+
+
+def _strip_title_from_name(raw: str) -> str | None:
+    cleaned_raw = re.sub(r"\(\d+\)", "", raw).strip()
+    if not cleaned_raw:
+        return None
+
+    tokens = cleaned_raw.split()
+    name_tokens = [
+        token
+        for token in tokens
+        if token
+        and token[0].isupper()
+        and token.lower().rstrip(".,") not in _TITLE_WORDS
+    ]
+    result = " ".join(name_tokens).strip()
+    return result if len(result) > 1 else None
+
+
+def _normalize_result_names(result: CompanyCompResult) -> CompanyCompResult:
+    for record in result.rows:
+        stripped = _strip_title_from_name(record.name)
+        record.name = stripped or ""
+    for role_key in ("ceo", "cfo", "coo", "other1", "other2"):
+        role_record = getattr(result, role_key, None)
+        if not isinstance(role_record, ExecCompRecord):
+            continue
+        stripped = _strip_title_from_name(role_record.name)
+        role_record.name = stripped or ""
+    return result
 
 
 def _build_user_message(
@@ -497,7 +570,8 @@ def _parse_and_validate(raw: str) -> CompanyCompResult | None:
         log.debug("LLM JSON parse error: %s", exc)
         return None
     try:
-        return CompanyCompResult.model_validate(data)
+        parsed = CompanyCompResult.model_validate(data)
+        return _normalize_result_names(parsed)
     except Exception as exc:  # noqa: BLE001
         log.debug("LLM schema validation error: %s", exc)
         return None

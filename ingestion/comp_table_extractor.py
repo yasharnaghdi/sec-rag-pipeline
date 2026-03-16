@@ -122,6 +122,39 @@ _SUMMARY_COMP_REQUIRED_NUMERIC_COLS = {
 }
 
 _NUMERIC_EMPTY_MARKERS = {"", "—", "-", "$", "n/a", "na"}
+_TITLE_WORDS = {
+    "chief",
+    "executive",
+    "officer",
+    "president",
+    "former",
+    "chair",
+    "vice",
+    "chairman",
+    "director",
+    "founder",
+    "senior",
+    "interim",
+    "retired",
+    "ceo",
+    "cfo",
+    "coo",
+    "cto",
+    "evp",
+    "svp",
+    "vp",
+    "general",
+    "counsel",
+    "secretary",
+    "treasurer",
+    "managing",
+    "partner",
+    "board",
+    "group",
+    "jr",
+    "sr",
+    "phd",
+}
 _EXEC_TITLE_KEYWORDS = {
     "officer",
     "president",
@@ -255,10 +288,49 @@ def clean_numeric(val: str) -> float | None:
 
     cleaned = re.sub(r"[$,\s]", "", val.strip())
     cleaned = re.sub(r"^\((.+)\)$", r"-\1", cleaned)
+    # Reject bare fiscal years mistakenly parsed as compensation values.
+    if re.fullmatch(r"20[0-2]\d|2030", cleaned):
+        return None
     try:
-        return float(cleaned)
+        parsed = float(cleaned)
+        # Guard against concatenated multi-value parse errors.
+        if parsed > 500_000_000:
+            return None
+        return parsed
     except ValueError:
         return None
+
+
+def _strip_title_from_name(raw: str) -> str | None:
+    """Remove title/role tokens from a name field; return None if no name remains."""
+    cleaned_raw = re.sub(r"\(\d+\)", "", raw).strip()
+    if not cleaned_raw:
+        return None
+
+    tokens = cleaned_raw.split()
+    name_tokens = [
+        token
+        for token in tokens
+        if token
+        and token[0].isupper()
+        and token.lower().rstrip(".,") not in _TITLE_WORDS
+    ]
+    result = " ".join(name_tokens).strip()
+    return result if len(result) > 1 else None
+
+
+def strip_title_from_name(raw: str) -> str | None:
+    """Public wrapper for name normalization across ingestion pipelines."""
+    return _strip_title_from_name(raw)
+
+
+def _normalize_name_fields(output: dict[str, Any]) -> None:
+    """Normalize all *_name fields in-place to contain proper names only."""
+    for key, value in list(output.items()):
+        if not key.endswith("_name"):
+            continue
+        stripped = _strip_title_from_name(str(value or ""))
+        output[key] = stripped or ""
 
 
 def _heading_matches(heading_text: str, signatures: list[str]) -> bool:
@@ -660,6 +732,7 @@ def _map_grants_row(
 
     if mapped_values == 0 and normalized_row:
         output["exec_name"] = normalized_row[0].strip()
+    _normalize_name_fields(output)
 
     output["footnote_refs"] = _extract_row_footnote_refs(normalized_row, footnotes)
     output["source_section"] = source_section
@@ -790,6 +863,7 @@ def _map_row(
         output["exec_name"] = exec_name
         if exec_title:
             output["exec_title"] = exec_title
+    _normalize_name_fields(output)
 
     output["footnote_refs"] = _extract_row_footnote_refs(row, footnotes)
     output["source_section"] = source_section
@@ -814,6 +888,7 @@ def _normalize_summary_comp_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
 
     for row in rows:
         out = dict(row)
+        _normalize_name_fields(out)
         table_id = str(out.get("table_block_id", "") or "")
         exec_name = str(out.get("exec_name", "") or "").strip()
         exec_title = str(out.get("exec_title", "") or "").strip()

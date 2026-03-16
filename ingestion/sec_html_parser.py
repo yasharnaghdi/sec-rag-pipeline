@@ -47,6 +47,8 @@ _PAGE_NUMBER_PATTERN = re.compile(
     r"|^\s*[Pp]age\s+\d{1,3}\s+of\s+\d{1,3}\s*$"
 )
 _MIN_HEADING_COLSPAN = 3
+_FISCAL_YEAR_HEADER_RE = re.compile(r"\b(20\d{2}|fiscal.?year|year)\b", re.IGNORECASE)
+_FISCAL_YEAR_VALUE_RE = re.compile(r"20(?:[0-2]\d|30)")
 _DetectionMethod = Literal[
     "tag",
     "bold_heuristic",
@@ -438,8 +440,91 @@ def _extract_table_rows(table_tag: Tag) -> tuple[list[list[str]], int, str, bool
         if all_header:
             header_row_count += 1
 
+    rows, header_row_count = _expand_multi_year_rows(rows, header_row_count)
     linearized_text = " | ".join(cell for row in rows for cell in row)
     return rows, header_row_count, linearized_text, has_merged_cells
+
+
+def _split_cell_for_year_count(cell_text: str, year_index: int, year_count: int) -> str:
+    text = cell_text.strip()
+    if year_count <= 1 or not text:
+        return text
+
+    parts = [part.strip() for part in re.split(r"[\r\n|;]+", text) if part.strip()]
+    if len(parts) == year_count:
+        return parts[year_index]
+
+    numeric_tokens = re.findall(r"\(?\$?\d[\d,]*(?:\.\d+)?\)?", text)
+    if len(numeric_tokens) == year_count:
+        return str(numeric_tokens[year_index]).strip()
+    return text
+
+
+def _extract_year_candidates(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if re.fullmatch(r"20(?:[0-2]\d|30)", stripped):
+        return [stripped]
+
+    years = _FISCAL_YEAR_VALUE_RE.findall(stripped)
+    deduped: list[str] = []
+    for year in years:
+        if year not in deduped:
+            deduped.append(year)
+    return deduped
+
+
+def _expand_multi_year_rows(rows: list[list[str]], header_row_count: int) -> tuple[list[list[str]], int]:
+    if not rows:
+        return rows, header_row_count
+
+    header_rows = max(1, header_row_count or 1)
+    header_rows = min(header_rows, len(rows))
+    header_slice = rows[:header_rows]
+    max_cols = max((len(row) for row in rows), default=0)
+
+    year_columns: set[int] = set()
+    for col_index in range(max_cols):
+        column_header_parts: list[str] = []
+        for header_row in header_slice:
+            if col_index < len(header_row):
+                value = header_row[col_index].strip()
+                if value:
+                    column_header_parts.append(value)
+        if _FISCAL_YEAR_HEADER_RE.search(" ".join(column_header_parts)):
+            year_columns.add(col_index)
+
+    if not year_columns:
+        return rows, header_row_count
+
+    expanded_rows: list[list[str]] = list(header_slice)
+    for row in rows[header_rows:]:
+        if not any(cell.strip() for cell in row):
+            continue
+
+        detected_years: list[str] = []
+        for year_col in sorted(year_columns):
+            if year_col >= len(row):
+                continue
+            for year in _extract_year_candidates(row[year_col]):
+                if year not in detected_years:
+                    detected_years.append(year)
+
+        if not detected_years:
+            expanded_rows.append(row)
+            continue
+
+        for year_index, year in enumerate(detected_years):
+            expanded = list(row)
+            for col_index, cell in enumerate(expanded):
+                if col_index in year_columns:
+                    expanded[col_index] = year
+                else:
+                    expanded[col_index] = _split_cell_for_year_count(cell, year_index, len(detected_years))
+            expanded_rows.append(expanded)
+
+    return expanded_rows, header_row_count
 
 
 def _parse_table_span(raw_value: object) -> int:
