@@ -151,10 +151,23 @@ DEFAULT_MODEL = "gpt-4o-mini"
 MIN_CEO_COVERAGE = 30
 BATCH_OUTPUT_BASE = Path("output")
 
-CEO_KEYWORDS = {"chief executive officer", "ceo"}
-CFO_KEYWORDS = {"chief financial officer", "cfo"}
-COO_KEYWORDS = {"chief operating officer", "coo"}
-PRESIDENT_KEYWORDS = {"president"}
+CONFIDENCE_THRESHOLD = 0.5
+ROLE_PATTERNS = {
+    "ceo": re.compile(
+        r"\b(chief\s+exec\w*\s+officer|ceo|president\s+and\s+ceo|"
+        r"chair\s+and\s+ceo|president\s*[,&]\s*chief\s+exec\w*)\b",
+        re.IGNORECASE,
+    ),
+    "cfo": re.compile(
+        r"\b(chief\s+financial\s+officer|cfo|chief\s+finance\w*)\b",
+        re.IGNORECASE,
+    ),
+    "coo": re.compile(
+        r"\b(chief\s+operating\s+officer|coo)\b",
+        re.IGNORECASE,
+    ),
+}
+PRESIDENT_ONLY_PATTERN = re.compile(r"\bpresident\b", re.IGNORECASE)
 
 _COMP_SIGNATURES = [
     "summary compensation table",
@@ -351,6 +364,7 @@ BATCH_LOG_COLUMNS = [
     "elapsed_seconds",
     "error",
 ]
+LOW_CONFIDENCE_COLUMNS = [*KEY_RESULTS_COLUMNS, "confidence_threshold", "low_confidence_reason"]
 
 
 def _call_process_cik(
@@ -459,10 +473,16 @@ def _fetch_latest_def14a(cik: str) -> fetcher.FetchedFiling:
     return fetcher.fetch_filing(cik=cik, folder_id=cik, form_type="DEF 14A")
 
 
-def _role_match(title: str, keywords: set[str]) -> bool:
-    """Case-insensitive check if title contains any keyword."""
-    lowered = title.lower()
-    return any(keyword in lowered for keyword in keywords)
+def classify_role(title: str) -> str:
+    for slot, pattern in ROLE_PATTERNS.items():
+        if pattern.search(title or ""):
+            return slot
+    return "other"
+
+
+def _normalize_exec_name_value(value: Any) -> str:
+    stripped = det_extractor.strip_title_from_name(str(value or ""))
+    return stripped or ""
 
 
 def _most_recent_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -498,6 +518,20 @@ def _to_float(value: Any) -> float:
 
 def _as_text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def _to_confidence(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sanitize_numeric_text(value: str) -> str:
+    """Normalize numeric strings from LLM outputs (strip hidden separators/symbols)."""
+    cleaned = value.replace("\u200b", "").replace("\ufeff", "").strip()
+    cleaned = cleaned.replace("$", "").replace(",", "").replace(" ", "")
+    return cleaned
 
 
 def _as_digit_string(value: Any) -> str:
@@ -552,15 +586,16 @@ def _collapse_to_roles(det_rows: list[dict[str, Any]]) -> dict[str, dict[str, An
     for row in det_rows:
         title_field = str(row.get("exec_title", "") or "")
         name_field = str(row.get("exec_name", "") or "")
-        role_text = (title_field or name_field).lower()
+        role_source = title_field or name_field
+        role_slot = classify_role(role_source)
 
-        if _role_match(role_text, CEO_KEYWORDS):
+        if role_slot == "ceo":
             ceo_rows.append(row)
-        elif _role_match(role_text, CFO_KEYWORDS):
+        elif role_slot == "cfo":
             cfo_rows.append(row)
-        elif _role_match(role_text, COO_KEYWORDS):
+        elif role_slot == "coo":
             coo_rows.append(row)
-        elif _role_match(role_text, PRESIDENT_KEYWORDS):
+        elif PRESIDENT_ONLY_PATTERN.search(role_source):
             president_rows.append(row)
         else:
             other_rows.append(row)
@@ -810,7 +845,7 @@ def _locate_comp_table(blocks: list[BaseBlock]) -> tuple[TableBlock | None, Head
 def _row_from_det(role_dict: dict[str, Any], prefix: str) -> dict[str, Any]:
     """Build flat key_results columns for one role from a deterministic row."""
     base = {
-        f"{prefix}_name": str(role_dict.get("exec_name", "") or ""),
+        f"{prefix}_name": _normalize_exec_name_value(role_dict.get("exec_name", "")),
         f"{prefix}_title": str(role_dict.get("exec_title", "") or ""),
         f"{prefix}_salary": _as_digit_string(role_dict.get("salary")),
         f"{prefix}_total": _as_digit_string(role_dict.get("total")),
@@ -829,17 +864,17 @@ def _row_from_det(role_dict: dict[str, Any], prefix: str) -> dict[str, Any]:
 def _row_from_llm(record: ExecCompRecord, prefix: str) -> dict[str, Any]:
     """Build flat key_results columns for one role from an LLM ExecCompRecord."""
     base = {
-        f"{prefix}_name": record.name,
+        f"{prefix}_name": _normalize_exec_name_value(record.name),
         f"{prefix}_title": record.title,
-        f"{prefix}_salary": record.salary or "",
-        f"{prefix}_total": record.total or "",
+        f"{prefix}_salary": _sanitize_numeric_text(record.salary or ""),
+        f"{prefix}_total": _sanitize_numeric_text(record.total or ""),
     }
     if prefix == "ceo":
         base.update(
             {
-                "ceo_bonus": record.bonus or "",
-                "ceo_stock_awards": record.stock_awards or "",
-                "ceo_option_awards": record.option_awards or "",
+                "ceo_bonus": _sanitize_numeric_text(record.bonus or ""),
+                "ceo_stock_awards": _sanitize_numeric_text(record.stock_awards or ""),
+                "ceo_option_awards": _sanitize_numeric_text(record.option_awards or ""),
             }
         )
     return base
@@ -1333,7 +1368,7 @@ def _compensation_row_from_det(
         "Company Name": company_name,
         "Filing URL": filing_url,
         "ticker": ticker,
-        "Name": str(row.get("exec_name", "") or "").strip(),
+        "Name": _normalize_exec_name_value(row.get("exec_name", "")),
         "Title": str(row.get("exec_title", "") or "").strip(),
         "Year": resolved_year,
         "Salary ($)": _as_digit_string(row.get("salary")),
@@ -1367,17 +1402,19 @@ def _compensation_row_from_llm(
         "Company Name": company_name,
         "Filing URL": filing_url,
         "ticker": ticker,
-        "Name": record.name.strip(),
+        "Name": _normalize_exec_name_value(record.name),
         "Title": record.title.strip(),
         "Year": resolved_year,
-        "Salary ($)": record.salary or "",
-        "Bonus Awards ($)": record.bonus or "",
-        "Stock Awards ($)": record.stock_awards or "",
-        "Option Awards ($)": record.option_awards or "",
-        "Non-Equity Incentive Plan Compensation ($)": record.non_equity_incentive or "",
-        "Change in pension value and nonqualified deferred compensation earnings ($)": record.pension_change or "",
-        "All Other Compensation ($)": record.other_comp or "",
-        "Total ($)": record.total or "",
+        "Salary ($)": _sanitize_numeric_text(record.salary or ""),
+        "Bonus Awards ($)": _sanitize_numeric_text(record.bonus or ""),
+        "Stock Awards ($)": _sanitize_numeric_text(record.stock_awards or ""),
+        "Option Awards ($)": _sanitize_numeric_text(record.option_awards or ""),
+        "Non-Equity Incentive Plan Compensation ($)": _sanitize_numeric_text(record.non_equity_incentive or ""),
+        "Change in pension value and nonqualified deferred compensation earnings ($)": _sanitize_numeric_text(
+            record.pension_change or ""
+        ),
+        "All Other Compensation ($)": _sanitize_numeric_text(record.other_comp or ""),
+        "Total ($)": _sanitize_numeric_text(record.total or ""),
         "Extra information": (record.footnotes or "").strip(),
         "__cik": cik,
         "__year": resolved_year,
@@ -1387,17 +1424,17 @@ def _compensation_row_from_llm(
 def _llm_record_to_det_row(record: ExecCompRecord, fallback_year: str) -> dict[str, Any]:
     """Convert an LLM compensation record to deterministic row-like shape."""
     return {
-        "exec_name": record.name.strip(),
+        "exec_name": _normalize_exec_name_value(record.name),
         "exec_title": record.title.strip(),
         "year": _normalize_compensation_year(record.fiscal_year, fallback_year),
-        "salary": record.salary or "",
-        "bonus": record.bonus or "",
-        "stock_awards": record.stock_awards or "",
-        "option_awards": record.option_awards or "",
-        "non_equity_incentive": record.non_equity_incentive or "",
-        "pension_change": record.pension_change or "",
-        "other_comp": record.other_comp or "",
-        "total": record.total or "",
+        "salary": _sanitize_numeric_text(record.salary or ""),
+        "bonus": _sanitize_numeric_text(record.bonus or ""),
+        "stock_awards": _sanitize_numeric_text(record.stock_awards or ""),
+        "option_awards": _sanitize_numeric_text(record.option_awards or ""),
+        "non_equity_incentive": _sanitize_numeric_text(record.non_equity_incentive or ""),
+        "pension_change": _sanitize_numeric_text(record.pension_change or ""),
+        "other_comp": _sanitize_numeric_text(record.other_comp or ""),
+        "total": _sanitize_numeric_text(record.total or ""),
         "footnote_refs": (record.footnotes or "").strip(),
     }
 
@@ -2015,6 +2052,7 @@ def main() -> None:
     key_results_path = out_dir / "key_results.csv"
     batch_log_path = out_dir / "batch_log.csv"
     batch_log_failed_path = out_dir / "batch_log_failed.csv"
+    low_confidence_log_path = out_dir / "low_confidence_log.csv"
     grants_master_path = out_dir / "grants_plan_based_master.csv"
     compensation_master_path = out_dir / "compensation_table_master.csv"
     grants_by_cik_year_dir = out_dir / "grants_plan_based_by_cik_year"
@@ -2037,11 +2075,17 @@ def main() -> None:
     with (
         key_results_path.open("w", newline="", encoding="utf-8") as key_results_file,
         batch_log_path.open("w", newline="", encoding="utf-8") as batch_log_file,
+        low_confidence_log_path.open("w", newline="", encoding="utf-8") as low_confidence_file,
         grants_master_path.open("w", newline="", encoding="utf-8") as grants_master_file,
         compensation_master_path.open("w", newline="", encoding="utf-8") as compensation_master_file,
     ):
         kr_writer = csv.DictWriter(key_results_file, fieldnames=KEY_RESULTS_COLUMNS)
         log_writer = csv.DictWriter(batch_log_file, fieldnames=BATCH_LOG_COLUMNS)
+        low_conf_writer = csv.DictWriter(
+            low_confidence_file,
+            fieldnames=LOW_CONFIDENCE_COLUMNS,
+            extrasaction="ignore",
+        )
         grants_writer = csv.DictWriter(
             grants_master_file,
             fieldnames=GRANTS_OUTPUT_COLUMNS,
@@ -2054,6 +2098,7 @@ def main() -> None:
         )
         kr_writer.writeheader()
         log_writer.writeheader()
+        low_conf_writer.writeheader()
         grants_writer.writeheader()
         compensation_writer.writeheader()
 
@@ -2180,6 +2225,26 @@ def main() -> None:
                 grants_rows_to_write = grants_rows
                 compensation_rows_to_write = compensation_rows
 
+            llm_confidence = _to_confidence(result_row.get("llm_confidence"))
+            if str(result_row.get("extraction_method", "")).lower() == "llm" and llm_confidence < CONFIDENCE_THRESHOLD:
+                low_conf_writer.writerow(
+                    {
+                        **result_row,
+                        "confidence_threshold": CONFIDENCE_THRESHOLD,
+                        "low_confidence_reason": "llm_confidence_below_threshold",
+                    }
+                )
+                low_confidence_file.flush()
+                base_log_row["status"] = "low_confidence"
+                base_log_row["error"] = "llm_confidence_below_threshold"
+                log_writer.writerow(base_log_row)
+                all_log_rows.append(dict(base_log_row))
+                for supplemental_log_row in supplemental_log_rows:
+                    log_writer.writerow(supplemental_log_row)
+                    all_log_rows.append(dict(supplemental_log_row))
+                batch_log_file.flush()
+                continue
+
             kr_writer.writerow(result_row)
             log_writer.writerow(base_log_row)
             all_log_rows.append(dict(base_log_row))
@@ -2263,6 +2328,7 @@ def main() -> None:
     log.info("key_results -> %s", key_results_path)
     log.info("batch_log   -> %s", batch_log_path)
     log.info("batch_log_failed -> %s (rows=%d)", batch_log_failed_path, len(failed_log_rows))
+    log.info("low_confidence_log -> %s", low_confidence_log_path)
     log.info("grants master -> %s", grants_master_path)
     log.info("grants by cik/year -> %s", grants_by_cik_year_dir)
     log.info("compensation master -> %s", compensation_master_path)
