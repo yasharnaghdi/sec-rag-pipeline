@@ -28,6 +28,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -56,7 +57,7 @@ log = logging.getLogger(__name__)
 
 # ── constants ───────────────────────────────────────────────────
 DEFAULT_MODEL = "gpt-5-mini"
-MAX_RAW_HTML_BYTES = 50_000  # fall back to linearized_text above this
+MAX_RAW_HTML_BYTES = 120_000  # fall back to linearized_text above this (post-minification)
 
 BATCH_LOG_COLUMNS = [
     "cik",
@@ -323,40 +324,77 @@ _SYSTEM_PROMPT = """\
 You are a financial data extraction assistant specialised in SEC DEF 14A
 proxy statement compensation tables.
 
-You will receive an Outstanding Equity Awards at Fiscal Year-End table,
-either as HTML markup or as linearized pipe-delimited text. Extract each
-data row and return ONLY valid JSON matching the schema enforced by the
-response_format.
+You will receive an Outstanding Equity Awards at Fiscal Year-End table
+as HTML markup. Extract each data row and return ONLY valid JSON matching
+the schema enforced by the response_format.
 
 EXTRACTION RULES:
-1. If the input is HTML, use the <tr> and <td>/<th> structure to identify
-   columns. Pay attention to colspan and rowspan attributes for merged cells
-   and multi-level headers. If the input is pipe-delimited text, use the
-   pipe separators and column positions to identify fields.
-2. Preserve row granularity: one output row per source data row.
-3. NAME PROPAGATION: In these tables, an executive's name appears once and
-   spans multiple rows (via rowspan or simply appearing in the first row
-   for that executive). If a data row has no name, assign the most recently
-   seen executive name above it.
-4. Field mapping is strict:
-   - name <- Name column
-   - grant_date <- Grant Date
-   - options_exercisable <- Number of Securities Underlying Unexercised Options Exercisable (#)
-   - options_unexercisable <- Number of Securities Underlying Unexercised Options Unexercisable (#)
-   - equity_incentive_unearned_options <- Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)
-   - option_exercise_price <- Option Exercise Price ($)
-   - option_expiration_date <- Option Expiration Date
-   - stock_unvested_shares <- Number of Shares or Units of Stock that Have Not Vested (#)
-   - stock_unvested_value <- Market Value of Shares or Units of Stock that Have Not Vested ($)
-   - equity_incentive_unearned_shares <- Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)
-   - equity_incentive_unearned_value <- Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)
-5. Numeric values: return as plain digit strings (e.g. "1250000", "25.10").
+
+1. COLUMN IDENTIFICATION (HTML):
+   Use the <tr> and <td>/<th> structure to identify columns. Pay close
+   attention to colspan and rowspan attributes for merged cells and
+   multi-level headers. The standard column order is:
+     Name | Grant Date | Options Exercisable | Options Unexercisable |
+     EIP Unearned Options | Exercise Price | Expiration Date |
+     Stock Unvested Shares | Stock Unvested Value |
+     EIP Unearned Shares | EIP Unearned Value
+   Some tables omit certain columns — map based on header text, not position.
+
+2. ONE OUTPUT ROW PER SOURCE DATA ROW:
+   Each <tr> that contains numeric data (option counts, share counts,
+   dollar values, or a grant date) MUST produce its own output row.
+   An executive with 4 grant rows must yield 4 output rows. NEVER
+   collapse multiple grants for the same person into a single row.
+
+3. NAME PROPAGATION:
+   An executive's name typically appears once and spans multiple rows
+   (via rowspan or appearing only in the first row for that executive).
+   For subsequent data rows with no name, carry forward the most recently
+   seen executive name. If a row contains only a job title (e.g.
+   "Chief Executive Officer", "Executive Chairman"), it is NOT a name —
+   skip it or merge with the name from the prior row.
+
+4. NAME CLEANING:
+   Return ONLY the person's name. Strip any job title, position, or
+   honorific suffix that appears on a separate line or after a line
+   break in the same cell. Examples:
+     "Stephen A. Remondi Chief Executive Officer and President" → "Stephen A. Remondi"
+     "Dale Hooks Chief Commercial Officer" → "Dale Hooks"
+   If the name is split across two <tr> rows (e.g. "Shoshana" in one
+   row, "Shendelman, Ph.D." in the next), concatenate them.
+
+5. FIELD MAPPING (strict):
+   - name ← Name column
+   - grant_date ← Grant Date
+   - options_exercisable ← Number of Securities Underlying Unexercised Options Exercisable (#)
+   - options_unexercisable ← Number of Securities Underlying Unexercised Options Unexercisable (#)
+   - equity_incentive_unearned_options ← Equity Incentive Plan Awards: Number of Securities Underlying Unexercised Unearned Options (#)
+   - option_exercise_price ← Option Exercise Price ($)
+   - option_expiration_date ← Option Expiration Date
+   - stock_unvested_shares ← Number of Shares or Units of Stock that Have Not Vested (#)
+   - stock_unvested_value ← Market Value of Shares or Units of Stock that Have Not Vested ($)
+   - equity_incentive_unearned_shares ← Equity Incentive Plan Awards: Number of Unearned Shares, Units, or Other Rights that Have Not Vested (#)
+   - equity_incentive_unearned_value ← Equity Incentive Plan Awards: Market or Payout Value of Unearned Shares, Units, or Other Rights that Have Not Vested ($)
+
+6. NUMERIC VALUES: return as plain digit strings (e.g. "1250000", "25.10").
    Remove currency symbols ($), commas, and whitespace. Use null for
-   missing/dash/em-dash values.
-6. Dates: keep as source text (e.g. "01/03/2022" or "2022-03-01").
-7. Do NOT invent values. Return null where data is absent.
-8. Skip header rows, separator rows, and footnote rows.
-9. Ignore footnote superscripts (e.g. "(1)", "(5)") within cell values.
+   missing / dash / em-dash / "—" values.
+
+7. DATES: keep as source text (e.g. "01/03/2022" or "2022-03-01").
+
+8. Do NOT invent values. Return null where data is absent.
+
+9. SKIP rows that are entirely empty (all values are null/dash).
+   Also skip header rows, separator rows, and footnote rows.
+
+10. Ignore footnote superscripts (e.g. "(1)", "(5)") within cell values.
+    Cells that contain ONLY a footnote marker and no numeric data should
+    be treated as null.
+
+11. COLUMN DISAMBIGUATION: A data value belongs to one and only one column.
+    Do NOT copy the same value into multiple output fields. If a source
+    row has values in only the option columns (exercisable, unexercisable,
+    price, expiration), leave the stock award fields as null, and vice versa.
 """
 
 # ── structured output JSON schema ──────────────────────────────
@@ -415,23 +453,180 @@ _RESPONSE_SCHEMA = {
 
 
 def _extract_raw_html_table(raw_html: str, table_block: TableBlock) -> str:
-    """Extract the raw HTML table from filing source using block char offsets.
+    """Extract the raw HTML table from filing source.
 
-    Falls back to linearized_text when:
-    - char offsets are degenerate (start == end, common when the parser
-      can't locate the serialized tag in raw HTML)
-    - the extracted snippet exceeds MAX_RAW_HTML_BYTES
+    Strategy:
+    1. Try char offsets from the parser (fast path).
+    2. If offsets are degenerate (start == end — common bug in SECHTMLParser),
+       fall back to a BeautifulSoup search that matches the table by content
+       fingerprint (first data cells).
+    3. If the HTML snippet exceeds MAX_RAW_HTML_BYTES, fall back to
+       linearized_text.
     """
+    # ── 1. Try char offsets ───────────────────────────────────────
     start = table_block.source_char_start
     end = table_block.source_char_end
     if start >= 0 and end > start and end <= len(raw_html):
-        snippet = raw_html[start:end]
-        if len(snippet.encode("utf-8", errors="replace")) <= MAX_RAW_HTML_BYTES:
+        snippet = _minify_html_table(raw_html[start:end])
+        byte_len = len(snippet.encode("utf-8", errors="replace"))
+        if byte_len <= MAX_RAW_HTML_BYTES:
+            log.debug("Using char-offset HTML (start=%d end=%d, minified=%d bytes)", start, end, byte_len)
             return snippet
-        log.info("Raw HTML table too large (%d bytes), using linearized_text", len(snippet.encode("utf-8", errors="replace")))
+        log.info(
+            "Raw HTML table too large after minification (%d bytes), trying BeautifulSoup fallback",
+            byte_len,
+        )
     else:
-        log.debug("Invalid char offsets (start=%d end=%d html_len=%d), using linearized_text", start, end, len(raw_html))
+        log.debug(
+            "Invalid char offsets (start=%d end=%d html_len=%d), trying BeautifulSoup fallback",
+            start, end, len(raw_html),
+        )
+
+    # ── 2. BeautifulSoup fallback ─────────────────────────────────
+    html_snippet = _find_table_html_via_bs4(raw_html, table_block)
+    if html_snippet is not None:
+        return html_snippet
+
+    # ── 3. Last resort: linearized text ───────────────────────────
+    log.debug("BeautifulSoup fallback failed, using linearized_text")
     return table_block.linearized_text
+
+
+# Keywords that must appear in the equity awards table (at least 3 of these).
+_BS4_EQUITY_REQUIRED_KEYWORDS = [
+    "grant date",
+    "exercisable",
+    "unexercisable",
+    "exercise price",
+    "expiration date",
+    "unexercised",
+    "have not vested",
+    "option awards",
+    "stock awards",
+    "equity incentive plan",
+]
+
+
+def _minify_html_table(html: str) -> str:
+    """Strip noise from SEC EDGAR HTML to reduce token count.
+
+    Removes: style, class, bgcolor, width, height, align, valign, nowrap,
+    cellspacing, cellpadding, border, id attributes. Unwraps <font> and
+    <span> tags (keeps their text content). Collapses whitespace.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strip attributes from all tags
+    strip_attrs = {
+        "style", "class", "bgcolor", "width", "height", "align",
+        "valign", "nowrap", "cellspacing", "cellpadding", "border",
+        "id", "size",
+    }
+    for tag in soup.find_all(True):
+        for attr in list(tag.attrs.keys()):
+            if attr in strip_attrs:
+                del tag[attr]
+
+    # Unwrap <font> and <span> tags (preserve their children)
+    for tag_name in ("font", "span", "b", "i", "em", "strong", "sup", "u"):
+        for tag in soup.find_all(tag_name):
+            tag.unwrap()
+
+    # Remove <br> tags
+    for br in soup.find_all("br"):
+        br.replace_with(" ")
+
+    # Remove HTML comments
+    from bs4 import Comment
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    result = str(soup)
+    # Collapse multiple whitespace
+    result = re.sub(r"\s+", " ", result)
+    # Collapse empty td/th tags
+    result = re.sub(r"<td>\s*</td>", "<td></td>", result)
+    result = re.sub(r"<th>\s*</th>", "<th></th>", result)
+    return result.strip()
+
+
+def _find_table_html_via_bs4(raw_html: str, table_block: TableBlock) -> str | None:
+    """Find the matching <table> in raw HTML by fingerprinting data cells.
+
+    Strategy:
+    1. Build fingerprints from the parsed TableBlock's data cells.
+    2. Iterate over all <table> elements — each candidate must contain
+       equity award keywords (exercisable, grant date, etc.) to avoid
+       matching Summary Compensation or Director Compensation tables.
+    3. Score by fingerprint hits and pick the best match.
+    4. Minify the HTML to reduce token count.
+    """
+    # Build fingerprints from the parsed rows — use non-empty data cells
+    # that look like names or numbers (skip short footnote markers).
+    fingerprints: list[str] = []
+    for row in table_block.rows:
+        for cell in row:
+            cell_stripped = cell.strip()
+            if not cell_stripped or len(cell_stripped) < 3:
+                continue
+            # Skip pure footnote markers like "(1)", "(2)"
+            if re.fullmatch(r"\(\d+\)", cell_stripped):
+                continue
+            fingerprints.append(cell_stripped)
+            if len(fingerprints) >= 20:
+                break
+        if len(fingerprints) >= 20:
+            break
+
+    if len(fingerprints) < 3:
+        return None
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    best_table = None
+    best_score = 0
+
+    for table_tag in soup.find_all("table"):
+        table_text = table_tag.get_text(" ", strip=True)
+        table_text_lower = table_text.lower()
+
+        # Gate: table must contain at least 3 equity-specific keywords
+        keyword_hits = sum(
+            1 for kw in _BS4_EQUITY_REQUIRED_KEYWORDS
+            if kw in table_text_lower
+        )
+        if keyword_hits < 3:
+            continue
+
+        # Score by fingerprint match
+        fp_score = sum(1 for fp in fingerprints if fp in table_text)
+        # Bonus for more keyword hits
+        combined_score = fp_score + keyword_hits
+        if combined_score > best_score:
+            best_score = combined_score
+            best_table = table_tag
+
+    if best_table is None or best_score < len(fingerprints) * 0.3:
+        log.debug("BS4 fallback: no equity-keyword-qualified table matched (best_score=%d)", best_score)
+        return None
+
+    # Minify to reduce token count
+    html_str = _minify_html_table(str(best_table))
+    byte_len = len(html_str.encode("utf-8", errors="replace"))
+
+    if byte_len > MAX_RAW_HTML_BYTES:
+        log.info(
+            "BeautifulSoup-found table still too large after minification (%d bytes > %d), using linearized_text",
+            byte_len, MAX_RAW_HTML_BYTES,
+        )
+        return None
+
+    log.info(
+        "Using BeautifulSoup-extracted HTML table (%d bytes, keywords=%d, fp_score=%d/%d)",
+        byte_len, sum(1 for kw in _BS4_EQUITY_REQUIRED_KEYWORDS if kw in best_table.get_text(" ", strip=True).lower()),
+        best_score - sum(1 for kw in _BS4_EQUITY_REQUIRED_KEYWORDS if kw in best_table.get_text(" ", strip=True).lower()),
+        len(fingerprints),
+    )
+    return html_str
 
 
 def _build_user_message(
@@ -476,7 +671,7 @@ def _call_llm(
             {"role": "user", "content": user_message},
         ],
         response_format=_RESPONSE_SCHEMA,
-        max_completion_tokens=8192,
+        max_completion_tokens=16384,
     )
 
     usage = response.usage
@@ -503,6 +698,23 @@ def _call_llm(
     if data.get("notes") is None:
         data["notes"] = ""
     return CompanyOutstandingEquityAwardsResult.model_validate(data), token_usage
+
+
+def _is_all_null_record(record: OutstandingEquityAwardRecord) -> bool:
+    """Return True if every data field (excluding name) is null/empty."""
+    data_fields = [
+        record.grant_date,
+        record.options_exercisable,
+        record.options_unexercisable,
+        record.equity_incentive_unearned_options,
+        record.option_exercise_price,
+        record.option_expiration_date,
+        record.stock_unvested_shares,
+        record.stock_unvested_value,
+        record.equity_incentive_unearned_shares,
+        record.equity_incentive_unearned_value,
+    ]
+    return all(not v for v in data_fields)
 
 
 def _row_to_csv(
@@ -593,6 +805,7 @@ def process_cik(
         rows = [
             _row_to_csv(record, cik, company_name, filing_url)
             for record in result.rows
+            if not _is_all_null_record(record)
         ]
 
         log_row["status"] = "ok"
