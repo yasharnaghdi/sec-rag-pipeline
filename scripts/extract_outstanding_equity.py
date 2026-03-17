@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from ingestion.edgar_folder_fetcher import fetch_latest_def14a  # noqa: E402
+from ingestion.edgar_folder_fetcher import fetch_def14a_for_fiscal_year, fetch_latest_def14a  # noqa: E402
 from ingestion.llm_comp_extractor import (  # noqa: E402
     CompanyOutstandingEquityAwardsResult,
     OutstandingEquityAwardRecord,
@@ -56,6 +57,21 @@ log = logging.getLogger(__name__)
 # ── constants ───────────────────────────────────────────────────
 DEFAULT_MODEL = "gpt-5-mini"
 MAX_RAW_HTML_BYTES = 50_000  # fall back to linearized_text above this
+
+BATCH_LOG_COLUMNS = [
+    "cik",
+    "company_name",
+    "target_fiscal_year",
+    "source_filing_date",
+    "source_accession_number",
+    "source_filing_url",
+    "status",
+    "rows_extracted",
+    "llm_confidence",
+    "llm_notes",
+    "elapsed_seconds",
+    "error",
+]
 
 OUTPUT_COLUMNS = [
     "CIK",
@@ -491,47 +507,97 @@ def process_cik(
     cik: str,
     client: OpenAI,
     model: str,
-) -> list[dict[str, str]]:
-    """Process one CIK end-to-end and return CSV rows."""
-    filing = fetch_latest_def14a(cik)
-    company_name = str(getattr(filing, "company_name", "") or "")
-    filing_url = str(getattr(filing, "filing_url", "") or "")
-    filing_date_str = str(getattr(filing, "filing_date", "") or "")
+    filing_override: Any = None,
+    target_fiscal_year: int | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Process one CIK end-to-end and return (csv_rows, log_row).
 
-    doc_meta = DocumentMetadata(
-        document_id=f"{cik}_{filing.accession_number.replace('-', '')}",
-        cik=cik,
-        company_name=company_name,
-        form_type="DEF 14A",
-        filing_date=filing.filing_date or date.today(),
-        accession_number=filing.accession_number,
-        source_url=filing.filing_url,
-    )
-    blocks = SECHTMLParser().parse(filing.raw_html, doc_meta)
+    If filing_override is provided, use it instead of fetching the latest filing.
+    """
+    t0 = time.monotonic()
+    log_row: dict[str, Any] = {col: "" for col in BATCH_LOG_COLUMNS}
+    log_row["cik"] = cik
+    log_row["target_fiscal_year"] = str(target_fiscal_year) if target_fiscal_year else ""
 
-    table_block, _ = _locate_outstanding_equity_awards_table(blocks)
-    if table_block is None:
-        log.warning("No Outstanding Equity Awards table found | cik=%s", cik)
-        return []
+    try:
+        filing = filing_override if filing_override is not None else fetch_latest_def14a(cik)
+        company_name = str(getattr(filing, "company_name", "") or "")
+        filing_url = str(getattr(filing, "filing_url", "") or "")
+        filing_date_str = str(getattr(filing, "filing_date", "") or "")
 
-    table_content = _extract_raw_html_table(filing.raw_html, table_block)
+        log_row["company_name"] = company_name
+        log_row["source_filing_date"] = filing_date_str
+        log_row["source_accession_number"] = filing.accession_number
+        log_row["source_filing_url"] = filing_url
 
-    result = _call_llm(
-        client=client,
-        model=model,
-        company_name=company_name,
-        cik=cik,
-        filing_date=filing_date_str,
-        table_content=table_content,
-    )
+        doc_meta = DocumentMetadata(
+            document_id=f"{cik}_{filing.accession_number.replace('-', '')}",
+            cik=cik,
+            company_name=company_name,
+            form_type="DEF 14A",
+            filing_date=filing.filing_date or date.today(),
+            accession_number=filing.accession_number,
+            source_url=filing.filing_url,
+        )
+        blocks = SECHTMLParser().parse(filing.raw_html, doc_meta)
 
-    return [
-        _row_to_csv(record, cik, company_name, filing_url)
-        for record in result.rows
-    ]
+        table_block, _ = _locate_outstanding_equity_awards_table(blocks)
+        if table_block is None:
+            log.warning("No Outstanding Equity Awards table found | cik=%s", cik)
+            log_row["status"] = "no_table"
+            log_row["rows_extracted"] = 0
+            log_row["elapsed_seconds"] = f"{time.monotonic() - t0:.1f}"
+            return [], log_row
+
+        table_content = _extract_raw_html_table(filing.raw_html, table_block)
+
+        result = _call_llm(
+            client=client,
+            model=model,
+            company_name=company_name,
+            cik=cik,
+            filing_date=filing_date_str,
+            table_content=table_content,
+        )
+
+        rows = [
+            _row_to_csv(record, cik, company_name, filing_url)
+            for record in result.rows
+        ]
+
+        log_row["status"] = "ok"
+        log_row["rows_extracted"] = len(rows)
+        log_row["llm_confidence"] = result.confidence
+        log_row["llm_notes"] = result.notes or ""
+        log_row["elapsed_seconds"] = f"{time.monotonic() - t0:.1f}"
+        return rows, log_row
+
+    except Exception as exc:
+        log_row["status"] = "failed"
+        log_row["rows_extracted"] = 0
+        log_row["error"] = str(exc)
+        log_row["elapsed_seconds"] = f"{time.monotonic() - t0:.1f}"
+        raise
 
 
 # ── CLI entry point ────────────────────────────────────────────
+
+
+def _make_error_log_row(
+    cik: str,
+    target_fiscal_year: int | None,
+    exc: Exception,
+    *,
+    status: str = "failed",
+) -> dict[str, Any]:
+    """Build a batch log row for an error case (when process_cik raised)."""
+    row: dict[str, Any] = {col: "" for col in BATCH_LOG_COLUMNS}
+    row["cik"] = cik
+    row["target_fiscal_year"] = str(target_fiscal_year) if target_fiscal_year else ""
+    row["status"] = status
+    row["rows_extracted"] = 0
+    row["error"] = str(exc)
+    return row
 
 
 def main() -> None:
@@ -560,12 +626,36 @@ def main() -> None:
         help="Max CIKs to process",
     )
     parser.add_argument(
+        "--fiscal-year-start",
+        type=int,
+        default=None,
+        help="Inclusive start fiscal year (must pair with --fiscal-year-end)",
+    )
+    parser.add_argument(
+        "--fiscal-year-end",
+        type=int,
+        default=None,
+        help="Inclusive end fiscal year (must pair with --fiscal-year-start)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Enable debug logging",
     )
     args = parser.parse_args()
+
+    has_start = args.fiscal_year_start is not None
+    has_end = args.fiscal_year_end is not None
+    if has_start != has_end:
+        parser.error("Both --fiscal-year-start and --fiscal-year-end are required together.")
+    if has_start and has_end:
+        if args.fiscal_year_start < 1000 or args.fiscal_year_start > 9999:
+            parser.error("--fiscal-year-start must be a 4-digit year.")
+        if args.fiscal_year_end < 1000 or args.fiscal_year_end > 9999:
+            parser.error("--fiscal-year-end must be a 4-digit year.")
+        if args.fiscal_year_start > args.fiscal_year_end:
+            parser.error("--fiscal-year-start cannot be greater than --fiscal-year-end.")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -595,51 +685,125 @@ def main() -> None:
     if args.limit:
         ciks = ciks[: args.limit]
 
-    log.info("Starting extraction | ciks=%d model=%s output=%s", len(ciks), args.model, args.output)
+    fiscal_years: list[int] | None = None
+    if args.fiscal_year_start is not None and args.fiscal_year_end is not None:
+        fiscal_years = list(range(args.fiscal_year_start, args.fiscal_year_end + 1))
+
+    year_label = f"{fiscal_years[0]}-{fiscal_years[-1]}" if fiscal_years else "latest"
+    log.info(
+        "Starting extraction | ciks=%d model=%s fiscal_years=%s output=%s",
+        len(ciks), args.model, year_label, args.output,
+    )
 
     # Initialize OpenAI client
     client = OpenAI()
 
-    # Prepare output
+    # Prepare output paths
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    batch_log_path = output_path.parent / f"{output_path.stem}_batch_log.csv"
+    batch_log_failed_path = output_path.parent / f"{output_path.stem}_batch_log_failed.csv"
 
     total_rows = 0
     tables_found = 0
     tables_missing = 0
     errors = 0
+    all_log_rows: list[dict[str, Any]] = []
 
-    with output_path.open("w", newline="", encoding="utf-8") as out_file:
+    def _handle_result(
+        rows: list[dict[str, str]],
+        log_entry: dict[str, Any],
+        writer: csv.DictWriter,
+        log_writer: csv.DictWriter,
+        label: str,
+    ) -> None:
+        nonlocal total_rows, tables_found, tables_missing
+        all_log_rows.append(log_entry)
+        log_writer.writerow(log_entry)
+        if rows:
+            tables_found += 1
+            for row in rows:
+                writer.writerow(row)
+            total_rows += len(rows)
+            log.info("%s ... %d rows extracted (confidence=%.2f)", label, len(rows), log_entry.get("llm_confidence", 0))
+        else:
+            tables_missing += 1
+            log.info("%s ... no table found", label)
+
+    def _handle_error(
+        exc: Exception,
+        log_entry: dict[str, Any],
+        log_writer: csv.DictWriter,
+        label: str,
+        *,
+        is_missing: bool = False,
+    ) -> None:
+        nonlocal errors, tables_missing
+        all_log_rows.append(log_entry)
+        log_writer.writerow(log_entry)
+        if is_missing:
+            tables_missing += 1
+            log.warning("%s ... %s", label, exc)
+        else:
+            errors += 1
+            log.error("%s ... error: %s", label, exc)
+
+    with (
+        output_path.open("w", newline="", encoding="utf-8") as out_file,
+        batch_log_path.open("w", newline="", encoding="utf-8") as blog_file,
+    ):
         writer = csv.DictWriter(out_file, fieldnames=OUTPUT_COLUMNS)
+        log_writer = csv.DictWriter(blog_file, fieldnames=BATCH_LOG_COLUMNS)
         writer.writeheader()
+        log_writer.writeheader()
 
         for i, cik in enumerate(ciks, 1):
-            try:
-                rows = process_cik(cik, client, args.model)
-                if rows:
-                    tables_found += 1
-                    for row in rows:
-                        writer.writerow(row)
-                    total_rows += len(rows)
-                    log.info("[%d/%d] CIK=%s ... %d rows extracted", i, len(ciks), cik, len(rows))
-                else:
-                    tables_missing += 1
-                    log.info("[%d/%d] CIK=%s ... no table found", i, len(ciks), cik)
-            except Exception as exc:  # noqa: BLE001
-                errors += 1
-                log.error("[%d/%d] CIK=%s ... error: %s", i, len(ciks), cik, exc)
+            if fiscal_years is None:
+                # Single latest filing per CIK
+                label = f"[{i}/{len(ciks)}] CIK={cik}"
+                try:
+                    rows, log_entry = process_cik(cik, client, args.model)
+                    _handle_result(rows, log_entry, writer, log_writer, label)
+                except Exception as exc:  # noqa: BLE001
+                    log_entry = _make_error_log_row(cik, None, exc)
+                    _handle_error(exc, log_entry, log_writer, label)
+            else:
+                # Sweep across fiscal years
+                for year in fiscal_years:
+                    label = f"[{i}/{len(ciks)}] CIK={cik} year={year}"
+                    try:
+                        filing = fetch_def14a_for_fiscal_year(cik, year)
+                        rows, log_entry = process_cik(
+                            cik, client, args.model,
+                            filing_override=filing,
+                            target_fiscal_year=year,
+                        )
+                        _handle_result(rows, log_entry, writer, log_writer, label)
+                    except ValueError as ve:
+                        log_entry = _make_error_log_row(cik, year, ve, status="no_filing")
+                        _handle_error(ve, log_entry, log_writer, label, is_missing=True)
+                    except Exception as exc:  # noqa: BLE001
+                        log_entry = _make_error_log_row(cik, year, exc)
+                        _handle_error(exc, log_entry, log_writer, label)
 
         out_file.flush()
+        blog_file.flush()
+
+    # Write failed-only log
+    failed_rows = [r for r in all_log_rows if r.get("status") not in ("ok",)]
+    with batch_log_failed_path.open("w", newline="", encoding="utf-8") as failed_file:
+        failed_writer = csv.DictWriter(failed_file, fieldnames=BATCH_LOG_COLUMNS)
+        failed_writer.writeheader()
+        for row in failed_rows:
+            failed_writer.writerow(row)
 
     log.info(
-        "Done | processed=%d tables_found=%d no_table=%d errors=%d total_rows=%d output=%s",
-        len(ciks),
-        tables_found,
-        tables_missing,
-        errors,
-        total_rows,
-        output_path,
+        "Done | processed=%d tables_found=%d no_table=%d errors=%d total_rows=%d",
+        len(ciks), tables_found, tables_missing, errors, total_rows,
     )
+    log.info("output         -> %s", output_path)
+    log.info("batch_log      -> %s", batch_log_path)
+    log.info("batch_log_failed -> %s (rows=%d)", batch_log_failed_path, len(failed_rows))
 
 
 if __name__ == "__main__":

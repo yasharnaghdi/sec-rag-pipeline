@@ -23,16 +23,25 @@ The script is intentionally independent so extraction quality can be iterated wi
 - `--output`: output CSV path (default: `output/outstanding_equity_awards.csv`)
 - `--model`: OpenAI model (default: `gpt-5-mini`)
 - `--limit`: max CIKs to process (optional, for testing)
+- `--fiscal-year-start` + `--fiscal-year-end`: sweep a range of fiscal years per CIK (must be provided together)
 - `-v` / `--verbose`: enable debug logging
 
-Example:
+Examples:
 ```bash
+# Latest filing per CIK
 poetry run python scripts/extract_outstanding_equity.py \
     --input fixtures/client_input.csv \
     --output output/outstanding_equity_awards.csv \
     --model gpt-5-mini \
     --limit 5 \
     --verbose
+
+# Multi-year sweep (2020–2024)
+poetry run python scripts/extract_outstanding_equity.py \
+    --input fixtures/client_input.csv \
+    --output output/outstanding_equity_awards_2020_2024.csv \
+    --fiscal-year-start 2020 \
+    --fiscal-year-end 2024
 ```
 
 ## 3. Per-CIK Processing Flow
@@ -41,10 +50,15 @@ For each CIK, `process_cik()` executes these stages:
 
 ### 3.1 Acquire Filing
 
-Calls `fetch_latest_def14a(cik)` from `ingestion/edgar_folder_fetcher.py`.
-- Returns a `FetchedFiling` with: `raw_html`, `company_name`, `ticker`, `filing_date`, `accession_number`, `filing_url`, `cache_path`
+**Default (latest)**: Calls `fetch_latest_def14a(cik)` from `ingestion/edgar_folder_fetcher.py`.
+
+**Fiscal year sweep**: When `--fiscal-year-start` / `--fiscal-year-end` are provided, calls `fetch_def14a_for_fiscal_year(cik, year)` for each year in the range. This fetches the most recent DEF 14A whose filing date maps to the target fiscal year.
+
+Both functions return a `FetchedFiling` with: `raw_html`, `company_name`, `ticker`, `filing_date`, `accession_number`, `filing_url`, `cache_path`.
 - Uses the `data/raw/` cache: if `data/raw/{CIK_padded}_{accession}.html` exists, reads from disk; otherwise downloads from SEC EDGAR and caches it
 - Metadata (company name, ticker, filing date) comes from the SEC EDGAR submissions API, same as the batch50 pipeline
+
+If no filing is found for a specific CIK+year combination (e.g., the company didn't file a DEF 14A that year), it logs a warning and continues to the next year/CIK.
 
 ### 3.2 Parse HTML
 
@@ -86,7 +100,46 @@ Response is parsed with `json.loads()` then validated through `CompanyOutstandin
 
 `_row_to_csv()` maps each `OutstandingEquityAwardRecord` to the output column schema, prepending `CIK`, `Company Name`, and `Filing URL`.
 
-## 4. Output Schema
+## 4. Batch Report Log
+
+Every run produces two companion log files alongside the output CSV (following the same pattern as `run_batch50_key_results.py`):
+
+| File | Description |
+|------|-------------|
+| `{output_stem}_batch_log.csv` | One row per CIK (or CIK×year) processed |
+| `{output_stem}_batch_log_failed.csv` | Subset: only rows where `status != "ok"` |
+
+For example, `--output output/equity.csv` produces:
+- `output/equity_batch_log.csv`
+- `output/equity_batch_log_failed.csv`
+
+### Batch log columns
+
+| Column | Description |
+|--------|-------------|
+| `cik` | CIK identifier |
+| `company_name` | Company name from EDGAR metadata |
+| `target_fiscal_year` | Fiscal year (blank for latest-only mode) |
+| `source_filing_date` | Filing date of the DEF 14A used |
+| `source_accession_number` | SEC accession number |
+| `source_filing_url` | URL to the filing on EDGAR |
+| `status` | `ok`, `no_table`, `no_filing`, or `failed` |
+| `rows_extracted` | Number of data rows extracted |
+| `llm_confidence` | LLM self-reported confidence (0–1) |
+| `llm_notes` | LLM notes about the extraction |
+| `elapsed_seconds` | Wall-clock time for this CIK/year |
+| `error` | Error message (blank on success) |
+
+### Status values
+
+| Status | Meaning |
+|--------|---------|
+| `ok` | Table found and extracted successfully |
+| `no_table` | Filing fetched but no Outstanding Equity Awards table located |
+| `no_filing` | No DEF 14A found for this CIK+year combination (fiscal year sweep only) |
+| `failed` | Unhandled exception (LLM error, network failure, etc.) |
+
+## 5. Output Schema
 
 CSV columns (14 total):
 
@@ -109,7 +162,7 @@ CSV columns (14 total):
 
 Numeric values are plain digit strings (no `$`, no commas). Dates are kept as source text. Missing values are empty strings in the CSV.
 
-## 5. Reused Components
+## 6. Reused Components
 
 | Component | Source | How used |
 |-----------|--------|----------|
@@ -122,26 +175,26 @@ Numeric values are plain digit strings (no `$`, no commas). Dates are kept as so
 
 The table locator was copied rather than imported to avoid pulling in the entire batch50 module and its heavy dependencies. If the locator logic is updated in batch50, this copy should be synced.
 
-## 6. Error Handling
+## 7. Error Handling
 
 - **Filing acquisition failure**: exception is caught per-CIK, logged, and processing continues with the next CIK
 - **Table not found**: logged as warning, no CSV rows emitted for that CIK
 - **LLM API error**: caught per-CIK, logged as error, continues to next CIK
 - **No retry logic**: structured outputs eliminate most parse/validation failures; if the API call fails, it is not retried
 
-Final summary is logged: `processed=N tables_found=N no_table=N errors=N total_rows=N`.
+Final summary is logged: `processed=N tables_found=N no_table=N errors=N total_rows=N`, plus paths to all output files. Every CIK/year attempt is also recorded in the batch log CSV (see §4).
 
-## 7. Known Limitations and Iteration Notes
+## 8. Known Limitations and Iteration Notes
 
 1. **Raw HTML offset reliability**: The `sec_html_parser._find_tag_span()` function often produces degenerate char offsets for large filings, causing fallback to linearized text. Improving the parser's tag-span logic would unlock raw HTML input for more filings.
 
-2. **Single filing per CIK**: Currently fetches only the latest DEF 14A. To extract across multiple fiscal years, either run with different input CSVs or extend with a `--fiscal-year-start/--fiscal-year-end` sweep (like batch50).
+2. **Fiscal year sweep**: Supported via `--fiscal-year-start` / `--fiscal-year-end`. Without these flags, only the latest DEF 14A per CIK is fetched.
 
 3. **Table locator drift**: The locator is a snapshot copy from batch50. If heuristics are improved upstream, this script needs manual syncing.
 
 4. **Model compatibility**: `gpt-5-mini` does not support `temperature` or `max_tokens` (use `max_completion_tokens`). If switching to a different model, these parameters may need adjustment.
 
-## 8. Key File Paths
+## 9. Key File Paths
 
 | File | Purpose |
 |------|---------|
@@ -153,3 +206,5 @@ Final summary is logged: `processed=N tables_found=N no_table=N errors=N total_r
 | `fixtures/client_input.csv` | Default input CSV (4 CIKs with cached filings) |
 | `data/raw/` | Cached HTML filings |
 | `output/outstanding_equity_awards.csv` | Default output path |
+| `output/outstanding_equity_awards_batch_log.csv` | Batch log (one row per CIK/year) |
+| `output/outstanding_equity_awards_batch_log_failed.csv` | Failed-only batch log |
