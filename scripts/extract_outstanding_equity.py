@@ -69,6 +69,9 @@ BATCH_LOG_COLUMNS = [
     "rows_extracted",
     "llm_confidence",
     "llm_notes",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
     "elapsed_seconds",
     "error",
 ]
@@ -453,9 +456,18 @@ def _call_llm(
     cik: str,
     filing_date: str,
     table_content: str,
-) -> CompanyOutstandingEquityAwardsResult:
-    """Call OpenAI with structured outputs and return validated result."""
+) -> tuple[CompanyOutstandingEquityAwardsResult, dict[str, int]]:
+    """Call OpenAI with structured outputs and return (result, token_usage).
+
+    token_usage keys: prompt_tokens, completion_tokens, total_tokens
+    """
     user_message = _build_user_message(company_name, cik, filing_date, table_content)
+
+    prompt_chars = len(_SYSTEM_PROMPT) + len(user_message)
+    log.debug(
+        "LLM call | cik=%s prompt_chars=%d (system=%d user=%d)",
+        cik, prompt_chars, len(_SYSTEM_PROMPT), len(user_message),
+    )
 
     response = client.chat.completions.create(
         model=model,
@@ -467,12 +479,30 @@ def _call_llm(
         max_completion_tokens=8192,
     )
 
+    usage = response.usage
+    token_usage = {
+        "prompt_tokens": usage.prompt_tokens if usage else 0,
+        "completion_tokens": usage.completion_tokens if usage else 0,
+        "total_tokens": usage.total_tokens if usage else 0,
+    }
+    log.info(
+        "LLM tokens | cik=%s prompt=%d completion=%d total=%d finish_reason=%s",
+        cik,
+        token_usage["prompt_tokens"],
+        token_usage["completion_tokens"],
+        token_usage["total_tokens"],
+        response.choices[0].finish_reason,
+    )
+
     raw_text = response.choices[0].message.content or "{}"
+    completion_chars = len(raw_text)
+    log.debug("LLM response | cik=%s completion_chars=%d", cik, completion_chars)
+
     data = json.loads(raw_text)
     # The structured output schema allows null for notes, but Pydantic model expects str
     if data.get("notes") is None:
         data["notes"] = ""
-    return CompanyOutstandingEquityAwardsResult.model_validate(data)
+    return CompanyOutstandingEquityAwardsResult.model_validate(data), token_usage
 
 
 def _row_to_csv(
@@ -551,7 +581,7 @@ def process_cik(
 
         table_content = _extract_raw_html_table(filing.raw_html, table_block)
 
-        result = _call_llm(
+        result, token_usage = _call_llm(
             client=client,
             model=model,
             company_name=company_name,
@@ -569,6 +599,9 @@ def process_cik(
         log_row["rows_extracted"] = len(rows)
         log_row["llm_confidence"] = result.confidence
         log_row["llm_notes"] = result.notes or ""
+        log_row["prompt_tokens"] = token_usage["prompt_tokens"]
+        log_row["completion_tokens"] = token_usage["completion_tokens"]
+        log_row["total_tokens"] = token_usage["total_tokens"]
         log_row["elapsed_seconds"] = f"{time.monotonic() - t0:.1f}"
         return rows, log_row
 
