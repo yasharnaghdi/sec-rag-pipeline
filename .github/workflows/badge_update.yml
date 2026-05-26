@@ -1,0 +1,63 @@
+name: Badge Status Update
+
+# Updates the dynamic pipeline phase badge in README on every main push.
+# Reads the phase output from the maturity check and writes a Shields.io
+# endpoint JSON to the repo so the badge stays current without a third-party service.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  update-badge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect phase
+        id: detect
+        run: |
+          PHASE=0
+          if [ -d "ingestion" ] && find ingestion -name '*.py' | grep -q .; then PHASE=1; fi
+          if [ $PHASE -ge 1 ] && [ -d "chunking" ] && [ -d "storage" ]; then PHASE=2; fi
+          if [ $PHASE -ge 2 ] && [ -d "retrieval" ] && [ -d "generation" ]; then PHASE=3; fi
+          if [ $PHASE -ge 3 ] && [ -d "api" ] && [ -d "tests" ] && \
+             [ $(find tests -name 'test_*.py' | wc -l) -ge 4 ]; then PHASE=4; fi
+
+          # Map phase to colour
+          case $PHASE in
+            0) COLOR="lightgrey"; LABEL="Phase 0 — scaffold" ;;
+            1) COLOR="orange";    LABEL="Phase 1 — ingestion" ;;
+            2) COLOR="yellow";    LABEL="Phase 2 — chunking+storage" ;;
+            3) COLOR="blue";      LABEL="Phase 3 — retrieval+generation" ;;
+            4) COLOR="brightgreen"; LABEL="Phase 4 — production-ready" ;;
+          esac
+
+          echo "phase=$PHASE" >> $GITHUB_OUTPUT
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "label=$LABEL" >> $GITHUB_OUTPUT
+
+      - name: Write Shields endpoint JSON
+        run: |
+          mkdir -p .github/badges
+          cat > .github/badges/pipeline_phase.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "pipeline",
+            "message": "${{ steps.detect.outputs.label }}",
+            "color": "${{ steps.detect.outputs.color }}"
+          }
+          EOF
+
+      - name: Commit badge JSON if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/pipeline_phase.json
+          git diff --cached --quiet || git commit -m "ci(badge): update pipeline phase to ${{ steps.detect.outputs.label }}"
+          git push

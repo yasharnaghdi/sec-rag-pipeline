@@ -1,0 +1,138 @@
+name: Milestone Tagger
+
+# Triggers on push to main — evaluates pipeline maturity
+# and auto-tags a release when all phase gates pass.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  evaluate-maturity:
+    runs-on: ubuntu-latest
+    outputs:
+      phase: ${{ steps.detect.outputs.phase }}
+      should_tag: ${{ steps.detect.outputs.should_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install poetry==1.8.3
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Lint (ruff)
+        run: poetry run ruff check .
+
+      - name: Type check (mypy)
+        run: poetry run mypy . --ignore-missing-imports
+
+      - name: Run tests
+        run: poetry run pytest tests/ -v --tb=short
+
+      # ── Maturity Detection ──────────────────────────────────────────
+      # Each phase gate checks for the presence of key module files.
+      # Adjust paths to match your actual layout.
+      - name: Detect pipeline phase
+        id: detect
+        run: |
+          PHASE=0
+          SHOULD_TAG=false
+
+          # Phase 1 — Ingestion live
+          if [ -d "ingestion" ] && find ingestion -name '*.py' | grep -q .; then
+            PHASE=1
+          fi
+
+          # Phase 2 — Chunking + Storage wired
+          if [ $PHASE -ge 1 ] && [ -d "chunking" ] && [ -d "storage" ]; then
+            PHASE=2
+          fi
+
+          # Phase 3 — Retrieval + Generation complete
+          if [ $PHASE -ge 2 ] && [ -d "retrieval" ] && [ -d "generation" ]; then
+            PHASE=3
+          fi
+
+          # Phase 4 — API exposed + tests cover all stages
+          if [ $PHASE -ge 3 ] && [ -d "api" ] && [ -d "tests" ] && \
+             [ $(find tests -name 'test_*.py' | wc -l) -ge 4 ]; then
+            PHASE=4
+            SHOULD_TAG=true
+          fi
+
+          echo "phase=$PHASE" >> $GITHUB_OUTPUT
+          echo "should_tag=$SHOULD_TAG" >> $GITHUB_OUTPUT
+          echo "Detected phase: $PHASE | Should tag: $SHOULD_TAG"
+
+  # ── Tag & Release on Phase 4 ──────────────────────────────────────
+  create-release:
+    needs: evaluate-maturity
+    if: needs.evaluate-maturity.outputs.should_tag == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version tag
+        id: version
+        run: |
+          LATEST=$(git tag --sort=-v:refname | grep '^v' | head -n1)
+          if [ -z "$LATEST" ]; then
+            NEXT="v1.0.0"
+          else
+            # bump patch automatically
+            BASE=${LATEST#v}
+            MAJOR=$(echo $BASE | cut -d. -f1)
+            MINOR=$(echo $BASE | cut -d. -f2)
+            PATCH=$(echo $BASE | cut -d. -f3)
+            NEXT="v$MAJOR.$MINOR.$((PATCH+1))"
+          fi
+          echo "tag=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next tag: $NEXT"
+
+      - name: Create Git tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.tag }} -m "Auto-milestone: Phase 4 complete — pipeline production-ready"
+          git push origin ${{ steps.version.outputs.tag }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "${{ steps.version.outputs.tag }} — Phase 4: Production Pipeline"
+          body: |
+            ## 🏁 Pipeline Milestone — Phase 4 Complete
+
+            All pipeline stages are wired and tested:
+
+            | Stage       | Status |
+            |-------------|--------|
+            | Ingestion   | ✅     |
+            | Chunking    | ✅     |
+            | Storage     | ✅     |
+            | Retrieval   | ✅     |
+            | Generation  | ✅     |
+            | API         | ✅     |
+            | Tests (≥4)  | ✅     |
+
+            CI gates passed: `ruff` · `mypy` · `pytest`
+
+            > Auto-tagged by the Milestone Tagger workflow.
+          prerelease: false
+          generate_release_notes: true
